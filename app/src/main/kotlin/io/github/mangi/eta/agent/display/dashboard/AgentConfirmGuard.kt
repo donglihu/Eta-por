@@ -116,6 +116,22 @@ internal object AgentConfirmGuard {
     /** 全部待答卡。 */
     val pendings: StateFlow<List<PendingApproval>> = mutablePendings.asStateFlow()
 
+    /**
+     * 待答卡的读改写必须原子。
+     *
+     * 早先是「读 value → 算新值 → 整体赋值」，两个会话并发拦截时会互相覆盖，
+     * 内存和盘上一起丢卡（2026-11-08 审核发现）。这里统一走锁 + 单点落盘。
+     */
+    private val pendingLock = Any()
+
+    private fun mutatePendings(block: (List<PendingApproval>) -> List<PendingApproval>): List<PendingApproval> =
+        synchronized(pendingLock) {
+            val next = block(mutablePendings.value)
+            mutablePendings.value = next
+            PendingPromptStore.save(next)
+            next
+        }
+
     /** 指定会话的待答卡（同一会话最多一张）。 */
     fun pendingFor(conversationKey: String): PendingApproval? =
         mutablePendings.value.firstOrNull {
@@ -290,10 +306,9 @@ internal object AgentConfirmGuard {
                 conversationKey = owner,
             )
         }
-        mutablePendings.value = mutablePendings.value.filter {
-            it.conversationKey != owner && !it.expired()
-        } + pending
-        PendingPromptStore.save(mutablePendings.value)
+        mutatePendings { current ->
+            current.filter { it.conversationKey != owner && !it.expired() } + pending
+        }
         // 刻意不 pause。
         // 早先的做法是命中即 pauseRun()，想着「别让模型继续跑」。实测两次翻车：
         // ① 模型拿到 NEED_CONFIRM 后本来就把这一轮收尾了，run 变 terminal，
@@ -440,19 +455,17 @@ internal object AgentConfirmGuard {
         return reply
     }
 
-    /** 兼容旧入口：批准。 */
-    fun approve(context: Context?, token: String, conversationId: String = "", remember: Boolean = false): Boolean {
-        if (mutablePendings.value.none { it.token == token }) return false
+    /**
+     * 批准/拒绝必须把 [choose] 的回灌文案交出去。
+     *
+     * 早先返回 Boolean 把文案丢了：半屏确认页点「确认」后模型收不到许可，
+     * 但 [grantFor] 已经写了 30 分钟放行窗口（2026-11-08 审核发现）。
+     */
+    fun approve(context: Context?, token: String, conversationId: String = "", remember: Boolean = false): String? =
         choose(context, token, if (remember) PromptOptionId.REMEMBER else PromptOptionId.APPROVE, conversationId)
-        return true
-    }
 
-    /** 兼容旧入口：拒绝。 */
-    fun reject(context: Context?, token: String, conversationId: String = ""): Boolean {
-        if (mutablePendings.value.none { it.token == token }) return false
+    fun reject(context: Context?, token: String, conversationId: String = ""): String? =
         choose(context, token, PromptOptionId.REJECT, conversationId)
-        return true
-    }
 
     /**
      * AI 主动提问：带选项、暂停 run、等用户选。
@@ -502,10 +515,9 @@ internal object AgentConfirmGuard {
             conversationKey = owner,
             source = PendingApproval.SOURCE_ASK,
         )
-        mutablePendings.value = mutablePendings.value.filter {
-            it.conversationKey != owner && !it.expired()
-        } + pending
-        PendingPromptStore.save(mutablePendings.value)
+        mutatePendings { current ->
+            current.filter { it.conversationKey != owner && !it.expired() } + pending
+        }
         // 提问也要发通知：用户可能正在别的应用里，不提醒他根本不知道有人在等。
         // （早先只有拦截路径调了 notify，提问这条线一直是静默的。）
         context?.let { runCatching { notify(it, pending) } }
@@ -553,8 +565,9 @@ internal object AgentConfirmGuard {
         io.github.mangi.eta.agent.runtime.RunControl.clearAllPaused("confirm.resolve")
     }
 
-    /** 只把卡收起来（用户划掉/会话切走），不产生任何许可。 */
-    fun dismiss(token: String) {
+    /** 只把卡收起来（用户划掉/会话切走），不产生任何许可；通知要一起撤掉，否则点了是死链。 */
+    fun dismiss(context: Context?, token: String) {
+        clearNotification(context, token)
         takeIfCurrent(token)
     }
 
@@ -565,9 +578,8 @@ internal object AgentConfirmGuard {
             EtaTrace.log("confirm.stale", "token=$token")
             return null
         }
-        // 不管成不成功，先把它从列表里摘掉
-        mutablePendings.value = mutablePendings.value.filter { it.token != token }
-        PendingPromptStore.save(mutablePendings.value)
+        // 不管成不成功，先把它从列表里摘掉（同一个锁，避免并发覆盖）
+        mutatePendings { current -> current.filter { it.token != token } }
         if (current.expired()) {
             EtaTrace.log("confirm.stale", "token=$token expired")
             return null

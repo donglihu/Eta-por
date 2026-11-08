@@ -246,6 +246,11 @@ internal class AgentLocalTools(
             .put("display", "primary").put("requires_observation", true)
             .put("message", "用户已通过通知允许本次任务改用主屏。刚才的操作没有重放；需要时重新启动应用，并调用 observe_screen 获取主屏的新观察后再操作。").toString())
 
+    /** 会真的落到屏幕上的点击类工具：主屏分支必须过审批闸门。 */
+    private val primaryGuardedTools = setOf(
+        "tap", "tap_area", "tap_smart", "tap_element", "long_press", "long_press_element",
+    )
+
     override fun execute(toolCall: AgentModelClient.ToolCall): AgentModelClient.ToolResult =
         runCatching {
             if (closed.get()) return@runCatching textResult(errorResult("DISPLAY_CANCELLED", "任务已结束，本次工具未执行"))
@@ -261,6 +266,24 @@ internal class AgentLocalTools(
                 }
             val virtualSettings = if (toolCall.name in VirtualScreenRoutingPolicy.uiTools) virtualScreenSettings() else null
             val virtualUi = virtualRouting.shouldRoute(toolCall.name, virtualSettings?.virtualScreenEnabled == true)
+            // 主屏 GUI 点击原先完全不过审批：inspectTool 只认 terminal/write_file，
+            // 而按屏上文本判定的 inspect() 只挂在灵屏那两个入口上。
+            // 主屏回退（或灵屏关闭）时模型可以直接点「确认支付」——这里补同口径闸门。
+            if (!virtualUi && toolCall.name in primaryGuardedTools) {
+                val guard = io.github.mangi.eta.agent.display.dashboard.AgentConfirmGuard
+                val target = when (toolCall.name) {
+                    "tap_area" -> guard.labelAt(
+                        (args.optInt("x1", 0) + args.optInt("x2", 0)) / 2,
+                        (args.optInt("y1", 0) + args.optInt("y2", 0)) / 2,
+                    )
+                    "tap_element", "long_press_element", "tap_smart" ->
+                        args.optString("text").ifBlank { args.optString("desc") }
+                    else -> guard.labelAt(args.optInt("x", 0), args.optInt("y", 0))
+                }
+                guard.inspect(context, target, toolCall.name, browserRunId)?.let { draft ->
+                    return@runCatching textResult(guard.blockedResult(draft))
+                }
+            }
             if (virtualRouting.usesPrimary && virtualSettings != null) {
                 if (!virtualSettings.virtualScreenEnabled || (!primaryApprovalFromAppConflict && !virtualSettings.virtualScreenFallbackEnabled)) {
                     return@runCatching textResult(errorResult("MAIN_SCREEN_FALLBACK_DISABLED", "本次主屏回退许可已关闭，后续界面操作停止"))
@@ -550,6 +573,20 @@ internal class AgentLocalTools(
                 coordinateSpace = observation.coordinateSpace,
             ),
         )
+        // 把这次的控件文本与坐标交给审批判定器：主屏坐标点击靠它反查「点到了什么」。
+        // 早先只有灵屏那条路喂 Spot 缓存，主屏 labelAt 恒空 → 点支付按钮判不出来。
+        observation.elementObservation?.let { elements ->
+            val labels = elements.nodes.map { it.text.ifBlank { it.desc }.trim() }
+            val guard = io.github.mangi.eta.agent.display.dashboard.AgentConfirmGuard
+            guard.remember(
+                elements.nodes.mapIndexed { i, node ->
+                    io.github.mangi.eta.agent.display.dashboard.AgentConfirmGuard.Spot(
+                        labels[i], node.centerX, node.centerY,
+                    )
+                }.filter { it.label.isNotEmpty() },
+                labels.filter { it.isNotEmpty() },
+            )
+        }
         logger.debug {
             "Agent local tool action=observe_screen outcome=completed " +
                 "observation=${observation.elementObservation?.id} " +

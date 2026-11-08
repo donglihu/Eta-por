@@ -1000,7 +1000,8 @@ internal fun AgentConversationMessages(
                 }
             }
             pendingApprovals.firstOrNull {
-                it.conversationKey.isBlank() || it.conversationKey == conversationKey
+                // 过期卡不能再挂出来：点了没反应、也不会自己消失（2026-11-08 审核发现）。
+                !it.expired() && (it.conversationKey.isBlank() || it.conversationKey == conversationKey)
             }?.let { approval ->
                 item(key = "approval-card") {
                     AgentApprovalCard(
@@ -1044,7 +1045,7 @@ internal fun AgentConversationMessages(
                 }
             }
             pendingApprovals.filter {
-                it.conversationKey.isNotBlank() && it.conversationKey != conversationKey
+                !it.expired() && it.conversationKey.isNotBlank() && it.conversationKey != conversationKey
             }.forEach { other ->
                 item(key = "approval-elsewhere-${other.token}") {
                     // 一行灰字太容易被划过去，改成带底色的卡片：标题 + 问题 + 去处理。

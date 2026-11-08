@@ -43,21 +43,23 @@ internal object ConfirmRiskDetector {
     /** 终端类工具：命令本身就是判定依据。 */
     private val terminalTools = setOf("terminal", "terminal_job", "terminal_daemon")
 
-    /**
-     * 明确的高危形态。刻意用最短的精确子串而不是宽泛正则——
-     * 宁可少拦几个变体，也不要因为「rm -rf 一个临时目录」天天烦人。
-     */
-    private val destructiveSnippets = listOf(
-        "rm -rf /", "rm -fr /", "rm -rf ~",
-        "mkfs", "dd if=", "of=/dev/block", "> /dev/block/",
-        "pm clear", "cmd package clear",
-        "wipe data", "wipe userdata", "fastboot flash", "fastboot erase",
-        "chmod -R 777 /",
-    )
+    /** 命令分段：&&、||、;、| 与换行都要拆开逐段判，整条命令级豁免是漏洞。 */
+    private val commandSeparators = Regex("""(?:&&|\|\||;|\n|\|)""")
+
+    /** 递归/强制删除的两种写法：-r -R --recursive / -f --force。 */
+    private val recursiveFlag = Regex("""^-(?=[A-Za-z]*[rR])[A-Za-z]+$|^--recursive$""")
+    private val forceFlag = Regex("""^-(?=[A-Za-z]*f)[A-Za-z]+$|^--force$""")
+
+    /** 命令前缀：跳过后再看真正的可执行名。 */
+    private val commandPrefixes = setOf("sudo", "busybox", "env", "nice", "nohup", "time", "command")
+
+    /** 会带 -c 的壳：里面的字符串才是真实命令，必须递归判定。 */
+    private val shellWrappers = setOf("su", "sh", "bash", "ash", "dash", "zsh")
 
     /** 写这些位置等于改系统，出错不可回滚。 */
     private val protectedWritePrefixes = listOf(
-        "/system", "/vendor", "/data/adb", "/init.rc", "/default.prop",
+        "/system", "/vendor", "/product", "/boot", "/data/adb",
+        "/init.rc", "/default.prop", "/metadata", "/sdcard", "/storage",
     )
 
     /**
@@ -71,19 +73,15 @@ internal object ConfirmRiskDetector {
         if (toolName in terminalTools) {
             val command = args.optString("command").trim()
             if (command.isEmpty()) return null
-            val hit = destructiveSnippets.firstOrNull { command.contains(it) } ?: return null
-            // rm -rf /data/local/tmp/xxx 是常规清理，别拦。
-            if (hit.startsWith("rm -rf /") && command.contains("/data/local/tmp")) return null
-            return ConfirmDraft(
-                risk = ConfirmRisk.IRREVERSIBLE,
-                title = "确认执行高危命令",
-                fields = listOf(ConfirmField("命令", command.take(80))),
-            )
+            return analyzeCommand(command)
         }
         if (toolName == "write_file" || toolName == "edit_file") {
             val path = args.optString("path").trim()
             if (path.isEmpty()) return null
-            if (protectedWritePrefixes.none { path.startsWith(it) }) return null
+            // 先规范化再比对：/data/./adb/x、/data//adb/x 都要还原成 /data/adb/x。
+            // 早先是裸 startsWith，两个斜杠就能绕过（2026-11-08 审核发现）。
+            val normalized = normalizePath(path)
+            if (!isProtectedPath(normalized)) return null
             return ConfirmDraft(
                 risk = ConfirmRisk.IRREVERSIBLE,
                 title = "确认写入系统目录",
@@ -91,6 +89,109 @@ internal object ConfirmRiskDetector {
             )
         }
         return null
+    }
+
+    /**
+     * 命令判定：逐段拆、逐段判。
+     *
+     * 早先是「整条命令 contains 某个片段」，于是
+     * `rm -rf /data/local/tmp/x && rm -rf /system` 只要命中临时目录豁免就整条放过。
+     */
+    private fun analyzeCommand(command: String): ConfirmDraft? {
+        command.split(commandSeparators).forEach { raw ->
+            val hit = analyzeSegment(normalizeCommand(raw))
+            if (hit != null) return hit
+        }
+        return null
+    }
+
+    private fun analyzeSegment(segment: String): ConfirmDraft? {
+        if (segment.isEmpty()) return null
+        val tokens = segment.split(' ').filter { it.isNotEmpty() }
+        if (tokens.isEmpty()) return null
+        var start = 0
+        while (start < tokens.size && tokens[start] in commandPrefixes) start++
+        if (start >= tokens.size) return null
+        val cmd = tokens[start].substringAfterLast('/').lowercase()
+        val rest = tokens.drop(start + 1)
+        val inner = rest.indexOfFirst { it == "-c" || it == "--command" }
+        if (inner >= 0 && cmd in shellWrappers && inner + 1 < rest.size) {
+            // su -c "rm -rf /" / sh -c '…'：里面的字符串才是真实命令。
+            return analyzeCommand(rest.drop(inner + 1).joinToString(" "))
+        }
+        val flags = rest.filter { it.startsWith("-") }
+        val targets = rest.filterNot { it.startsWith("-") }
+        return when {
+            cmd == "rm" -> {
+                val recursive = flags.any { recursiveFlag.matches(it) }
+                val force = flags.any { forceFlag.matches(it) }
+                if (!recursive && !force) null
+                else if (targets.any { isProtectedPath(normalizePath(it)) }) draftOf("确认执行高危命令", segment)
+                else null
+            }
+            cmd == "mkfs" || cmd.startsWith("mkfs.") -> draftOf("确认格式化分区", segment)
+            cmd == "dd" && rest.any { it.startsWith("of=/dev/") } -> draftOf("确认写块设备", segment)
+            cmd == "pm" && rest.firstOrNull()?.lowercase() == "clear" -> draftOf("确认清空应用数据", segment)
+            cmd == "cmd" && rest.take(2).map { it.lowercase() } == listOf("package", "clear") ->
+                draftOf("确认清空应用数据", segment)
+            cmd == "fastboot" &&
+                rest.firstOrNull()?.lowercase() in setOf("flash", "erase", "format", "oem", "update") ->
+                draftOf("确认刷写设备", segment)
+            cmd == "wipe" && rest.firstOrNull()?.lowercase() in setOf("data", "userdata") ->
+                draftOf("确认擦除数据", segment)
+            cmd == "chmod" && flags.any { recursiveFlag.matches(it) } &&
+                targets.any { normalizePath(it) == "/" } -> draftOf("确认批量改权限", segment)
+            cmd == "base64" && rest.any { it == "-d" || it == "--decode" } ->
+                draftOf("确认解码后再执行", segment)
+            segment.contains("> /dev/block") || segment.contains(">/dev/block") -> draftOf("确认写块设备", segment)
+            else -> null
+        }
+    }
+
+    private fun draftOf(title: String, segment: String) = ConfirmDraft(
+        risk = ConfirmRisk.IRREVERSIBLE,
+        title = title,
+        fields = listOf(ConfirmField("命令", segment.take(80))),
+    )
+
+    /** 去引号、压空白：`rm  -rf   /` 与 `rm -rf /` 必须同判。 */
+    private fun normalizeCommand(raw: String): String =
+        raw.replace(Regex("""["']"""), " ").replace(Regex("""\s+"""), " ").trim()
+
+    /**
+     * 纯字符串路径规范化：吃掉 `//`、`./`、`../`。
+     * 不碰文件系统，所以符号链接逃逸仍需真机侧另行校验；这里先堵住字符串绕过。
+     */
+    internal fun normalizePath(path: String): String {
+        val trimmed = path.trim()
+        if (trimmed.isEmpty()) return ""
+        if (trimmed == "~" || trimmed.startsWith("~/")) return trimmed
+        val absolute = trimmed.startsWith("/")
+        val stack = ArrayList<String>()
+        trimmed.split('/').forEach { part ->
+            when (part) {
+                "", "." -> Unit
+                ".." -> when {
+                    stack.isNotEmpty() && stack.last() != ".." -> stack.removeAt(stack.size - 1)
+                    !absolute -> stack.add("..")
+                }
+                else -> stack.add(part)
+            }
+        }
+        val joined = stack.joinToString("/")
+        return if (absolute) "/$joined" else joined.ifEmpty { "." }
+    }
+
+    /** 危险目标判定：根、家目录、变量、通配，以及 /data 整体；/data/local/tmp 属常规清理。 */
+    private fun isProtectedPath(normalized: String): Boolean {
+        if (normalized.isEmpty()) return false
+        if (normalized == "/" || normalized == "*" || normalized == "/*" ||
+            normalized == "~" || normalized.startsWith("~/") || normalized == ".."
+        ) return true
+        if (normalized.startsWith("$")) return true
+        if (normalized.startsWith("/data/local/tmp")) return false
+        if (normalized == "/data" || normalized.startsWith("/data/")) return true
+        return protectedWritePrefixes.any { normalized == it || normalized.startsWith("$it/") }
     }
 
     fun inspect(target: String?, texts: List<String>): ConfirmDraft? {

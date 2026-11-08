@@ -61,7 +61,11 @@ internal class AgentConfirmActivity : ComponentActivity() {
         val risk = intent?.getStringExtra(EXTRA_RISK).orEmpty()
         val fieldsRaw = intent?.getStringExtra(EXTRA_FIELDS).orEmpty()
         val previewPath = intent?.getStringExtra(EXTRA_PREVIEW_PATH).orEmpty()
-        val conversation = intent?.getStringExtra(EXTRA_CONVERSATION).orEmpty()
+        // 通知塞的是 MainActivity.EXTRA_CONVERSATION_KEY，早先这里读自己的
+        // EXTRA_CONVERSATION，恒空 → 裁决结果回不到会话（2026-11-08 审核发现）。
+        val conversation = intent?.getStringExtra(io.github.mangi.eta.ui.MainActivity.EXTRA_CONVERSATION_KEY)
+            .orEmpty()
+            .ifBlank { intent?.getStringExtra(EXTRA_CONVERSATION).orEmpty() }
 
         val fields = fieldsRaw.split("|").mapNotNull {
             val i = it.indexOf('=')
@@ -169,8 +173,8 @@ internal class AgentConfirmActivity : ComponentActivity() {
                     }
                     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         SheetButton("取消", Color(0xFFFF6B6B), Modifier.weight(1f)) {
-                            // 拒绝 = 通过 steering 明确告诉 AI 停手，而不是只改本机状态机。
-                            AgentConfirmGuard.reject(applicationContext, token, conversation)
+                            // 拒绝 = 把「停手」文案作为新消息送回会话，而不是只改本机状态机。
+                            deliver(AgentConfirmGuard.reject(applicationContext, token, conversation), conversation)
                             finish()
                         }
                         SheetButton("去接管", Color(0xFFB6BEC9), Modifier.weight(1f)) {
@@ -180,13 +184,23 @@ internal class AgentConfirmActivity : ComponentActivity() {
                         }
                         SheetButton("确认", Color(0xFF5FE08C), Modifier.weight(1f), filled = true) {
                             // 批准 = 发一个可执行的许可让 AI 继续；不重放旧坐标（快照可能已过期）。
-                            AgentConfirmGuard.approve(applicationContext, token, conversation)
+                            // 许可文案必须送回会话：否则 grantFor 放了行、模型却在等一句永远到不了的话。
+                            deliver(AgentConfirmGuard.approve(applicationContext, token, conversation), conversation)
                             finish()
                         }
                     }
                     Spacer(Modifier.height(2.dp))
                 }
             }
+        }
+    }
+
+    /** 把裁决文案作为一条新用户消息送回会话；会话 id 为空时 steerRun 走当前活动 run。 */
+    private fun deliver(reply: String?, conversation: String) {
+        val text = reply?.takeIf { it.isNotBlank() } ?: return
+        runCatching {
+            AgentRuntimeClient(applicationContext, io.github.mangi.eta.core.AndroidAgentLogger)
+                .steerRun(text, conversation)
         }
     }
 
