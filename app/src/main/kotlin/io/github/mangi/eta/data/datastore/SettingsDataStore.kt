@@ -16,6 +16,7 @@ import androidx.datastore.preferences.preferencesDataStore
 import io.github.mangi.eta.data.model.AppearanceAccentColor
 import io.github.mangi.eta.data.model.AppearancePaletteStyle
 import io.github.mangi.eta.data.model.AppearanceSettings
+import io.github.mangi.eta.data.model.ConversationTitleSettings
 import io.github.mangi.eta.data.model.AppearanceThemeMode
 import io.github.mangi.eta.data.model.AppearanceTopBarBlurStyle
 import io.github.mangi.eta.data.model.SpeechSettings
@@ -31,6 +32,7 @@ import kotlinx.coroutines.flow.map
 
 internal object SettingsDataStore {
     private val SPEECH_SETTINGS = stringPreferencesKey("speech_settings_v1")
+    private val CONVERSATION_TITLE_SETTINGS = stringPreferencesKey("conversation_title_settings_v1")
     private val WEB_TOOLS_SETTINGS = stringPreferencesKey("web_tools_settings_v1")
     private val SUBAGENT_SETTINGS = stringPreferencesKey("subagent_settings_v1")
     private val speechJson = Json { ignoreUnknownKeys = true; encodeDefaults = true }
@@ -506,5 +508,25 @@ internal object SettingsDataStore {
         this[APPEARANCE_SWIPE_DISMISS_ENABLED] = settings.swipeDismissEnabled
         this[APPEARANCE_PREDICTIVE_BACK_ENABLED] = settings.predictiveBackEnabled
         this[APPEARANCE_INTERFACE_SCALE] = settings.interfaceScale
+    }
+
+    fun conversationTitleSettingsFlow(): Flow<ConversationTitleSettings> {
+        ensureInitialized()
+        return dataStore.data
+            .catch { cause ->
+                if (cause is IOException) emit(emptyPreferences()) else throw cause
+            }
+            .map { prefs ->
+                prefs[CONVERSATION_TITLE_SETTINGS]?.let { raw ->
+                    runCatching { speechJson.decodeFromString<ConversationTitleSettings>(raw) }.getOrNull()
+                } ?: ConversationTitleSettings()
+            }
+    }
+
+    suspend fun conversationTitleSettings(): ConversationTitleSettings = conversationTitleSettingsFlow().first()
+
+    suspend fun setConversationTitleSettings(settings: ConversationTitleSettings) {
+        ensureInitialized()
+        dataStore.edit { it[CONVERSATION_TITLE_SETTINGS] = speechJson.encodeToString(settings) }
     }
 }

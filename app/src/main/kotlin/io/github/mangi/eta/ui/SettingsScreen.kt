@@ -9,6 +9,7 @@ import android.provider.Settings
 import android.widget.Toast
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.MenuBook
+import androidx.compose.material.icons.rounded.AutoAwesome
 import androidx.compose.material.icons.rounded.AccessibilityNew
 import androidx.compose.material.icons.rounded.AccountTree
 import androidx.compose.material.icons.rounded.BarChart
@@ -443,6 +444,17 @@ private fun SettingsPageContent(
                             )
                         },
                         onClick = { onNavigate(AppRoute.Memory) },
+                    )
+                    EtaPreferenceDivider()
+                    EtaArrowPreference(
+                        title = stringResource(R.string.conversation_title_settings_title),
+                        startAction = {
+                            EtaPreferenceIcon(
+                                icon = Icons.Rounded.AutoAwesome,
+                                tint = EtaPreferenceColors.Blue,
+                            )
+                        },
+                        onClick = { onNavigate(AppRoute.ConversationTitleSettings) },
                     )
                     EtaPreferenceDivider()
                     EtaArrowPreference(

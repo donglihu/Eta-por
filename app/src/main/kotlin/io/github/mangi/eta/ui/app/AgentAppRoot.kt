@@ -67,6 +67,7 @@ import io.github.mangi.eta.ui.AppearanceSettingsScreen
 import io.github.mangi.eta.ui.SettingsScreen
 import io.github.mangi.eta.ui.components.ConversationNavigatorSheet
 import io.github.mangi.eta.ui.screens.branches.ConversationBranchScreen
+import io.github.mangi.eta.ui.screens.settings.ConversationTitleSettingsScreen
 import io.github.mangi.eta.ui.components.MiuixDialogActions
 import io.github.mangi.eta.ui.model.AgentHomeAction
 import io.github.mangi.eta.ui.model.BranchNodeUi
@@ -729,6 +730,9 @@ fun AgentAppRoot(
                         }
                     },
                 )
+            }
+            entry<AppRoute.ConversationTitleSettings>(swipeDismiss = swipeDismiss) {
+                ConversationTitleSettingsScreen(onBack = ::popRoute)
             }
             entry<AppRoute.WebToolsSettings>(swipeDismiss = swipeDismiss) {
                 WebToolsSettingsScreen(onBack = ::popRoute)
