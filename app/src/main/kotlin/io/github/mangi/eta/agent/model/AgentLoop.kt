@@ -62,10 +62,15 @@ internal class AgentLoop(
     private val sensitiveToolCallIds = linkedSetOf<String>()
     private val toolBatchLock = Any()
     private var pendingToolImageMessage: JSONObject? = null
+    private var precedingTools: JSONArray? = null
     private val context = AgentContextSession(
         config, messages, systemCount, operationId, provider, runController,
         { sensitiveToolCallIds }, onEvent, onContextSnapshot, { transcript.length() },
         roleplay = roleplayContext != null,
+        mainToolsProvider = { precedingTools ?: tools },
+        mainSessionId = sessionId,
+        messageProjector = { source -> roleplayContext?.projectMessages(source) ?: source },
+        enableCacheReuse = true,
     )
     private var supplementIndex = initialSupplementIndex
 
@@ -117,7 +122,6 @@ internal class AgentLoop(
 
     fun run(): Result {
         var round = 1
-        var precedingTools: JSONArray? = null
 
         while (true) {
             runController.throwIfCancelled()

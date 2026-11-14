@@ -24,6 +24,8 @@ internal data class TokenUsageRecordEntity(
     @ColumnInfo(name = "output_tokens") val outputTokens: Int? = null,
     @ColumnInfo(name = "reasoning_tokens") val reasoningTokens: Int? = null,
     @ColumnInfo(name = "cached_tokens") val cachedTokens: Int? = null,
+    @ColumnInfo(name = "cache_write_tokens") val cacheWriteTokens: Int? = null,
+    @ColumnInfo(name = "request_kind") val requestKind: String? = null,
     @ColumnInfo(name = "duration_ms") val durationMs: Long? = null,
 )
 

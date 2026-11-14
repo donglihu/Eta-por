@@ -202,14 +202,34 @@ internal fun TokenUsageScreen(onBack: () -> Unit) {
 }
 
 @Composable
-private fun summaryPairs(rows: List<TokenUsageRecordEntity>): List<Pair<String, String>> = listOf(
-    stringResource(R.string.usage_requests) to stringResource(R.string.usage_times, rows.size),
-    stringResource(R.string.usage_input) to formatTokens(sum(rows) { it.inputTokens }),
-    stringResource(R.string.usage_output) to formatTokens(sum(rows) { it.outputTokens }),
-    stringResource(R.string.usage_reasoning) to formatTokens(sum(rows) { it.reasoningTokens }),
-    stringResource(R.string.usage_cached) to formatTokens(sum(rows) { it.cachedTokens }),
-    stringResource(R.string.usage_context) to formatTokens(rows.mapNotNull { it.contextTokens }.maxOrNull()),
-)
+private fun summaryPairs(rows: List<TokenUsageRecordEntity>): List<Pair<String, String>> {
+    val normal = rows.filter { it.requestKind == null || it.requestKind == "chat" }
+    val compaction = rows.filter { it.requestKind == "compaction" }
+    val subagent = rows.filter { it.requestKind == "subagent" }
+    return listOf(
+        stringResource(R.string.usage_requests) to stringResource(R.string.usage_times, rows.size),
+        stringResource(R.string.usage_input) to formatTokens(sum(rows) { it.inputTokens }),
+        stringResource(R.string.usage_output) to formatTokens(sum(rows) { it.outputTokens }),
+        stringResource(R.string.usage_reasoning) to formatTokens(sum(rows) { it.reasoningTokens }),
+        stringResource(R.string.usage_cached) to formatTokens(sum(rows) { it.cachedTokens }),
+        stringResource(R.string.usage_cache_write) to formatTokens(sum(rows) { it.cacheWriteTokens }),
+        stringResource(R.string.usage_context) to formatTokens(rows.mapNotNull { it.contextTokens }.maxOrNull()),
+        stringResource(R.string.usage_compaction_requests) to
+            stringResource(R.string.usage_times, compaction.size) +
+            " · " + formatTokens(sum(compaction) { it.inputTokens }) + "↑ / " +
+            formatTokens(sum(compaction) { it.cachedTokens }) + "◎ / " +
+            formatTokens(sum(compaction) { it.cacheWriteTokens }) + "✎ / " +
+            formatTokens(sum(compaction) { it.outputTokens }),
+        stringResource(R.string.usage_subagent_requests) to
+            stringResource(R.string.usage_times, subagent.size) +
+            " · " + formatTokens(sum(subagent) { it.inputTokens }) + "↑ / " +
+            formatTokens(sum(subagent) { it.outputTokens }),
+        stringResource(R.string.usage_uncached_input) to
+            formatTokens(sum(normal) { row ->
+                row.inputTokens?.let { input -> (input - (row.cachedTokens ?: 0) - (row.cacheWriteTokens ?: 0)).coerceAtLeast(0) }
+            }),
+    )
+}
 
 @Composable
 private fun rowDetail(rows: List<TokenUsageRecordEntity>): String = stringResource(

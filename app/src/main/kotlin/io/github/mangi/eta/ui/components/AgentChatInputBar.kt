@@ -749,6 +749,8 @@ internal fun AgentChatInputBar(
                             AgentContextUsageButton(
                                 usage = contextUsage,
                                 onOpenPanel = { showContextSheet = true },
+                                onCompact = onCompactContext,
+                                canCompact = canCompactContext && !isStreaming,
                             )
 
                             Spacer(modifier = Modifier.width(2.dp))

@@ -8,7 +8,7 @@ import androidx.room.RoomDatabase
 import androidx.room.migration.Migration
 
 /** 结构版本的唯一来源：@Database 与自检页共用，文案里不再写字面量。 */
-internal const val ETA_DB_SCHEMA_VERSION = 32
+internal const val ETA_DB_SCHEMA_VERSION = 33
 
 @Database(
     entities = [
@@ -84,6 +84,7 @@ internal abstract class EtaDatabase : RoomDatabase() {
                         MIGRATION_29_30,
                         MIGRATION_30_31,
                         MIGRATION_31_32,
+                        MIGRATION_32_33,
                     )
                     .addCallback(object : Callback() {
                         override fun onCreate(db: androidx.sqlite.db.SupportSQLiteDatabase) { createTextChunkCleanup(db) }
@@ -225,6 +226,47 @@ internal abstract class EtaDatabase : RoomDatabase() {
          */
         internal val MIGRATION_31_32 = Migration(31, 32) { database ->
             database.execSQL("ALTER TABLE conversation_messages ADD COLUMN request_count INTEGER")
+        }
+
+        /**
+         * 32 → 33：缓存写入统计、压缩归档引用与上下文构成补齐。
+         *
+         * 幂等实现：本仓库有两条来源路径都能走到 33 —— branch 线（32 起，已有上下文五列与
+         * request_count）与本地装机线（31 起，已有 cache_write_tokens / compaction_archive_id /
+         * token_usage_records 两列但缺上下文列）。逐列查 PRAGMA 再补，缺什么补什么，
+         * 不重复 ALTER，两条路径升级后 schema 收敛到同一份。
+         */
+        internal val MIGRATION_32_33 = Migration(32, 33) { database ->
+            database.addColumnIfMissing("conversation_messages", "cache_write_tokens", "INTEGER")
+            database.addColumnIfMissing("conversation_messages", "compaction_archive_id", "TEXT")
+            database.addColumnIfMissing("token_usage_records", "cache_write_tokens", "INTEGER")
+            database.addColumnIfMissing("token_usage_records", "request_kind", "TEXT")
+            database.addColumnIfMissing("conversation_messages", "system_prompt_tokens", "INTEGER")
+            database.addColumnIfMissing("conversation_messages", "tool_definition_tokens", "INTEGER")
+            database.addColumnIfMissing("conversation_messages", "conversation_tokens", "INTEGER")
+            database.addColumnIfMissing("conversation_messages", "first_token_ms", "INTEGER")
+            database.addColumnIfMissing("conversation_messages", "tool_duration_ms", "INTEGER")
+            database.addColumnIfMissing("conversation_messages", "request_count", "INTEGER")
+        }
+
+        /** 只在列不存在时 ALTER，供 [MIGRATION_32_33] 合并两条来源路径。 */
+        private fun androidx.sqlite.db.SupportSQLiteDatabase.addColumnIfMissing(
+            table: String,
+            column: String,
+            definition: String,
+        ) {
+            val exists = query("PRAGMA table_info($table)").use { cursor ->
+                val nameIndex = cursor.getColumnIndex("name")
+                var found = false
+                while (cursor.moveToNext()) {
+                    if (nameIndex >= 0 && cursor.getString(nameIndex) == column) {
+                        found = true
+                        break
+                    }
+                }
+                found
+            }
+            if (!exists) execSQL("ALTER TABLE $table ADD COLUMN $column $definition")
         }
 
         private fun createTextChunkCleanup(database: androidx.sqlite.db.SupportSQLiteDatabase) {

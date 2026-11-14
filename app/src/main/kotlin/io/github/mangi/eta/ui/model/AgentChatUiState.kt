@@ -170,6 +170,9 @@ data class SystemNoticeMessageUi(
     val contextTokens: Int? = null,
     /** 仅运行期存在的进行中标记，不随消息持久化；恢复的历史通知始终视为已结束。 */
     val running: Boolean = false,
+    val usage: TokenUsageUi? = null,
+    val archiveId: String = "",
+    val tokensBefore: Int? = null,
 ) : AgentChatMessageUi
 
 @Immutable
@@ -180,6 +183,8 @@ data class TokenUsageUi(
     val outputTokens: Int? = null,
     val reasoningTokens: Int? = null,
     val cachedTokens: Int? = null,
+    val cacheWriteTokens: Int? = null,
+    val requestKind: String? = null,
     val requestDurationMs: Long? = null,
     /** 上下文构成估算（系统提示词 / 工具定义 / 对话消息），只在运行期有意义。 */
     val systemPromptTokens: Int? = null,
@@ -255,7 +260,8 @@ data class TokenUsageUi(
             inputTokens == null &&
             outputTokens == null &&
             reasoningTokens == null &&
-            cachedTokens == null
+            cachedTokens == null &&
+            cacheWriteTokens == null
 }
 
 @Immutable

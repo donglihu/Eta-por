@@ -23,6 +23,8 @@ internal object TokenUsageRecorder {
         outputTokens: Int?,
         reasoningTokens: Int?,
         cachedTokens: Int?,
+        cacheWriteTokens: Int?,
+        requestKind: String?,
         durationMs: Long?,
     ) {
         val now = System.currentTimeMillis()
@@ -39,6 +41,8 @@ internal object TokenUsageRecorder {
                     outputTokens = outputTokens,
                     reasoningTokens = reasoningTokens,
                     cachedTokens = cachedTokens,
+                    cacheWriteTokens = cacheWriteTokens,
+                    requestKind = requestKind,
                     durationMs = durationMs,
                 ),
             )

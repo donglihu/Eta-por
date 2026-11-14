@@ -6,6 +6,8 @@ internal data class AgentTokenUsage(
     val outputTokens: Int? = null,
     val reasoningTokens: Int? = null,
     val cachedTokens: Int? = null,
+    val cacheWriteTokens: Int? = null,
+    val requestKind: String? = null,
     val requestDurationMs: Long? = null,
     /**
      * 上下文构成估算：本次请求里系统提示词、工具定义（schema）与对话消息各占多少 token。
@@ -26,7 +28,8 @@ internal data class AgentTokenUsage(
     fun merge(other: AgentTokenUsage): AgentTokenUsage = AgentTokenUsage(
         other.contextTokens ?: contextTokens, other.inputTokens ?: inputTokens,
         other.outputTokens ?: outputTokens, other.reasoningTokens ?: reasoningTokens,
-        other.cachedTokens ?: cachedTokens, other.requestDurationMs ?: requestDurationMs,
+        other.cachedTokens ?: cachedTokens, other.cacheWriteTokens ?: cacheWriteTokens,
+        other.requestKind ?: requestKind, other.requestDurationMs ?: requestDurationMs,
         other.systemPromptTokens ?: systemPromptTokens,
         other.toolDefinitionTokens ?: toolDefinitionTokens,
         other.conversationTokens ?: conversationTokens,
@@ -40,11 +43,18 @@ internal data class AgentTokenUsage(
             inputTokens == null &&
             outputTokens == null &&
             reasoningTokens == null &&
-            cachedTokens == null
+            cachedTokens == null &&
+            cacheWriteTokens == null
 
     /** 三段构成是否至少拿到一段（拿到才画分段条与明细行）。 */
     val hasContextComposition: Boolean
         get() = systemPromptTokens != null ||
             toolDefinitionTokens != null ||
             conversationTokens != null
+
+    companion object {
+        const val REQUEST_KIND_CHAT = "chat"
+        const val REQUEST_KIND_COMPACTION = "compaction"
+        const val REQUEST_KIND_SUBAGENT = "subagent"
+    }
 }

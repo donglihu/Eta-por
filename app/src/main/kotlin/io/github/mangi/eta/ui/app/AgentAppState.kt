@@ -2892,6 +2892,8 @@ internal class AgentAppState(
                             outputTokens = usage.outputTokens,
                             reasoningTokens = usage.reasoningTokens,
                             cachedTokens = usage.cachedTokens,
+                            cacheWriteTokens = usage.cacheWriteTokens,
+                            requestKind = usage.requestKind,
                             durationMs = usage.requestDurationMs,
                         )
                     }

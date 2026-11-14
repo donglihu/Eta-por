@@ -65,6 +65,8 @@ internal data class AgentContextUsageUi(
     val systemPromptTokens: Int? = null,
     val toolDefinitionTokens: Int? = null,
     val conversationTokens: Int? = null,
+    /** 最近一次上下文压缩的回本诊断；没有压缩历史时为 null。 */
+    val compactionPayback: CompactionPaybackSummary? = null,
 ) {
     val progress: Float?
         get() = contextUsageProgress(contextTokens, contextWindow)
@@ -177,6 +179,7 @@ internal fun latestContextUsage(
     selectedModel: AgentModelOptionUi?,
 ): AgentContextUsageUi {
     val window = selectedModel?.contextWindow
+    val payback = CacheUsageDiagnostics.analyze(messages).lastCompactionPayback
     for (message in messages.asReversed()) {
         when (message) {
             is AgentMessageUi -> {
@@ -190,16 +193,17 @@ internal fun latestContextUsage(
                         systemPromptTokens = usage.systemPromptTokens,
                         toolDefinitionTokens = usage.toolDefinitionTokens,
                         conversationTokens = usage.conversationTokens,
+                        compactionPayback = payback,
                     )
                 }
             }
             is SystemNoticeMessageUi -> if (message.code == SystemNoticeCode.ContextCompaction) {
-                return AgentContextUsageUi(null, window)
+                return AgentContextUsageUi(null, window, compactionPayback = payback)
             }
             else -> Unit
         }
     }
-    return AgentContextUsageUi(null, window)
+    return AgentContextUsageUi(null, window, compactionPayback = payback)
 }
 
 internal fun contextUsageProgress(contextTokens: Int?, contextWindow: Int?): Float? {

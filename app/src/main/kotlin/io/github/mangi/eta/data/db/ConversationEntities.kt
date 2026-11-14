@@ -144,6 +144,8 @@ internal data class ConversationMessageEntity(
     @ColumnInfo(name = "output_tokens") val outputTokens: Int? = null,
     @ColumnInfo(name = "reasoning_tokens") val reasoningTokens: Int? = null,
     @ColumnInfo(name = "cached_tokens") val cachedTokens: Int? = null,
+    @ColumnInfo(name = "cache_write_tokens") val cacheWriteTokens: Int? = null,
+    @ColumnInfo(name = "compaction_archive_id") val compactionArchiveId: String? = null,
     @ColumnInfo(name = "request_duration_ms") val requestDurationMs: Long? = null,
     @ColumnInfo(name = "system_prompt_tokens") val systemPromptTokens: Int? = null,
     @ColumnInfo(name = "tool_definition_tokens") val toolDefinitionTokens: Int? = null,

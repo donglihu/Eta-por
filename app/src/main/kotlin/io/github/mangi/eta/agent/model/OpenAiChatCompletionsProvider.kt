@@ -17,6 +17,11 @@ internal object OpenAiChatCompletionsProvider : AgentProviderClient {
     private const val MAX_ERROR_CHARS = 600
     private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
 
+    private val COMPACTION_FORBIDDEN_FIELDS = setOf(
+        "model", "stream", "messages", "input", "instructions", "system",
+        "system_instruction", "tools", "tool_choice", "stream_options",
+    )
+
     override val id: String = "openai_chat_completions"
 
     override val capabilities: ProviderCapabilities =
@@ -55,8 +60,15 @@ internal object OpenAiChatCompletionsProvider : AgentProviderClient {
             }
             .build()
 
-        val requestJson = buildRequestJson(config, request.messages, request.effectiveTools).apply {
-            if (!request.purpose.allowsTools || request.effectiveTools.length() == 0) {
+        val requestJson = buildRequestJson(config, request.messages, request.effectiveTools, request.purpose).apply {
+            if (request.purpose == ProviderRequestPurpose.COMPACTION) {
+                if (optJSONArray("tools")?.length()?.let { it > 0 } == true) {
+                    put("tool_choice", "none")
+                } else {
+                    remove("tools")
+                    remove("tool_choice")
+                }
+            } else if (!request.purpose.allowsTools || request.effectiveTools.length() == 0) {
                 remove("tools")
                 remove("tool_choice")
             }
@@ -95,7 +107,8 @@ internal object OpenAiChatCompletionsProvider : AgentProviderClient {
     internal fun buildRequestJson(
         config: AgentModelClient.ModelConfig,
         messages: JSONArray,
-        tools: JSONArray
+        tools: JSONArray,
+        purpose: ProviderRequestPurpose = ProviderRequestPurpose.CHAT,
     ): JSONObject {
         val sourceType = ProviderSourceRegistry.resolve(
             providerId = config.providerId,
@@ -103,6 +116,27 @@ internal object OpenAiChatCompletionsProvider : AgentProviderClient {
             baseUrl = config.baseUrl,
             providerType = config.providerType,
         )
+        if (purpose == ProviderRequestPurpose.COMPACTION) {
+            return JSONObject().also { request ->
+                mergeExtraBody(request, config.extraBodyJson)
+                RequestBodyMerge.mergeCustomBody(request, config.customBody)
+                COMPACTION_FORBIDDEN_FIELDS.forEach(request::remove)
+                request.put("model", config.model)
+                request.put("stream", true)
+                request.put("messages", OpenAiRequestMessages.forChatCompletions(messages))
+                if (tools.length() > 0) {
+                    request.put("tools", tools)
+                    request.put("tool_choice", "none")
+                } else {
+                    request.remove("tools")
+                    request.remove("tool_choice")
+                }
+                if (sourceType != ProviderSourceTypes.OPENROUTER) {
+                    request.put("stream_options", JSONObject().put("include_usage", true))
+                }
+                ProviderReasoning.applyOpenAiCompatibleRequest(request, config)
+            }
+        }
         return JSONObject()
             .put("model", config.model)
             .put("stream", true)

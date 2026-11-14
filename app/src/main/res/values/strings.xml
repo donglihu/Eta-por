@@ -1066,6 +1066,10 @@
   <string name="context_usage_previous_response">%1$s\n上轮实测</string>
   <string name="context_compaction">上下文压缩</string>
   <string name="context_compact_action">压缩上下文</string>
+  <string name="context_open_panel_action">查看上下文面板</string>
+  <string name="context_compaction_payback_done">压缩归档 %1$s：已在 %2$d 轮内回本。</string>
+  <string name="context_compaction_payback_pending">压缩归档 %1$s：已过 %2$d 轮，预计 %3$d 轮回本。</string>
+  <string name="context_compaction_payback_unknown">压缩归档 %1$s：回本轮次暂无法估算。</string>
   <string name="settings_auto_compaction">自动压缩上下文</string>
   <string name="context_usage_description">上下文用量：%1$s</string>
   <string name="memory_budget_summary">每轮最多注入 %1$s 字符，详细内容由模型按需读取</string>
@@ -1569,6 +1573,10 @@
   <string name="usage_output">输出 token</string>
   <string name="usage_reasoning">推理 token</string>
   <string name="usage_cached">缓存 token</string>
+  <string name="usage_cache_write">缓存写入 token</string>
+  <string name="usage_uncached_input">未命中输入 token</string>
+  <string name="usage_compaction_requests">压缩摘要请求</string>
+  <string name="usage_subagent_requests">子智能体请求</string>
   <string name="usage_context">上下文 token（峰值）</string>
   <string name="usage_by_conversation">按会话 · 近 30 天</string>
   <string name="usage_by_model">按模型 · 近 30 天</string>

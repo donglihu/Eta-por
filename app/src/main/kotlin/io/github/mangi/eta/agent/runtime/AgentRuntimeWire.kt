@@ -703,6 +703,8 @@ internal object AgentRuntimeWire {
                 event.tokensBefore?.let { putInt("tokens_before", it) }
                 event.tokensAfter?.let { putInt("tokens_after", it) }
                 putString("reason_code", event.reasonCode)
+                if (event.archiveId.isNotBlank()) putString("compaction_archive_id", event.archiveId)
+                event.usage?.takeUnless { it.isEmpty }?.let { putTokenUsage(it, prefix = "compaction_usage_") }
             }
 
             is AgentEvent.ModelRetryScheduled -> {
@@ -873,6 +875,8 @@ internal object AgentRuntimeWire {
             tokensBefore = bundle.optionalInt("tokens_before"),
             tokensAfter = bundle.optionalInt("tokens_after"),
             reasonCode = bundle.getString("reason_code").orEmpty(),
+            usage = bundle.getTokenUsage(prefix = "compaction_usage_").takeUnless { it.isEmpty },
+            archiveId = bundle.getString("compaction_archive_id").orEmpty(),
         )
         "model_retry_scheduled" -> AgentEvent.ModelRetryScheduled(
             round = bundle.getInt("round"),
@@ -1010,36 +1014,40 @@ internal object AgentRuntimeWire {
     private fun Bundle.optionalInt(key: String): Int? =
         if (containsKey(key)) getInt(key) else null
 
-    private fun Bundle.putTokenUsage(usage: AgentTokenUsage) {
-        usage.contextTokens?.let { putInt("usage_context", it) }
-        usage.inputTokens?.let { putInt("usage_input", it) }
-        usage.outputTokens?.let { putInt("usage_output", it) }
-        usage.reasoningTokens?.let { putInt("usage_reasoning", it) }
-        usage.cachedTokens?.let { putInt("usage_cache", it) }
-        usage.requestDurationMs?.let { putLong("usage_duration_ms", it) }
-        usage.systemPromptTokens?.let { putInt("usage_system_prompt", it) }
-        usage.toolDefinitionTokens?.let { putInt("usage_tool_defs", it) }
-        usage.conversationTokens?.let { putInt("usage_conversation", it) }
-        usage.firstTokenMs?.let { putLong("usage_first_token_ms", it) }
-        usage.toolDurationMs?.let { putLong("usage_tool_duration_ms", it) }
-        usage.requestCount?.let { putInt("usage_request_count", it) }
+    private fun Bundle.putTokenUsage(usage: AgentTokenUsage, prefix: String = "usage_") {
+        usage.contextTokens?.let { putInt("${prefix}context", it) }
+        usage.inputTokens?.let { putInt("${prefix}input", it) }
+        usage.outputTokens?.let { putInt("${prefix}output", it) }
+        usage.reasoningTokens?.let { putInt("${prefix}reasoning", it) }
+        usage.cachedTokens?.let { putInt("${prefix}cache", it) }
+        usage.cacheWriteTokens?.let { putInt("${prefix}cache_write", it) }
+        usage.requestKind?.takeIf { it.isNotBlank() }?.let { putString("${prefix}request_kind", it) }
+        usage.requestDurationMs?.let { putLong("${prefix}duration_ms", it) }
+        usage.systemPromptTokens?.let { putInt("${prefix}system_prompt", it) }
+        usage.toolDefinitionTokens?.let { putInt("${prefix}tool_defs", it) }
+        usage.conversationTokens?.let { putInt("${prefix}conversation", it) }
+        usage.firstTokenMs?.let { putLong("${prefix}first_token_ms", it) }
+        usage.toolDurationMs?.let { putLong("${prefix}tool_duration_ms", it) }
+        usage.requestCount?.let { putInt("${prefix}request_count", it) }
     }
 
     @Suppress("DEPRECATION")
-    private fun Bundle.getTokenUsage(): AgentTokenUsage =
+    private fun Bundle.getTokenUsage(prefix: String = "usage_"): AgentTokenUsage =
         AgentTokenUsage(
-            contextTokens = optionalInt("usage_context"),
-            inputTokens = optionalInt("usage_input"),
-            outputTokens = optionalInt("usage_output"),
-            reasoningTokens = optionalInt("usage_reasoning"),
-            cachedTokens = optionalInt("usage_cache"),
-            requestDurationMs = (get("usage_duration_ms") as? Number)?.toLong()?.takeIf { it > 0 },
-            systemPromptTokens = optionalInt("usage_system_prompt"),
-            toolDefinitionTokens = optionalInt("usage_tool_defs"),
-            conversationTokens = optionalInt("usage_conversation"),
-            firstTokenMs = (get("usage_first_token_ms") as? Number)?.toLong()?.takeIf { it > 0 },
-            toolDurationMs = (get("usage_tool_duration_ms") as? Number)?.toLong()?.takeIf { it > 0 },
-            requestCount = optionalInt("usage_request_count"),
+            contextTokens = optionalInt("${prefix}context"),
+            inputTokens = optionalInt("${prefix}input"),
+            outputTokens = optionalInt("${prefix}output"),
+            reasoningTokens = optionalInt("${prefix}reasoning"),
+            cachedTokens = optionalInt("${prefix}cache"),
+            cacheWriteTokens = optionalInt("${prefix}cache_write"),
+            requestKind = getString("${prefix}request_kind"),
+            requestDurationMs = (get("${prefix}duration_ms") as? Number)?.toLong()?.takeIf { it > 0 },
+            systemPromptTokens = optionalInt("${prefix}system_prompt"),
+            toolDefinitionTokens = optionalInt("${prefix}tool_defs"),
+            conversationTokens = optionalInt("${prefix}conversation"),
+            firstTokenMs = (get("${prefix}first_token_ms") as? Number)?.toLong()?.takeIf { it > 0 },
+            toolDurationMs = (get("${prefix}tool_duration_ms") as? Number)?.toLong()?.takeIf { it > 0 },
+            requestCount = optionalInt("${prefix}request_count"),
         )
 
     private fun decodeCustomHeaders(raw: String?): List<CustomHeader> =
