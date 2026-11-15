@@ -738,11 +738,9 @@ internal class SubagentExecutor(
                 }
 
                 is AgentEvent.UsageReceived -> {
-                    if (event.usage.stepCount != null) {
-                        latestTurnUsage = event.usage
-                    } else {
-                        latestStepUsage = event.usage
-                    }
+                    // 本地版 AgentTokenUsage 无 stepCount/llmMs（未并 TurnMetrics）：
+                    // 每次 UsageReceived 一律按步骤用量累计，轮次快照回落到最新一步。
+                    latestStepUsage = event.usage
                     false
                 }
 
@@ -754,7 +752,7 @@ internal class SubagentExecutor(
                             compactionCacheWriteTokens += usage.cacheWriteTokens ?: 0
                             compactionOutputTokens += usage.outputTokens ?: 0
                             compactionReasoningTokens += usage.reasoningTokens ?: 0
-                            compactionLlmMs += usage.llmMs ?: 0L
+                            compactionLlmMs += 0L
                         }
                     }
                     false
@@ -813,7 +811,7 @@ internal class SubagentExecutor(
             val totalCacheWrite = (baseUsage?.cacheWriteTokens ?: 0) + compactionCacheWriteTokens
             val totalOutput = (baseUsage?.outputTokens ?: 0) + compactionOutputTokens
             val totalReasoning = (baseUsage?.reasoningTokens ?: 0) + compactionReasoningTokens
-            val totalLlmMs = (baseUsage?.llmMs ?: 0L) + compactionLlmMs
+            val totalLlmMs = compactionLlmMs
             val usageSnapshot = if (
                 totalInput > 0 || totalCached > 0 || totalCacheWrite > 0 || totalOutput > 0 || totalLlmMs > 0L
             ) {

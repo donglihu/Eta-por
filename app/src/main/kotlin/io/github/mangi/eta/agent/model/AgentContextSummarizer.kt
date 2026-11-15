@@ -127,8 +127,6 @@ internal class AgentContextSummarizer(
             usage.copy(
                 inputTokens = latestInputTokens ?: usage.inputTokens,
                 requestKind = AgentTokenUsage.REQUEST_KIND_COMPACTION,
-                stepCount = usage.stepCount ?: 1,
-                llmMs = usage.llmMs ?: elapsedMs,
             )
         }
         return SummaryResult(summary = summary, usage = effectiveUsage, llmMs = elapsedMs)

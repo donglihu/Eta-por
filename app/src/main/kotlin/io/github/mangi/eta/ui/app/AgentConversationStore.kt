@@ -437,13 +437,6 @@ internal object AgentConversationStore {
                 cachedTokens = usage?.cachedTokens,
                 cacheWriteTokens = usage?.cacheWriteTokens,
                 compactionArchiveId = archiveId.takeIf { it.isNotBlank() },
-                stepCount = usage?.stepCount,
-                llmMs = usage?.llmMs,
-                toolMs = usage?.toolMs,
-                ttftMs = usage?.ttftMs,
-                ttftSteps = usage?.ttftSteps,
-                decodeMs = usage?.decodeMs,
-                decodeTokens = usage?.decodeTokens,
                 renderMarkdown = false,
             )
 
@@ -524,13 +517,6 @@ internal object AgentConversationStore {
                     requestKind = if (code == SystemNoticeCode.ContextCompaction) {
                         io.github.mangi.eta.agent.runtime.AgentTokenUsage.REQUEST_KIND_COMPACTION
                     } else null,
-                    stepCount = stepCount,
-                    llmMs = llmMs,
-                    toolMs = toolMs,
-                    ttftMs = ttftMs,
-                    ttftSteps = ttftSteps,
-                    decodeMs = decodeMs,
-                    decodeTokens = decodeTokens,
                 ).takeUnless { it.isEmpty }
                 val storedBefore = if (code == SystemNoticeCode.ContextCompaction && noticeUsage != null) {
                     contextTokens
