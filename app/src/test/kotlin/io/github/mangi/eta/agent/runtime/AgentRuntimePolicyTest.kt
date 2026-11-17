@@ -21,7 +21,6 @@ class AgentRuntimePolicyTest {
             AgentRuntimePolicy.Permissions(
                 terminalTools = false,
                 browserTools = false,
-                thinking = false,
                 autoCompaction = false,
                 subagentTools = false,
             ),
@@ -40,7 +39,6 @@ class AgentRuntimePolicyTest {
                 deviceDirectTools = true,
                 deviceSensitiveReadTools = true,
                 deviceSensitiveActionTools = true,
-                thinking = true,
                 subagentTools = true,
             ),
             AgentRuntimePolicy.permissions(preferences),
@@ -55,7 +53,6 @@ class AgentRuntimePolicyTest {
             AgentRuntimePolicy.Permissions(
                 terminalTools = false,
                 browserTools = false,
-                thinking = false,
                 autoCompaction = false,
                 subagentTools = false,
             ),
@@ -93,15 +90,14 @@ class AgentRuntimePolicyTest {
             permissions = AgentRuntimePolicy.Permissions(
                 terminalTools = false,
                 browserTools = false,
-                thinking = false,
                 subagentTools = false,
             ),
         )
 
         assertFalse(constrained.terminalTools)
         assertFalse(constrained.browserTools)
-        assertFalse(constrained.thinkingEnabled)
-        assertEquals(ReasoningEffort.OFF, constrained.reasoningEffort)
+        assertTrue(constrained.thinkingEnabled)
+        assertEquals(ReasoningEffort.DEFAULT, constrained.reasoningEffort)
         assertFalse(constrained.deviceDirectTools)
         assertFalse(constrained.deviceSensitiveReadTools)
         assertFalse(constrained.deviceSensitiveActionTools)
@@ -119,7 +115,6 @@ class AgentRuntimePolicyTest {
             permissions = AgentRuntimePolicy.Permissions(
                 terminalTools = true,
                 browserTools = true,
-                thinking = true,
                 subagentTools = true,
             ),
         )
@@ -136,7 +131,7 @@ class AgentRuntimePolicyTest {
             config = modelConfig(
                 terminalTools = false,
                 browserTools = false,
-                thinking = true,
+                thinking = false,
             ).copy(
                 extraBodyJson = """{"thinking":{"budget_tokens":4096},"temperature":0.2,"generation_config":{"thinking_level":"high","thinking_summaries":"auto","max_output_tokens":4096}}""",
                 customBody = listOf(
@@ -155,7 +150,6 @@ class AgentRuntimePolicyTest {
             permissions = AgentRuntimePolicy.Permissions(
                 terminalTools = false,
                 browserTools = false,
-                thinking = false,
             ),
         )
 
