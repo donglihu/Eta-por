@@ -100,6 +100,9 @@ import io.github.mangi.eta.ui.app.EnhancementSettingsHistory
 import io.github.mangi.eta.ui.app.rememberDeviceCapabilities
 import io.github.mangi.eta.ui.components.EtaArrowPreference
 import io.github.mangi.eta.ui.components.EtaDropdownPreference
+import androidx.compose.material.icons.rounded.Tune
+import io.github.mangi.eta.data.model.ReasoningEffort
+import io.github.mangi.eta.data.model.enabledModel
 import io.github.mangi.eta.ui.components.EtaPreference
 import io.github.mangi.eta.ui.components.EtaPreferenceColors
 import io.github.mangi.eta.ui.components.EtaPreferenceDivider
@@ -209,6 +212,37 @@ private fun SettingsPageContent(
     // LSPosed 数据库）；未就绪时保持 null，UI 禁止修改。
     var prefs by remember { mutableStateOf(Prefs.remotePreferencesForUi(EtaApp.serviceInstance)) }
     val agentPrefs = remember { Prefs.localAgentPreferences() }
+    val effectiveCapabilities = remember(providers, selectedModelId) {
+        providers.enabledModel(selectedModelId)?.let { (provider, model) ->
+            RuntimeConfigRepository.reasoningCapabilities(provider, model)
+        }
+    }
+    val effortOptions = remember(effectiveCapabilities) {
+        effectiveCapabilities?.selectableEfforts?.filter { it != ReasoningEffort.OFF }.orEmpty()
+    }
+    val providerDefaultLabel = stringResource(R.string.conversation_title_settings_reasoning_provider_default)
+    val effortLabels = remember(effortOptions, providerDefaultLabel) {
+        effortOptions.map { effort ->
+            if (effort == ReasoningEffort.DEFAULT) providerDefaultLabel else effort.displayName
+        }
+    }
+    val defaultThinkingKey = Prefs.Keys.AGENT_THINKING_ENABLED
+    val defaultThinkingFallback = Prefs.Keys.BOOLEAN_DEFAULTS.getValue(defaultThinkingKey)
+    val defaultThinkingEnabled = remember(agentPrefs, enhancementHistory) {
+        agentPrefs?.getBoolean(defaultThinkingKey, defaultThinkingFallback)
+            ?: enhancementHistory.checked(defaultThinkingKey, defaultThinkingFallback)
+    }
+    var savedDefaultEffort by remember(agentPrefs) {
+        mutableStateOf(Prefs.defaultReasoningEffort(agentPrefs))
+    }
+    val effectiveSelectedEffort = remember(effectiveCapabilities, savedDefaultEffort) {
+        effectiveCapabilities?.normalize(savedDefaultEffort) ?: ReasoningEffort.DEFAULT
+    }
+    val selectedEffortIndex = remember(effortOptions, effectiveSelectedEffort) {
+        effortOptions.indexOf(effectiveSelectedEffort).takeIf { it >= 0 } ?: 0
+    }
+    val defaultEffortTitle = stringResource(R.string.settings_default_reasoning_effort)
+    val defaultEffortEnabled = agentPrefs != null && defaultThinkingEnabled && effortOptions.size > 1
     var powerAssistantTarget by remember(prefs) {
         mutableStateOf(prefs?.let(Prefs::powerAssistantTarget) ?: enhancementHistory.powerTarget())
     }
@@ -334,6 +368,28 @@ private fun SettingsPageContent(
                         icon = Icons.Rounded.Psychology,
                         iconTint = EtaPreferenceColors.Blue,
                     )
+
+                    EtaPreferenceDivider()
+                    if (effortOptions.size > 1) {
+                        EtaDropdownPreference(
+                            title = defaultEffortTitle,
+                            items = effortLabels.map { DropdownItem(text = it) },
+                            selectedIndex = selectedEffortIndex,
+                            onSelectedIndexChange = { index ->
+                                val chosen = effortOptions.getOrNull(index)
+                                    ?: return@EtaDropdownPreference
+                                val targetPrefs = agentPrefs ?: return@EtaDropdownPreference
+                                if (putStringSync(
+                                        prefs = targetPrefs,
+                                        key = Prefs.Keys.AGENT_DEFAULT_REASONING_EFFORT,
+                                        value = chosen.wireValue,
+                                    )
+                                ) {
+                                    savedDefaultEffort = chosen
+                                }
+                            },
+                        )
+                    }
 
                 }
             }

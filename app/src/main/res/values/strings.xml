@@ -868,6 +868,7 @@
   <string name="accessibility_protection_unavailable">无障碍保护后端不可用，请确认 system 作用域已启用并重启</string>
   <string name="accessibility_protection_rejected">无障碍保护请求被系统拒绝</string>
   <string name="settings_write_failed">配置写入失败</string>
+  <string name="settings_default_reasoning_effort">默认思考深度</string>
   <string name="status_processing">处理中…</string>
   <string name="power_assistant_system_default">系统默认助手</string>
   <string name="provider_error">失败：%1$s</string>
