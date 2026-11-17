@@ -2514,13 +2514,8 @@ internal class AgentAppState(
                     return@launch
                 }
             }
-            val permittedReasoningEffort = if (
-                agentBooleanForUi(Prefs.Keys.AGENT_THINKING_ENABLED)
-            ) {
-                reasoningEffort
-            } else {
-                ReasoningEffort.OFF
-            }
+            // 思考档位不再由 AGENT_THINKING_ENABLED 硬门控：开关只决定默认档位，对话内已选的档位直接生效。
+            val permittedReasoningEffort = reasoningEffort
             val config = RuntimeConfigRepository.runtimeConfigFor(runModelId)?.copy(
                 terminalTools = agentBooleanForUi(Prefs.Keys.AGENT_TERMINAL_TOOLS),
                 browserTools = agentBooleanForUi(Prefs.Keys.AGENT_BROWSER_TOOLS),
