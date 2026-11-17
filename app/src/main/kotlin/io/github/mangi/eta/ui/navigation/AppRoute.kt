@@ -167,7 +167,6 @@ sealed interface AppRoute : NavKey {
     data object GitHubAccount : AppRoute
 
     @Serializable
-    data object Support : AppRoute
 
     @Serializable
     data class McpServerDetail(val serverId: String) : AppRoute

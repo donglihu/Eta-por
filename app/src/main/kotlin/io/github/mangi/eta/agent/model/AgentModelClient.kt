@@ -21,7 +21,6 @@ import io.github.mangi.eta.data.model.ReasoningEffort
 import io.github.mangi.eta.data.provider.BuiltinProviders
 import io.github.mangi.eta.data.provider.GeminiModelCapabilities
 import io.github.mangi.eta.data.provider.ProviderSourceRegistry
-import io.github.mangi.eta.data.provider.isLocalEndpoint
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import io.github.mangi.eta.agent.terminal.TerminalExecutionContext
@@ -318,7 +317,7 @@ internal object AgentModelClient {
         when {
             ProviderAuthModes.isBorrowedVendor(authMode) -> Unit
             authMode == ProviderAuthModes.API_KEY -> require(
-                apiKey.isNotBlank() || baseUrl.isLocalEndpoint(),
+                apiKey.isNotBlank(),
             ) { "请先配置 API Key（本地地址可留空）" }
             ProviderAuthModes.isOAuth(authMode) -> {
                 require(providerId.isNotBlank()) { "账号登录缺少服务商标识，请重新选择服务商" }

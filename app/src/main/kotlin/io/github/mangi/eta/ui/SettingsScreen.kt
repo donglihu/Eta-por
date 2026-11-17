@@ -936,19 +936,6 @@ private fun SettingsPageContent(
 
                     EtaPreferenceDivider()
                     EtaArrowPreference(
-                        title = stringResource(R.string.support_entry),
-                        summary = stringResource(R.string.support_entry_summary),
-                        startAction = {
-                            EtaPreferenceIcon(
-                                icon = Icons.Rounded.Favorite,
-                                tint = EtaPreferenceColors.Orange,
-                            )
-                        },
-                        onClick = { onNavigate(AppRoute.Support) },
-                    )
-
-                    EtaPreferenceDivider()
-                    EtaArrowPreference(
                         title = stringResource(R.string.ui_about_github_star_title),
                         summary = stringResource(R.string.ui_about_github_star_hint),
                         startAction = {

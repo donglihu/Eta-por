@@ -5,7 +5,6 @@ import io.github.mangi.eta.data.model.Model
 import io.github.mangi.eta.data.model.ProviderAuthModes
 import io.github.mangi.eta.data.model.ProviderSetting
 import io.github.mangi.eta.data.provider.ProviderSourceRegistry
-import io.github.mangi.eta.data.provider.isLocalEndpoint
 import java.text.NumberFormat
 import java.util.Locale
 
@@ -116,11 +115,9 @@ internal object AgentModelPickerProjector {
         val groups = enabledProviders
             .asSequence()
             .filter {
-                // 本地/局域网服务不校验 Key，也必须进面板；否则「本地地址代理」永远选不到。
                 ProviderAuthModes.isOAuth(it.authMode) ||
                     ProviderAuthModes.isBorrowedVendor(it.authMode) ||
-                    (it.authMode == ProviderAuthModes.API_KEY &&
-                        (it.apiKey.isNotBlank() || it.baseUrl.isLocalEndpoint()))
+                    (it.authMode == ProviderAuthModes.API_KEY && it.apiKey.isNotBlank())
             }
             .mapNotNull { provider ->
                 val sourceType = ProviderSourceRegistry.resolve(provider)

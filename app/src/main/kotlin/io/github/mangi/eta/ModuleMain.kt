@@ -11,7 +11,6 @@ import io.github.mangi.eta.core.ModuleConfig
 import io.github.mangi.eta.core.ModuleLogger
 import io.github.mangi.eta.core.safeLogType
 import io.github.mangi.eta.hook.aimemory.ColorOsMemoryHooks
-import io.github.mangi.eta.hook.breeno.BreenoHooks
 import io.github.mangi.eta.hook.colordirect.ColorDirectHooks
 import io.github.mangi.eta.hook.google.GoogleAppHooks
 import io.github.mangi.eta.hook.google.GoogleEligibilityHooks
@@ -86,14 +85,6 @@ class ModuleMain : XposedModule() {
                 if (isCurrentPackageProcess(ModuleConfig.COLOR_DIRECT_PACKAGE)) {
                     recordInstallation(
                         ColorDirectHooks.install(this, logger, param.classLoader, param.applicationInfo)
-                    )
-                }
-            }
-
-            ModuleConfig.BREENO_PACKAGE -> {
-                if (isCurrentPackageProcess(ModuleConfig.BREENO_PACKAGE)) {
-                    recordInstallation(
-                        BreenoHooks.install(this, logger, param.classLoader, param.applicationInfo)
                     )
                 }
             }

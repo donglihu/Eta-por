@@ -32,9 +32,6 @@ internal object BuiltinProviders {
     const val HUNYUAN_ID = "builtin-hunyuan"
     const val LOCAL_ID = "builtin-local"
 
-    /** 借用厂商助手（小布）自身模型；不联网、不走 API Key。 */
-    const val BREENO_ID = "builtin-breeno"
-
     /** 订阅账号（Codex / Grok）登录入口，删掉就没有登录入口了。 */
     val SUBSCRIPTION_PROVIDER_IDS: List<String> = listOf(OPENAI_ID, XAI_ID)
 
@@ -43,7 +40,7 @@ internal object BuiltinProviders {
      *
      * ensureBuiltInsMerged() 只播种这个集合里的条目，并删除不在集合内的历史内置项，
      * 所以新增内置 provider 必须同时登记到这里，否则重启后会被清掉。
-     * 借用厂商（小布）不在此列——它单独靠 [BREENO_ID] 注入，且不出现在提供商列表。
+     * 借用厂商（小布）注入已移除，历史库里的 builtin-breeno 条目会在合并时被清掉。
      */
     val SEEDED_PROVIDER_IDS: List<String> by lazy {
         PROVIDERS
@@ -52,24 +49,6 @@ internal object BuiltinProviders {
     }
 
     val PROVIDERS: List<ProviderSetting> = listOf(
-        OpenAiCompatibleProviderSetting(
-            id = BREENO_ID,
-            name = "小布助手（借用）",
-            baseUrl = "http://breeno.local/tap",
-            sourceType = ProviderSourceTypes.CUSTOM,
-            authMode = ProviderAuthModes.BREENO_TAP,
-            isBuiltIn = true,
-            sortOrder = 99,
-            systemPrompt = DEFAULT_SYSTEM_PROMPT,
-            models = listOf(
-                Model(
-                    id = "builtin-breeno-default",
-                    modelId = "breeno",
-                    displayName = "小布助手",
-                    isBuiltIn = true,
-                ),
-            ),
-        ),
         OpenAiCompatibleProviderSetting(
             id = OPENAI_ID,
             name = "OpenAI",
