@@ -109,27 +109,25 @@ internal class AgentExecutionService : Service() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
         val taskCount = leases.count()
+        val contentText = status?.localizedText(resources)
+            ?: resources.getQuantityString(R.plurals.execution_summary, taskCount, taskCount)
         val builder = Notification.Builder(this, CHANNEL)
             .setSmallIcon(R.drawable.ic_notification)
             .setColor(0xFF4285F4.toInt())
             .setContentTitle(getString(R.string.execution_title))
-            .setContentText(
-                status?.localizedText(resources)
-                    ?: resources.getQuantityString(R.plurals.execution_summary, taskCount, taskCount)
-            )
+            .setContentText(contentText)
             .setContentIntent(open)
             .setOngoing(true)
             .setOnlyAlertOnce(true)
             .addAction(Notification.Action.Builder(null, getString(R.string.execution_stop), stop).build())
-        // 运行总卡片保持普通前台服务通知：不申请提升为 Live Update / 流体云。
-        // 逐会话的进度由 RunProgressNotifier 的会话卡片承担，避免同一件事在通知栏里出现两张"正在运行"的流体云。
-        // 若要恢复提升，把下面这段解注释即可。
-        // if (status != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.BAKLAVA) {
-        //     builder
-        //         .setStyle(Notification.ProgressStyle().setProgressIndeterminate(true))
-        //         .setShortCriticalText(status.shortText())
-        //     builder.extras.putBoolean("android.requestPromotedOngoing", true)
-        // }
+        // Agent run 期间把运行总卡片提升为 Live Update：状态栏胶囊、锁屏与流体云都读这张卡。
+        if (status != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.BAKLAVA) {
+            // 不用无进度的 ProgressStyle：那会渲染出一条空进度白条。改用 BigTextStyle 承载状态文本。
+            builder
+                .setStyle(Notification.BigTextStyle().bigText(contentText))
+                .setShortCriticalText(status.shortText())
+            builder.extras.putBoolean("android.requestPromotedOngoing", true)
+        }
         return builder.build()
     }
 

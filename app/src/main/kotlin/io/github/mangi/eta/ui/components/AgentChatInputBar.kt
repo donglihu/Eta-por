@@ -888,7 +888,7 @@ private fun ThinkingEffortChip(
 ) {
     var showPopup by remember { mutableStateOf(false) }
     val active = effort != ReasoningEffort.OFF
-    val menuEnabled = enabled && options.size > 1
+    val menuEnabled = enabled && options.isNotEmpty()
     LaunchedEffect(menuEnabled) {
         if (!menuEnabled) showPopup = false
     }
@@ -919,7 +919,8 @@ private fun ThinkingEffortChip(
             )
         }
         WindowListPopup(
-            show = showPopup && menuEnabled && popupAnchorTopPx > 0,
+            // 锚点尚未测量（0）时也要能弹出：位置提供者会把越界的 Y 夹回窗口内。
+            show = showPopup && menuEnabled,
             popupPositionProvider = popupPositionProvider,
             alignment = PopupPositionProvider.Align.TopStart,
             onDismissRequest = { showPopup = false },
