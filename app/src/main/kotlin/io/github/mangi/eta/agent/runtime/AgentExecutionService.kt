@@ -111,6 +111,7 @@ internal class AgentExecutionService : Service() {
         val taskCount = leases.count()
         val builder = Notification.Builder(this, CHANNEL)
             .setSmallIcon(R.drawable.ic_notification)
+            .setColor(0xFF4285F4.toInt())
             .setContentTitle(getString(R.string.execution_title))
             .setContentText(
                 status?.localizedText(resources)
