@@ -271,7 +271,11 @@ internal class AgentRuntimeRunExecutor(
             toolExecutor = routingExecutor
             toolsBinding = runController.register(routingExecutor::close)
             timing.preparationFinished(skillContext.installedSkills.size)
-            val historyTool = if (request.operation == AgentRuntimeWire.OP_CHAT) {
+            // 手动压缩复用主会话工具目录以保持 Provider 前缀缓存，必须暴露与 OP_CHAT 一致的 conversation_history。
+            val historyTool = if (
+                request.operation == AgentRuntimeWire.OP_CHAT ||
+                request.operation == AgentRuntimeWire.OP_COMPACT
+            ) {
                 val id = conversationId
                 if (id != null) {
                     ConversationHistoryTool {

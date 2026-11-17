@@ -44,6 +44,9 @@ internal data class PendingApproval(
     val allowMultiple: Boolean = false,
     /** 归属会话：新开会话不再继承上一会话的卡。 */
     val conversationKey: String = "",
+    /** 被拦下的工具名与原始参数（JSON 文本）：批准后原样回灌，避免模型改参数导致再次拦截。 */
+    val toolName: String = "",
+    val toolArgs: String = "",
     val createdAt: Long = System.currentTimeMillis(),
 ) {
     val riskLabel: String
@@ -91,6 +94,7 @@ internal object AgentConfirmGuard {
     private const val NOTIFICATION_ID = 8891
 
     /** 批准后同一主体在宽限期内直接放行：同一个按钮不该被连着问三遍。 */
+    private const val MAX_TOOL_ARGS = 1200
     private const val GRANT_WINDOW_MS = 30 * 60 * 1000L
 
     /** 用户显式选择「24 小时内不再问」时的宽限期。同样只在内存里，重启即失效。 */
@@ -251,7 +255,15 @@ internal object AgentConfirmGuard {
             "terminal", "terminal_job", "terminal_daemon" -> args.optString("command").take(40)
             else -> args.optString("path").take(40)
         }
-        return register(context, draft, target, toolName, runId)
+        return register(
+            context = context,
+            draft = draft,
+            target = target,
+            action = toolName,
+            runId = runId,
+            toolName = toolName,
+            toolArgs = args.toString().take(MAX_TOOL_ARGS),
+        )
     }
 
     /** GUI 与非 GUI 共用的登记路径：宽限期、去重、落卡、通知、暂停。 */
@@ -261,6 +273,8 @@ internal object AgentConfirmGuard {
         target: String?,
         action: String,
         runId: String = "",
+        toolName: String = "",
+        toolArgs: String = "",
     ): ConfirmDraft? {
         val subject = subjectOf(draft, target)
         // 归属优先取 run 自己的会话；查不到才退回 UI 当前会话（单会话场景下等价）。
@@ -304,6 +318,8 @@ internal object AgentConfirmGuard {
                 body = body,
                 options = options,
                 conversationKey = owner,
+                toolName = toolName,
+                toolArgs = toolArgs,
             )
         }
         mutatePendings { current ->
@@ -536,7 +552,14 @@ internal object AgentConfirmGuard {
     private fun approvalText(current: PendingApproval): String {
         val detail = current.fields.joinToString(" · ") { "${it.label} ${it.value}" }.take(160)
         val suffix = if (detail.isBlank()) "" else "（$detail）"
-        return "用户已确认「${current.title}」$suffix。请继续执行这一步，不要重复询问同一操作。"
+        // 带上原始调用：只回灌一句「已确认」时，模型常常改写参数或干脆不再发起，命令就永远没被执行。
+        val replay = if (current.toolName.isNotBlank()) {
+            "用户已批准这次调用，请立刻用完全相同的工具与参数重新发起，不要改写命令、不要换别的工具：" +
+                "${current.toolName}(${current.toolArgs})。这次调用已放行，不会再询问。"
+        } else {
+            "请继续执行这一步，不要重复询问同一操作。"
+        }
+        return "用户已确认「${current.title}」$suffix。$replay"
     }
 
     private fun grantFor(current: PendingApproval, remember: Boolean) {
