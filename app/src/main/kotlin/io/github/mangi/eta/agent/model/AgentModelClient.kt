@@ -40,12 +40,8 @@ internal object AgentModelClient {
             runCatching {
                 json.decodeFromString<ModelConfig>(runtimeJson)
             }.getOrNull()?.let { runtime ->
-                val thinkingAllowed = Prefs.isEnabled(Prefs.Keys.AGENT_THINKING_ENABLED)
-                val effort = if (thinkingAllowed) {
-                    runtime.effectiveReasoningEffort
-                } else {
-                    ReasoningEffort.OFF
-                }
+                // 思考是否可用不再由 AGENT_THINKING_ENABLED 硬门控：对话内可随时改档，开关只决定默认档位。
+                val effort = runtime.effectiveReasoningEffort
                 return runtime.copy(
                     terminalTools = Prefs.isEnabled(Prefs.Keys.AGENT_TERMINAL_TOOLS),
                     browserTools = Prefs.isEnabled(Prefs.Keys.AGENT_BROWSER_TOOLS),
@@ -84,10 +80,8 @@ internal object AgentModelClient {
                 Prefs.isEnabled(Prefs.Keys.AGENT_DEVICE_SENSITIVE_READ_TOOLS),
             deviceSensitiveActionTools =
                 Prefs.isEnabled(Prefs.Keys.AGENT_DEVICE_SENSITIVE_ACTION_TOOLS),
-            thinkingEnabled = Prefs.isEnabled(Prefs.Keys.AGENT_THINKING_ENABLED),
-            reasoningEffort = ReasoningEffort.fromLegacy(
-                Prefs.isEnabled(Prefs.Keys.AGENT_THINKING_ENABLED)
-            ),
+            thinkingEnabled = Prefs.defaultReasoningEffort().enablesReasoning,
+            reasoningEffort = Prefs.defaultReasoningEffort(),
         )
     }
 

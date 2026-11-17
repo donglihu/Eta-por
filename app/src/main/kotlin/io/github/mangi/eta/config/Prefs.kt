@@ -3,6 +3,7 @@ package io.github.mangi.eta.config
 import android.content.Context
 import android.content.SharedPreferences
 import io.github.libxposed.service.XposedService
+import io.github.mangi.eta.data.model.ReasoningEffort
 
 /**
  * 模块配置中枢。
@@ -48,6 +49,7 @@ internal object Prefs {
         const val AGENT_DEVICE_SENSITIVE_READ_TOOLS = "agent_device_sensitive_read_tools"
         const val AGENT_DEVICE_SENSITIVE_ACTION_TOOLS = "agent_device_sensitive_action_tools"
         const val AGENT_THINKING_ENABLED = "agent_thinking_enabled"
+        const val AGENT_DEFAULT_REASONING_EFFORT = "agent_default_reasoning_effort"
         const val AGENT_AUTO_COMPACTION_ENABLED = "agent_auto_compaction_enabled"
         const val AGENT_SUBAGENT_ENABLED = "agent_subagent_enabled"
         const val AGENT_RUNTIME_CONFIG_JSON = "agent_runtime_config_json"
@@ -134,6 +136,16 @@ internal object Prefs {
 
     fun getString(key: String): String {
         return remote?.getString(key, "") ?: ""
+    }
+
+    fun defaultReasoningEffort(
+        preferences: SharedPreferences? = localAgent ?: remote,
+    ): ReasoningEffort {
+        val raw = runCatching {
+            preferences?.getString(Keys.AGENT_DEFAULT_REASONING_EFFORT, null)
+        }.getOrNull()
+        val parsed = ReasoningEffort.fromWireValue(raw)
+        return if (parsed != null && parsed != ReasoningEffort.OFF) parsed else ReasoningEffort.DEFAULT
     }
 
     fun powerAssistantTarget(): PowerAssistantTarget = powerAssistantTarget(remote)
