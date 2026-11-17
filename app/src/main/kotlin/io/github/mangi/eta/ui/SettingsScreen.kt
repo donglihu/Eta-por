@@ -14,17 +14,14 @@ import androidx.compose.material.icons.rounded.AccessibilityNew
 import androidx.compose.material.icons.rounded.AccountTree
 import androidx.compose.material.icons.rounded.BarChart
 import androidx.compose.material.icons.rounded.BugReport
-import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.Cloud
 import androidx.compose.material.icons.rounded.Code
 import androidx.compose.material.icons.rounded.Dashboard
 import androidx.compose.material.icons.rounded.Description
-import androidx.compose.material.icons.rounded.Email
 import androidx.compose.material.icons.rounded.Favorite
 import androidx.compose.material.icons.rounded.EditNote
 import androidx.compose.material.icons.rounded.FilterAlt
 import androidx.compose.material.icons.rounded.GppMaybe
-import androidx.compose.material.icons.rounded.Groups
 import androidx.compose.material.icons.rounded.Hearing
 import androidx.compose.material.icons.rounded.Hub
 import androidx.compose.material.icons.rounded.ImportContacts
@@ -115,7 +112,6 @@ import io.github.mangi.eta.ui.components.LanguagePreference
 import io.github.mangi.eta.ui.components.MiuixDialogActions
 import io.github.mangi.eta.ui.components.MiuixScaffoldPage
 import io.github.mangi.eta.ui.navigation.AppRoute
-import io.github.mangi.eta.ui.onboarding.OnboardingKeys
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -129,15 +125,6 @@ import top.yukonga.miuix.kmp.theme.MiuixTheme
  * 开关默认值由 [Prefs.Keys.BOOLEAN_DEFAULTS] 统一定义。Eta Runtime 自己消费的开关写入
  * App 本地配置；仅 Hook 消费的开关通过 RemotePreferences 提交到 LSPosed。
  */
-/** 定制包自己的仓库：关于页的「问题反馈」「源代码」都指这里，不再指上游。 */
-private const val PROJECT_REPO_URL = "https://github.com/Oo0520/Eta-por"
-
-/** QQ 群分享链接（群号 1132120965）。 */
-private const val QQ_GROUP_URL =
-    "https://qun.qq.com/universal-share/share?ac=1&authKey=jPy2myDmmN%2B5gC5JlCsK8pbnx6E5PXTFx4ZLVMJJSdaiikFeSg1e6ltA91UjV8JI&busi_data=eyJncm91cENvZGUiOiIxMTMyMTIwOTY1IiwidG9rZW4iOiJyOFUvYmI4ckJSdWJzY0QwUDhiUmtUc05wQWR4N2F4RGxNSjc4QzdIY0JvUUN1OEJFQks2YTU4M1FDbjdkaGh6IiwidWluIjoiNzM4MzU4NTc1In0%3D&data=MpswJsOJbRm9LY92xuuAwgArXSY2SAW4PY54FMDtqb9GCb8rKwi0C1MESciv7Eo04YtsndNu2DA-ECMMYsCLcg&svctype=4&tempid=h5_group_info"
-
-/** 联系邮箱。 */
-private const val CONTACT_EMAIL = "qm0mp@qq.com"
 
 @Composable
 internal fun SettingsScreen(
@@ -319,30 +306,6 @@ private fun SettingsPageContent(
                         onClick = { onNavigate(AppRoute.DataBackup) },
                     )
 
-                    EtaPreferenceDivider()
-                    EtaArrowPreference(
-                        title = "重置新手引导",
-                        startAction = {
-                            EtaPreferenceIcon(
-                                icon = Icons.Rounded.Refresh,
-                                tint = EtaPreferenceColors.Blue,
-                            )
-                        },
-                        onClick = {
-                            coroutineScope.launch {
-                                SettingsDataStore.updateSettings { current ->
-                                    current.copy(
-                                        seenTourPacks = current.seenTourPacks - OnboardingKeys.All,
-                                    )
-                                }
-                                Toast.makeText(
-                                    context,
-                                    "已重置，回到聊天页后会重新出现",
-                                    Toast.LENGTH_SHORT,
-                                ).show()
-                            }
-                        },
-                    )
                 }
             }
 
@@ -896,56 +859,6 @@ private fun SettingsPageContent(
                         onClick = { onNavigate(AppRoute.DataUsage) },
                     )
 
-                    EtaPreferenceDivider()
-                    EtaArrowPreference(
-                        title = stringResource(R.string.about_group_title),
-                        summary = stringResource(R.string.about_group_summary),
-                        startAction = {
-                            EtaPreferenceIcon(
-                                icon = Icons.Rounded.Groups,
-                                tint = EtaPreferenceColors.Blue,
-                            )
-                        },
-                        onClick = { openUrl(QQ_GROUP_URL) },
-                    )
-
-                    EtaPreferenceDivider()
-                    EtaArrowPreference(
-                        title = stringResource(R.string.about_email_title),
-                        summary = stringResource(R.string.about_email_summary),
-                        startAction = {
-                            EtaPreferenceIcon(
-                                icon = Icons.Rounded.Email,
-                                tint = EtaPreferenceColors.Green,
-                            )
-                        },
-                        onClick = { sendEmail(context, CONTACT_EMAIL) },
-                    )
-
-                    EtaPreferenceDivider()
-                    EtaArrowPreference(
-                        title = stringResource(R.string.ui_about_feedback_title),
-                        startAction = {
-                            EtaPreferenceIcon(
-                                icon = Icons.Rounded.BugReport,
-                                tint = EtaPreferenceColors.Orange,
-                            )
-                        },
-                        onClick = { openUrl("$PROJECT_REPO_URL/issues") },
-                    )
-
-                    EtaPreferenceDivider()
-                    EtaArrowPreference(
-                        title = stringResource(R.string.ui_about_github_star_title),
-                        summary = stringResource(R.string.ui_about_github_star_hint),
-                        startAction = {
-                            EtaPreferenceIcon(
-                                icon = Icons.Rounded.Code,
-                                tint = EtaPreferenceColors.Blue,
-                            )
-                        },
-                        onClick = { openUrl(PROJECT_REPO_URL) },
-                    )
 
                 }
             }
@@ -1281,10 +1194,8 @@ private val SETTINGS_SEARCH_INDEX = listOf(
             R.string.ui_about_bed172,
             R.string.usage_stats_title,
             R.string.data_usage_title,
-            R.string.ui_about_feedback_title,
-            R.string.ui_about_github_star_title,
         ),
-        keywords = "关于 版本 版本号 更新 开源 许可 协议全文 用量 统计 token 消耗 花费 数据占用 清理 数据库 缓存 大小 存储 反馈 问题 报错 github star 源代码 仓库 点赞",
+        keywords = "关于 版本 版本号 更新 开源 许可 协议全文 用量 统计 token 消耗 花费 数据占用 清理 数据库 缓存 大小 存储",
     ),
 )
 
@@ -1360,20 +1271,3 @@ private fun SettingsSearchBar(
     }
 }
 
-/** 拉起邮件客户端；没有就退回复制邮箱。 */
-private fun sendEmail(context: Context, address: String) {
-    val intent = Intent(Intent.ACTION_SENDTO, Uri.parse("mailto:$address")).apply {
-        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-    }
-    if (runCatching { context.startActivity(intent) }.isFailure) {
-        runCatching {
-            val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
-            cm.setPrimaryClip(android.content.ClipData.newPlainText("Eta", address))
-        }
-        Toast.makeText(
-            context.applicationContext,
-            "没有可用的邮件应用，已复制邮箱",
-            Toast.LENGTH_LONG,
-        ).show()
-    }
-}

@@ -467,10 +467,7 @@
   <string name="ui_add_attachment_dba9e8">添加附件</string>
   <string name="ui_clear_84fcd7">清空</string>
   <string name="ui_clear_all_memory_a43bd3">清空全部记忆？</string>
-  <string name="ui_about_github_star_title">源代码</string>
-  <string name="ui_about_github_star_hint">如果 Eta Por 帮到了你，请在 GitHub 点个 Star，这对我们意义重大</string>
   <string name="ui_about_version_title">版本</string>
-  <string name="ui_about_feedback_title">问题反馈</string>
   <string name="settings_search_hint">搜索设置项</string>
   <string name="settings_search_empty">没有匹配的设置项</string>
   <string name="ui_click_to_reinstall_dc60de">点击重新安装</string>
@@ -2343,10 +2340,6 @@
     <string name="support_alipay_title">支付宝</string>
     <string name="support_alipay_summary">一键打开付款页</string>
     <string name="support_section_long_term">长期支持</string>
-    <string name="about_group_title">加入交流群</string>
-    <string name="about_group_summary">QQ 群 1132120965</string>
-    <string name="about_email_title">邮件联系</string>
-    <string name="about_email_summary">qm0mp@qq.com</string>
     <string name="support_afdian_title">爱发电</string>
     <string name="support_afdian_summary">按月或单次赞助，平台内支付</string>
     <string name="support_link_missing">没有可打开的应用，已复制链接</string>
