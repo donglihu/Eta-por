@@ -375,4 +375,75 @@ class EtaDatabaseMigrationTest {
             "INSERT OR REPLACE INTO room_master_table (id, identity_hash) VALUES (42, 'bd87dd0053b011246cba304c35316f07')",
         )
     }
+
+    /**
+     * 32 → 33：两条来源路径（branch 32 起、本地装机 31 起升级到 32 后）跑完必须收敛到同一份列集合，
+     * 且重复执行不抛 duplicate column（幂等）。
+     */
+    @Test
+    fun migration32To33ConvergesBothUpgradePaths() {
+        val context = RuntimeEnvironment.getApplication() as Context
+        val expectedMessageColumns = setOf(
+            "cache_write_tokens",
+            "compaction_archive_id",
+            "system_prompt_tokens",
+            "tool_definition_tokens",
+            "conversation_tokens",
+            "first_token_ms",
+            "tool_duration_ms",
+            "request_count",
+        )
+
+        fun runMigration(name: String, initial: (SupportSQLiteDatabase) -> Unit): Set<String> {
+            val configuration = SupportSQLiteOpenHelper.Configuration.builder(context)
+                .name(name)
+                .callback(
+                    object : SupportSQLiteOpenHelper.Callback(32) {
+                        override fun onCreate(db: SupportSQLiteDatabase) = initial(db)
+                        override fun onUpgrade(db: SupportSQLiteDatabase, oldVersion: Int, newVersion: Int) = Unit
+                    },
+                )
+                .build()
+            return FrameworkSQLiteOpenHelperFactory().create(configuration).use { helper ->
+                val database = helper.writableDatabase
+                EtaDatabase.MIGRATION_32_33.migrate(database)
+                // 幂等：同一份库上再跑一遍，不能因列已存在而抛 duplicate column
+                EtaDatabase.MIGRATION_32_33.migrate(database)
+                database.query("PRAGMA table_info(conversation_messages)").use { cursor ->
+                    val nameIndex = cursor.getColumnIndexOrThrow("name")
+                    buildSet { while (cursor.moveToNext()) add(cursor.getString(nameIndex)) }
+                }
+            }
+        }
+
+        val branchPath = "migration-32-33-branch-${UUID.randomUUID()}.db"
+        val localPath = "migration-32-33-local-${UUID.randomUUID()}.db"
+        try {
+            val fromBranch = runMigration(branchPath) { db ->
+                db.execSQL(
+                    "CREATE TABLE conversation_messages (id TEXT NOT NULL PRIMARY KEY, " +
+                        "system_prompt_tokens INTEGER, tool_definition_tokens INTEGER, " +
+                        "conversation_tokens INTEGER, first_token_ms INTEGER, " +
+                        "tool_duration_ms INTEGER, request_count INTEGER)",
+                )
+                db.execSQL("CREATE TABLE token_usage_records (id INTEGER NOT NULL PRIMARY KEY)")
+            }
+            val fromLocal = runMigration(localPath) { db ->
+                db.execSQL(
+                    "CREATE TABLE conversation_messages (id TEXT NOT NULL PRIMARY KEY, " +
+                        "cache_write_tokens INTEGER, compaction_archive_id TEXT, request_count INTEGER)",
+                )
+                db.execSQL(
+                    "CREATE TABLE token_usage_records (id INTEGER NOT NULL PRIMARY KEY, " +
+                        "cache_write_tokens INTEGER, request_kind TEXT)",
+                )
+            }
+            assertEquals(expectedMessageColumns, fromBranch.intersect(expectedMessageColumns))
+            assertEquals(expectedMessageColumns, fromLocal.intersect(expectedMessageColumns))
+            assertEquals(fromBranch, fromLocal)
+        } finally {
+            context.deleteDatabase(branchPath)
+            context.deleteDatabase(localPath)
+        }
+    }
 }
