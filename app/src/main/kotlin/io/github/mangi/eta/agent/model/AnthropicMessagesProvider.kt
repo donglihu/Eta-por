@@ -99,7 +99,8 @@ internal object AnthropicMessagesProvider : AgentProviderClient {
             messages.optJSONObject(index)?.let {
                 it.optString("role") == "user" &&
                     !it.optBoolean("_eta_observation") &&
-                    !it.optBoolean("_eta_compaction_prompt")
+                    !it.optBoolean("_eta_compaction_prompt") &&
+                    !it.optBoolean("_eta_steering")
             } == true
         } ?: -1
         for (index in 0 until messages.length()) {

@@ -11,6 +11,7 @@ import android.os.Build
 import android.content.Context
 import android.content.Intent
 import android.content.res.Configuration
+import android.os.Bundle
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
@@ -257,6 +258,8 @@ internal class AgentRuntimeService : Service(), LifecycleOwner, SavedStateRegist
             if (!isMessageSenderAllowed(msg)) {
                 if (msg.what == AgentRuntimeWire.MSG_START_RUN) {
                     AgentRuntimeWire.closeImageDescriptors(msg.data)
+                } else if (msg.what == AgentRuntimeWire.MSG_STEER) {
+                    AgentWireText.close(msg.data)
                 }
                 return
             }
@@ -297,11 +300,16 @@ internal class AgentRuntimeService : Service(), LifecycleOwner, SavedStateRegist
                     msg.data?.let(AgentRuntimeWire::runIdFromBundle)?.takeIf { it.isNotBlank() },
                 )
                 AgentRuntimeWire.MSG_STEER -> {
-                    val text = msg.data?.getString(AgentRuntimeWire.KEY_PROMPT).orEmpty().trim()
-                    val conversationId = msg.data
-                        ?.getString(AgentRuntimeWire.KEY_CONVERSATION_ID)
-                        .orEmpty()
-                    if (text.isNotBlank()) requestSupplement(text, conversationId)
+                    val data = msg.data
+                    val runId = data?.let { AgentRuntimeWire.runIdFromBundle(it) }.orEmpty()
+                    if (runId.isNotBlank()) {
+                        steerRun(data, msg.replyTo)
+                    } else {
+                        // 旧格式：浮层按 conversationId 定位的 fire-and-forget steering。
+                        val text = data?.getString(AgentRuntimeWire.KEY_PROMPT).orEmpty().trim()
+                        val conversationId = data?.getString(AgentRuntimeWire.KEY_CONVERSATION_ID).orEmpty()
+                        if (text.isNotBlank()) requestSupplement(text, conversationId)
+                    }
                 }
 
                 AgentRuntimeWire.MSG_ACK_RESULT -> {
@@ -1112,6 +1120,57 @@ internal class AgentRuntimeService : Service(), LifecycleOwner, SavedStateRegist
             ?.takeIf { handoff -> handoff.source == AgentRuntimeWire.AGENT_UI_HANDOFF_SOURCE }
             ?.let { handoff -> AgentUiHandoffPayload.from(handoff.payload).conversationId }
             .orEmpty()
+
+    private fun steerRun(data: Bundle?, replyTo: Messenger?) {
+        if (data == null) {
+            sendSteerResponse("", replyTo, accepted = false)
+            return
+        }
+        var runId = ""
+        val text = try {
+            runId = AgentRuntimeWire.runIdFromBundle(data)
+            AgentRuntimeWire.steerTextFromBundle(data).trim()
+        } catch (throwable: Throwable) {
+            AndroidAgentLogger.warnThrottled("runtime_invalid_steer_request") {
+                "Agent runtime rejected invalid steer request: type=${throwable.safeLogType()}"
+            }
+            ""
+        } finally {
+            AgentWireText.close(data)
+        }
+        val session = runId.takeIf(String::isNotBlank)?.let(sessions::get)
+        val event = if (session != null && text.isNotBlank()) {
+            session.steer(text) { recordSupplementEvent(text) }
+        } else {
+            null
+        }
+        if (event != null) {
+            AndroidAgentLogger.info(
+                "Agent runtime supplement received: index=${event.index}, chars=${event.text.length}"
+            )
+            state.value = state.value.applyEvent(event)
+            sendSteerResponse(runId, replyTo, accepted = true, supplementIndex = event.index)
+        } else {
+            sendSteerResponse(runId, replyTo, accepted = false)
+        }
+    }
+
+    private fun sendSteerResponse(
+        runId: String,
+        replyTo: Messenger?,
+        accepted: Boolean,
+        supplementIndex: Int = 0,
+    ) {
+        runCatching {
+            val msg = Message.obtain(null, AgentRuntimeWire.MSG_STEER_RESPONSE)
+            msg.data = AgentRuntimeWire.steerResponseBundle(runId, accepted, supplementIndex)
+            replyTo?.send(msg)
+        }.onFailure { throwable ->
+            AndroidAgentLogger.warnThrottled("runtime_steer_response_delivery_failed") {
+                "Agent runtime steer response failed: type=${throwable.safeLogType()}"
+            }
+        }
+    }
 
     private fun requestSupplement(text: String, conversationId: String = "") {
         val supplementText = text.trim()

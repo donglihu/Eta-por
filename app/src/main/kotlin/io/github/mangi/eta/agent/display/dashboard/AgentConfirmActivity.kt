@@ -165,7 +165,7 @@ internal class AgentConfirmActivity : ComponentActivity() {
                             modifier = Modifier.clickable {
                                 if (steer.isNotBlank()) {
                                     runCatching { AgentRuntimeClient(applicationContext, io.github.mangi.eta.core.AndroidAgentLogger)
-                                        .steerRun(steer, conversation) }
+                                        .steerByConversation(steer, conversation) }
                                     steer = ""
                                 }
                             }.padding(start = 10.dp),
@@ -200,7 +200,7 @@ internal class AgentConfirmActivity : ComponentActivity() {
         val text = reply?.takeIf { it.isNotBlank() } ?: return
         runCatching {
             AgentRuntimeClient(applicationContext, io.github.mangi.eta.core.AndroidAgentLogger)
-                .steerRun(text, conversation)
+                .steerByConversation(text, conversation)
         }
     }
 

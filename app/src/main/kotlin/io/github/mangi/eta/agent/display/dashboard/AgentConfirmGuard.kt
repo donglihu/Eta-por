@@ -613,7 +613,7 @@ internal object AgentConfirmGuard {
     private fun steer(context: Context?, text: String, conversationId: String) {
         val app = context?.applicationContext ?: return
         runCatching {
-            AgentRuntimeClient(app, AndroidAgentLogger).steerRun(text, conversationId)
+            AgentRuntimeClient(app, AndroidAgentLogger).steerByConversation(text, conversationId)
         }.onFailure {
             AndroidAgentLogger.warn("Confirm steer failed: ${it.message}")
         }

@@ -442,7 +442,7 @@ internal object AgentLiveCoordinator {
             }.getOrDefault(false)
             if (!deliveredToSubagent) {
                 runCatching {
-                    AgentRuntimeClient(app, io.github.mangi.eta.core.AndroidAgentLogger).steerRun(notice)
+                    AgentRuntimeClient(app, io.github.mangi.eta.core.AndroidAgentLogger).steerByConversation(notice)
                 }
             }
         }

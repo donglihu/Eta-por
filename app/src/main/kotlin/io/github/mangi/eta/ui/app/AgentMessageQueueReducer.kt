@@ -31,6 +31,36 @@ internal object AgentMessageQueueReducer {
         )
     }
 
+    /** 将条目置顶到队首并清除插话标记，用于不支持运行时 Steer（如含图片）时等待当前 Run 结束后优先发送。 */
+    fun promoteToQueueHead(
+        state: AgentChatUiState,
+        id: String,
+    ): AgentChatUiState {
+        val target = state.queuedMessages.firstOrNull { it.id == id } ?: return state
+        val rest = state.queuedMessages
+            .filterNot { it.id == id }
+            .map { it.copy(immediateInterrupt = false) }
+        return state.copy(
+            queuedMessages = listOf(target.copy(immediateInterrupt = false)) + rest,
+        )
+    }
+
+    /** 将刚入队且无法立即 Steer 的条目置顶到队首（清除草稿，不中断当前运行）。 */
+    fun enqueueAtHead(
+        state: AgentChatUiState,
+        item: QueuedMessageUi,
+    ): AgentChatUiState {
+        val normalized = item.copy(immediateInterrupt = false)
+        val rest = state.queuedMessages.map { it.copy(immediateInterrupt = false) }
+        return state.copy(
+            input = "",
+            pendingImages = emptyList(),
+            pendingFileReferences = emptyList(),
+            messageEdit = null,
+            queuedMessages = listOf(normalized) + rest,
+        )
+    }
+
     /**
      * 将队列中的指定消息提升为立即插话。
      *
@@ -93,6 +123,15 @@ internal object AgentMessageQueueReducer {
         if (state.queuedMessages.none { it.immediateInterrupt }) return state
         return state.copy(
             queuedMessages = state.queuedMessages.map { it.copy(immediateInterrupt = false) },
+        )
+    }
+
+    fun clearInterruptFlag(state: AgentChatUiState, id: String): AgentChatUiState {
+        if (state.queuedMessages.none { it.id == id && it.immediateInterrupt }) return state
+        return state.copy(
+            queuedMessages = state.queuedMessages.map { item ->
+                if (item.id == id && item.immediateInterrupt) item.copy(immediateInterrupt = false) else item
+            },
         )
     }
 
