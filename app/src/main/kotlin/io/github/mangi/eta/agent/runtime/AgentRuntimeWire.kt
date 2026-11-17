@@ -89,6 +89,9 @@ internal object AgentRuntimeWire {
     const val MSG_RESUME = 17
     const val MSG_STEER = 18
 
+    /** service -> client：返回 steering 是否已被当前活跃 run 接纳及分配的补充序号。 */
+    const val MSG_STEER_RESPONSE = 19
+
     // 组件所在包 = applicationId（正式版 io.github.mangi.eta / 测试版 .beta），随安装身份变。
     private val MODULE_PACKAGE = BuildConfig.APPLICATION_ID
     // 类名由 namespace 决定，**不随 applicationId 变**。测试版曾把它一起拼成
@@ -164,6 +167,8 @@ internal object AgentRuntimeWire {
     private const val LEGACY_BREENO_HANDOFF_SOURCE = "breeno"
     private const val KEY_CREATED_AT = "created_at"
     private const val KEY_RESULTS = "results"
+    private const val KEY_STEER_TEXT = "steer_text"
+    private const val KEY_SUPPLEMENT_INDEX = "supplement_index"
     private const val MAX_RESULT_CONTENT_CHARS = 64_000
     private const val MAX_RESULT_REASONING_CHARS = 32_000
     private const val MAX_DRAIN_CONTENT_CHARS = 16_000
@@ -649,6 +654,28 @@ internal object AgentRuntimeWire {
 
     fun attachRunSucceeded(bundle: Bundle): Boolean = bundle.getBoolean(KEY_OK)
 
+    fun steerBundle(runId: String, text: String, textCacheDir: File? = null): Bundle = Bundle().apply {
+        putString(KEY_RUN_ID, runId)
+        AgentWireText.put(this, KEY_STEER_TEXT, text, textCacheDir)
+    }
+
+    fun steerTextFromBundle(bundle: Bundle): String =
+        AgentWireText.read(bundle, KEY_STEER_TEXT).orEmpty()
+
+    fun steerResponseBundle(
+        runId: String,
+        accepted: Boolean,
+        supplementIndex: Int = 0,
+    ): Bundle = Bundle().apply {
+        putString(KEY_RUN_ID, runId)
+        putBoolean(KEY_OK, accepted)
+        putInt(KEY_SUPPLEMENT_INDEX, supplementIndex)
+    }
+
+    fun steerAcceptedFromBundle(bundle: Bundle): Boolean = bundle.getBoolean(KEY_OK)
+
+    fun steerSupplementIndexFromBundle(bundle: Bundle): Int = bundle.getInt(KEY_SUPPLEMENT_INDEX)
+
     fun runIdFromBundle(bundle: Bundle): String =
         bundle.getString(KEY_RUN_ID).orEmpty()
 
@@ -734,6 +761,7 @@ internal object AgentRuntimeWire {
                 putInt("index", event.index)
                 putString("block_id", event.blockId)
                 putString("name", event.name)
+                event.startedAtEpochMs?.let { putLong("started_at_epoch_ms", it) }
             }
 
             is AgentEvent.AssistantBlockDelta -> {
@@ -754,6 +782,7 @@ internal object AgentRuntimeWire {
                 putString("name", event.name)
                 putInt("content_chars", event.contentChars)
                 putString("replacement_content", event.replacementContent)
+                event.elapsedMs?.let { putLong("elapsed_ms", it) }
             }
 
             is AgentEvent.SearchSuggestions -> {
@@ -903,6 +932,7 @@ internal object AgentRuntimeWire {
             index = bundle.getInt("index"),
             blockId = bundle.getString("block_id"),
             name = bundle.getString("name"),
+            startedAtEpochMs = bundle.optionalLong("started_at_epoch_ms"),
         )
 
         "assistant_block_delta" -> AgentEvent.AssistantBlockDelta(
@@ -925,6 +955,7 @@ internal object AgentRuntimeWire {
             name = bundle.getString("name"),
             contentChars = bundle.getInt("content_chars"),
             replacementContent = bundle.getString("replacement_content"),
+            elapsedMs = bundle.optionalLong("elapsed_ms"),
         )
 
         "search_suggestions" -> bundle.getString("html")
@@ -1013,6 +1044,9 @@ internal object AgentRuntimeWire {
 
     private fun Bundle.optionalInt(key: String): Int? =
         if (containsKey(key)) getInt(key) else null
+
+    private fun Bundle.optionalLong(key: String): Long? =
+        if (containsKey(key)) getLong(key) else null
 
     private fun Bundle.putTokenUsage(usage: AgentTokenUsage, prefix: String = "usage_") {
         usage.contextTokens?.let { putInt("${prefix}context", it) }

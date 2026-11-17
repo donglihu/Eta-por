@@ -59,6 +59,7 @@ internal class AgentLoop(
     private var availableToolNames = emptySet<String>()
     private var toolCallValidator = AgentToolCallValidator(localToolsOnly(tools))
     private val accumulatedReasoning = StringBuilder()
+    private val thinkingBlockStartMs = mutableMapOf<Pair<Int, Int>, Long>()
     private val sensitiveToolCallIds = linkedSetOf<String>()
     private val toolBatchLock = Any()
     private var pendingToolImageMessage: JSONObject? = null
@@ -174,9 +175,15 @@ internal class AgentLoop(
                         if (providerEvent is ProviderEvent.Usage) {
                             roundInputTokens = providerEvent.contextInputTokens ?: roundInputTokens
                         }
+                        if (providerEvent is ProviderEvent.BlockStart &&
+                            providerEvent.kind == AssistantBlockKind.THINKING
+                        ) {
+                            thinkingBlockStartMs[attemptRound to providerEvent.index] = SystemClock.elapsedRealtime()
+                        }
                         if (providerEvent is ProviderEvent.BlockDelta &&
                             providerEvent.kind == AssistantBlockKind.THINKING
                         ) {
+                            thinkingBlockStartMs.putIfAbsent(attemptRound to providerEvent.index, SystemClock.elapsedRealtime())
                             accumulatedReasoning.append(providerEvent.delta)
                         }
                         providerEvent.toAgentEvent(attemptRound)?.let(onEvent)
@@ -319,6 +326,7 @@ internal class AgentLoop(
     private fun steeringMessage(supplement: String): JSONObject =
         AgentConversationCodec.userTextMessage(steeringPrompt(supplement))
             .put("_eta_message_id", "user-$operationId-supplement-${++supplementIndex}")
+            .put("_eta_steering", true)
 
     /** 过滤掉远端工具后的本地工具清单，用于参数预检；远端工具交给服务器自己判。 */
     private fun localToolsOnly(tools: JSONArray): JSONArray {
@@ -665,6 +673,7 @@ internal class AgentLoop(
                 index = index,
                 blockId = blockId,
                 name = name,
+                startedAtEpochMs = if (kind == AssistantBlockKind.THINKING) System.currentTimeMillis() else null,
             )
             is ProviderEvent.BlockDelta -> AgentEvent.AssistantBlockDelta(
                 round = round,
@@ -681,6 +690,12 @@ internal class AgentLoop(
                 name = name,
                 contentChars = content.length,
                 replacementContent = content.takeIf { replaceContent },
+                elapsedMs = if (kind == AssistantBlockKind.THINKING) {
+                    thinkingBlockStartMs.remove(round to index)
+                        ?.let { startedAt -> (SystemClock.elapsedRealtime() - startedAt).coerceAtLeast(0L) }
+                } else {
+                    null
+                },
             )
             is ProviderEvent.Usage -> AgentEvent.UsageReceived(round = round, usage = usage.withContextComposition())
             is ProviderEvent.HostedToolStarted -> AgentEvent.HostedToolStarted(
