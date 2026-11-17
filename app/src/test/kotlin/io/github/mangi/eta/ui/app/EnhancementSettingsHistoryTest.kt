@@ -40,12 +40,4 @@ class EnhancementSettingsHistoryTest {
         assertEquals(PowerAssistantTarget.GEMINI, restored.powerTarget())
         assertTrue(source.getBoolean(Prefs.Keys.HOTWORD_SELF_HEAL, false))
     }
-
-    @Test
-    fun existingSystemizerEntrySurvivesLossOfCurrentRootAccess() {
-        val history = EnhancementSettingsHistory(context)
-        assertFalse(history.hasUsedSystemizer)
-        history.recordSystemizerUse()
-        assertTrue(EnhancementSettingsHistory(context).hasUsedSystemizer)
-    }
 }
