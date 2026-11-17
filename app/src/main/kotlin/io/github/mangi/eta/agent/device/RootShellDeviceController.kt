@@ -851,7 +851,12 @@ internal class RootShellDeviceController(
             )
             return emptyList()
         }
-        return parseUiNodes(result.output, maxNodes)
+        val parsed = parseUiNodes(result.output, maxNodes)
+        logger.info(
+            "Agent device action=dump_ui outcome=succeeded source=root " +
+                "exitCode=${result.exitCode} nodeCount=${parsed.size} outputChars=${result.output.length}"
+        )
+        return parsed
     }
 
     private fun parseUiNodes(xml: String, maxNodes: Int): List<UiNode> {
