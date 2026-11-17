@@ -8,7 +8,7 @@ import androidx.room.RoomDatabase
 import androidx.room.migration.Migration
 
 /** 结构版本的唯一来源：@Database 与自检页共用，文案里不再写字面量。 */
-internal const val ETA_DB_SCHEMA_VERSION = 33
+internal const val ETA_DB_SCHEMA_VERSION = 34
 
 @Database(
     entities = [
@@ -85,6 +85,7 @@ internal abstract class EtaDatabase : RoomDatabase() {
                         MIGRATION_30_31,
                         MIGRATION_31_32,
                         MIGRATION_32_33,
+                        MIGRATION_33_34,
                     )
                     .addCallback(object : Callback() {
                         override fun onCreate(db: androidx.sqlite.db.SupportSQLiteDatabase) { createTextChunkCleanup(db) }
@@ -249,6 +250,10 @@ internal abstract class EtaDatabase : RoomDatabase() {
             database.addColumnIfMissing("conversation_messages", "request_count", "INTEGER")
         }
 
+        internal val MIGRATION_33_34 = Migration(33, 34) { database ->
+            database.execSQL("ALTER TABLE mcp_servers ADD COLUMN tools_truncation_reason TEXT")
+        }
+
         /** 只在列不存在时 ALTER，供 [MIGRATION_32_33] 合并两条来源路径。 */
         private fun androidx.sqlite.db.SupportSQLiteDatabase.addColumnIfMissing(
             table: String,
@@ -272,7 +277,8 @@ internal abstract class EtaDatabase : RoomDatabase() {
         private fun createTextChunkCleanup(database: androidx.sqlite.db.SupportSQLiteDatabase) {
             mapOf("runtime_results" to "run_id", "runtime_archive_runs" to "archive_run_id",
                 "runtime_inflight_runs" to "run_id", "conversation_context_checkpoints" to "conversation_id",
-                "conversation_messages" to "id", "conversations" to "id")
+                "conversation_messages" to "id", "conversations" to "id",
+                "mcp_servers" to "id")
                 .plus(if (database.version >= 21 || database.query(
                     "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'roleplay_characters'"
                 ).use { it.moveToFirst() }) mapOf("roleplay_characters" to "id", "roleplay_user_persona" to "id") else emptyMap())

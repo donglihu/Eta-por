@@ -35,6 +35,7 @@ import io.github.mangi.eta.R
 import io.github.mangi.eta.agent.mcp.McpServerManager
 import io.github.mangi.eta.agent.mcp.validateMcpEndpoint
 import io.github.mangi.eta.data.model.McpAuthorizationType
+import io.github.mangi.eta.data.model.McpDiscoveryTruncation
 import io.github.mangi.eta.data.model.McpProtocolMode
 import io.github.mangi.eta.data.model.McpServerSetting
 import io.github.mangi.eta.data.model.McpToolDefinition
@@ -109,10 +110,15 @@ internal fun McpServersScreen(
                 } else {
                     servers.forEachIndexed { index, server ->
                         if (index > 0) EtaPreferenceDivider(hasLeading = false)
+                        val summaryRes = if (server.toolsTruncationReason != null) {
+                            R.string.mcp_server_row_summary_truncated
+                        } else {
+                            R.string.mcp_server_row_summary
+                        }
                         EtaArrowPreference(
                             title = server.name,
                             summary = stringResource(
-                                R.string.mcp_server_row_summary,
+                                summaryRes,
                                 server.activeTools.size,
                                 server.tools.size,
                             ),
@@ -216,9 +222,14 @@ internal fun McpServersScreen(
                             url = ""
                             token = ""
                             error = null
+                            val messageRes = if (it.toolsTruncationReason != null) {
+                                R.string.mcp_server_added_truncated
+                            } else {
+                                R.string.mcp_server_added
+                            }
                             Toast.makeText(
                                 context,
-                                resources.getString(R.string.mcp_server_added, it.tools.size),
+                                resources.getString(messageRes, it.tools.size),
                                 Toast.LENGTH_SHORT,
                             ).show()
                         }.onFailure {
@@ -264,7 +275,14 @@ internal fun McpServerDetailScreen(
                         Toast.makeText(
                             context,
                             result.fold(
-                                onSuccess = { resources.getString(R.string.mcp_refreshed, it.tools.size) },
+                                onSuccess = {
+                                    val messageRes = if (it.toolsTruncationReason != null) {
+                                        R.string.mcp_refreshed_truncated
+                                    } else {
+                                        R.string.mcp_refreshed
+                                    }
+                                    resources.getString(messageRes, it.tools.size)
+                                },
                                 onFailure = { it.message ?: resources.getString(R.string.mcp_refresh_failed) },
                             ),
                             Toast.LENGTH_SHORT,
@@ -372,6 +390,20 @@ internal fun McpServerDetailScreen(
                             EtaTextButton(text = "可写（${writable.size}）", onClick = { enable(writable) })
                         }
                     }
+                }
+            }
+        }
+        server.toolsTruncationReason?.let { reason ->
+            item(key = "tools-truncated") {
+                EtaPreferenceGroup(modifier = Modifier.padding(horizontal = EtaPreferenceDefaults.SidePadding)) {
+                    EtaPreference(
+                        title = stringResource(R.string.mcp_tools_truncated_title, server.tools.size),
+                        titleColor = BasicComponentColors(
+                            color = MiuixTheme.colorScheme.error,
+                            disabledColor = MiuixTheme.colorScheme.disabledOnSurface,
+                        ),
+                        summary = stringResource(reason.summaryRes()),
+                    )
                 }
             }
         }
@@ -573,3 +605,10 @@ private fun githubPresetNames(tools: List<McpToolDefinition>): Set<String> = too
 
 private fun isGitHubServer(server: McpServerSetting): Boolean =
     server.url.contains("githubcopilot", ignoreCase = true)
+
+private fun McpDiscoveryTruncation.summaryRes(): Int = when (this) {
+    McpDiscoveryTruncation.TOOL_LIMIT -> R.string.mcp_tools_truncated_tool_limit
+    McpDiscoveryTruncation.PAGE_LIMIT -> R.string.mcp_tools_truncated_page_limit
+    McpDiscoveryTruncation.SIZE_LIMIT -> R.string.mcp_tools_truncated_size_limit
+    McpDiscoveryTruncation.CURSOR_LOOP -> R.string.mcp_tools_truncated_cursor_loop
+}
