@@ -88,6 +88,7 @@ sealed interface AppRoute : NavKey {
     @Serializable
     data object DiagnosticsCenter : AppRoute
 
+    @Serializable
     data object DiagnosticsPatrol : AppRoute
 
     @Serializable
