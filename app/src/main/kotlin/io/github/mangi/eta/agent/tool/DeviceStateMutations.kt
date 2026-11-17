@@ -45,7 +45,9 @@ internal class DeviceStateMutations(
         DeviceToolContract.userScopeError(args, userId)?.let { return it.toString() }
         val target = args.optString("target").lowercase(Locale.ROOT)
         val enabled = args.opt("enabled") as? Boolean ?: return invalid("enabled 必须是布尔值")
-        if (target !in setOf("wifi", "bluetooth")) return SystemStateControls(context, logger, executeRoot).set(target, enabled).toString()
+        if (target !in setOf("wifi", "bluetooth")) {
+            return SystemStateControls(context, logger, executeRoot).set(target, enabled).toString()
+        }
         val command = when (target) {
             "wifi" -> "cmd wifi set-wifi-enabled ${if (enabled) "enabled" else "disabled"}"
             "bluetooth" -> "cmd bluetooth_manager ${if (enabled) "enable" else "disable"}"
