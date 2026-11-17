@@ -68,6 +68,8 @@ internal fun ModelProviderListScreen(
     val filteredProviders = remember(providers, searchQuery) {
         val query = searchQuery.trim()
         providers.filter { provider ->
+            // 只显示用户自己配置的提供商，隐藏内置/预置（OpenAI、DeepSeek、Gemini 等官方 seed）。
+            !provider.isBuiltIn &&
             // 借用厂商由设置开关控制，不进「已配置提供商」列表，只在对话页模型列表里出现。
             !ProviderAuthModes.isBorrowedVendor(provider.authMode) &&
                 (query.isBlank() ||

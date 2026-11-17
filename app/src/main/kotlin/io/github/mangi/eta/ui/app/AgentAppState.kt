@@ -351,7 +351,8 @@ internal class AgentAppState(
         capabilities: ModelReasoningCapabilities? = currentReasoningCapabilities,
     ): ReasoningEffort {
         if (!agentBooleanForUi(Prefs.Keys.AGENT_THINKING_ENABLED)) {
-            return capabilities?.normalize(ReasoningEffort.OFF) ?: ReasoningEffort.OFF
+            // 直接 OFF：normalize(OFF) 在 OFF 不在可选档位里时会回退到 DEFAULT，导致开关关掉后仍默认思考。
+            return ReasoningEffort.OFF
         }
         val requested = Prefs.defaultReasoningEffort(Prefs.localAgentPreferences())
         return capabilities?.normalize(requested) ?: requested
