@@ -438,6 +438,8 @@ fun AgentAppRoot(
                     topInset = WindowInsets.statusBars.asPaddingValues().calculateTopPadding() + 56.dp,
                     onDismiss = { workspaceSheetOpen = false },
                     onOpenMarkdown = { path, text -> workspaceMarkdown = path to text },
+                    // 文件区长按 → 当前会话引用；面板把输入栏推到屏外，成功提示由 attach 内部 Toast 给。
+                    onAttachReference = { absolutePath -> agentState.attachWorkspaceReference(absolutePath) },
                 )
             },
             conversationTrimmed = agentState.historyTrimNotice,
@@ -918,7 +920,10 @@ fun AgentAppRoot(
                 )
             }
             entry<AppRoute.Workspace>(swipeDismiss = swipeDismiss) {
-                WorkspaceScreen(onBack = ::popRoute)
+                WorkspaceScreen(
+                    onBack = ::popRoute,
+                    onAttachReference = { absolutePath -> agentState.attachWorkspaceReference(absolutePath) },
+                )
             }
             entry<AppRoute.Settings>(swipeDismiss = swipeDismiss) {
                 SettingsScreen(

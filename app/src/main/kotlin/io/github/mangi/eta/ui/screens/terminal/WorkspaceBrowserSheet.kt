@@ -7,10 +7,11 @@ import android.util.Log
 import android.net.Uri
 import android.text.format.Formatter
 import android.widget.Toast
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.ui.graphics.Color
 import androidx.compose.foundation.layout.heightIn
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -107,6 +108,8 @@ internal fun WorkspaceBrowserSheet(
     onDismiss: () -> Unit,
     /** 预览交给宿主渲染：弹层是树内底部弹层，放在被裁剪的面板里会被截掉。 */
     onOpenMarkdown: ((String, String) -> Unit)? = null,
+    /** 长按文件或文件夹 → 交给宿主加入当前会话引用；入参是绝对路径。 */
+    onAttachReference: ((String) -> Unit)? = null,
 ) {
     // 入场从右滑到定位、退场滑回右侧：之前是 visible 一翻转就整块出现，观感是「突变」。
 
@@ -114,6 +117,9 @@ internal fun WorkspaceBrowserSheet(
     val store = remember(context.applicationContext) { WorkspaceFileStore(context) }
     var previewImage by remember { mutableStateOf<String?>(null) }
     val scope = rememberCoroutineScope()
+
+    // 无障碍长按动作名与可见提示分开：前者要短，后者要解释清楚。
+    val attachActionLabel = stringResource(R.string.workspace_attach_reference_action)
 
     val expanded = remember { mutableListOf<String>().toMutableStateList() }
     var rootEntries by remember { mutableStateOf<List<WorkspaceEntry>?>(null) }
@@ -173,7 +179,7 @@ internal fun WorkspaceBrowserSheet(
         ) {
             PaneHintBar(
                 id = OnboardingKeys.WorkspaceHint,
-                text = "点文件直接预览，Markdown 会渲染成卡片；空目录可以让 Agent 建个文件。",
+                text = "点文件直接预览，Markdown 会渲染成卡片；长按文件或文件夹可加入当前会话引用。",
             )
             // 面板自己的头：路径 + 刷新 + 在 MT2 中打开。
             // 顺序按用户要求：刷新在左，MT2 固定在其右边。
@@ -237,6 +243,24 @@ internal fun WorkspaceBrowserSheet(
                         WorkspaceTreeRow(
                             row = row,
                             expanded = row.path in expanded,
+                            attachActionLabel = attachActionLabel,
+                            // 长按 → 加入会话引用。同步解析绝对路径（一次 stat，带 root 越界校验），
+                            // 解析这一步不能挂在 UI 协程上：长按后立刻关面板会连协程一起取消，
+                            // 引用静默丢失。异步入队交给 AgentAppState 自己的 scope。
+                            onLongClick = onAttachReference?.let { attach ->
+                                {
+                                    val absolute = runCatching { store.absolutePath(row.path) }.getOrNull()
+                                    if (absolute != null) {
+                                        attach(absolute)
+                                    } else {
+                                        Toast.makeText(
+                                            context,
+                                            context.getString(R.string.workspace_attach_reference_failed),
+                                            Toast.LENGTH_SHORT,
+                                        ).show()
+                                    }
+                                }
+                            },
                             onClick = {
                                 if (row.entry.directory) {
                                     if (row.path in expanded) expanded.remove(row.path)
@@ -366,17 +390,30 @@ private suspend fun flattenTree(
     return out
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun WorkspaceTreeRow(
     row: TreeRow,
     expanded: Boolean,
     onClick: () -> Unit,
+    onLongClick: (() -> Unit)? = null,
+    attachActionLabel: String? = null,
 ) {
     val context = LocalContext.current
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .clickable(onClick = onClick)
+            .combinedClickable(
+                // 目录行的短按语义是展开/收起，念出来和箭头一致；文件行不给标签，避免说错动作。
+                onClickLabel = if (row.entry.directory) {
+                    stringResource(
+                        if (expanded) R.string.workspace_browser_collapse else R.string.workspace_browser_expand,
+                    )
+                } else null,
+                onLongClickLabel = onLongClick?.let { attachActionLabel },
+                onLongClick = onLongClick,
+                onClick = onClick,
+            )
             .tourAnchorFirst("workspace.file")
             .padding(start = (12 + row.depth * 18).dp, end = 12.dp, top = 10.dp, bottom = 10.dp),
         verticalAlignment = Alignment.CenterVertically,

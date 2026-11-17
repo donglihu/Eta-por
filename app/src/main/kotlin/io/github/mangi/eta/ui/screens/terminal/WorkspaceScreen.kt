@@ -56,10 +56,16 @@ import top.yukonga.miuix.kmp.basic.InfiniteProgressIndicator
 import top.yukonga.miuix.kmp.theme.MiuixTheme
 
 @Composable
-internal fun WorkspaceScreen(onBack: () -> Unit) {
+internal fun WorkspaceScreen(
+    onBack: () -> Unit,
+    /** 长按文件或文件夹 → 交给宿主加入当前会话引用；入参是绝对路径。 */
+    onAttachReference: ((String) -> Unit)? = null,
+) {
     val context = LocalContext.current
     val resources = LocalResources.current
     val store = remember(context.applicationContext) { WorkspaceFileStore(context) }
+    // 无障碍长按动作名：短，不被长句提示污染。
+    val attachActionLabel = stringResource(R.string.workspace_attach_reference_action)
     val scope = rememberCoroutineScope()
     var path by rememberSaveable { mutableStateOf("") }
     var pendingExport by rememberSaveable { mutableStateOf<String?>(null) }
@@ -132,6 +138,14 @@ internal fun WorkspaceScreen(onBack: () -> Unit) {
                 summary = stringResource(R.string.capability_workspace_private_summary),
                 modifier = Modifier.padding(horizontal = EtaPreferenceDefaults.SidePadding),
             )
+        }
+        if (onAttachReference != null) {
+            item(key = "workspace-attach-hint") {
+                EtaPreference(
+                    title = stringResource(R.string.workspace_attach_reference_hint),
+                    modifier = Modifier.padding(horizontal = EtaPreferenceDefaults.SidePadding),
+                )
+            }
         }
         item(key = "actions") {
             EtaPreferenceGroup(modifier = Modifier.padding(horizontal = EtaPreferenceDefaults.SidePadding).padding(top = 8.dp, bottom = EtaPreferenceDefaults.GroupSpacing)) {
@@ -246,6 +260,23 @@ internal fun WorkspaceScreen(onBack: () -> Unit) {
                             )
                         },
                         enabled = !busy,
+                        // 长按加入会话引用：短按行为（进目录 / 导出）不变。
+                        // 同步解析绝对路径，异步入队交给 AgentAppState 的 scope——
+                        // 挂在 UI 协程上会随页面销毁被取消，引用静默丢失。
+                        onLongClick = onAttachReference?.let { attach ->
+                            {
+                                val absolute = runCatching { store.absolutePath(entry.path) }.getOrNull()
+                                if (absolute != null) {
+                                    attach(absolute)
+                                } else {
+                                    message = WorkspaceMessage(
+                                        resources.getString(R.string.workspace_attach_reference_failed),
+                                        isError = true,
+                                    )
+                                }
+                            }
+                        },
+                        onLongClickLabel = attachActionLabel,
                         onClick = {
                             if (entry.directory) path = entry.path else {
                                 pendingExport = entry.path

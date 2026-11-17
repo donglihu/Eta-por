@@ -2653,6 +2653,18 @@ internal class AgentAppState(
         }
     }
 
+    /**
+     * 文件区（右侧工作区面板 / 工作区页面）长按条目 → 加入当前会话引用。
+     *
+     * 复用 [attachFilePath] 的解析、去重与失败提示；区别只有成功也提示：
+     * 长按是隐藏手势，面板又把输入栏推到屏幕外，不给 Toast 就等于没反馈。
+     */
+    fun attachWorkspaceReference(path: String) {
+        resolveAndAttachFileReferences(notifySuccess = true) {
+            listOf(AgentFileReferenceGateway(AndroidAgentLogger).resolveAbsolutePath(path))
+        }
+    }
+
     fun removePendingFileReference(id: String) {
         updateCurrentConversation(
             homeState.copy(
@@ -2662,6 +2674,7 @@ internal class AgentAppState(
     }
 
     private fun resolveAndAttachFileReferences(
+        notifySuccess: Boolean = false,
         resolver: () -> List<AgentFileReferenceGateway.Resolution>,
     ) {
         val ownerVersion = fileAttachmentOwnerVersion
@@ -2705,6 +2718,18 @@ internal class AgentAppState(
                         failures.size,
                     )
                     additions.isEmpty() -> appContext.getString(R.string.state_ui_the_selected_path_has_been_added_42b432)
+                    notifySuccess -> if (additions.size == 1) {
+                        appContext.getString(
+                            R.string.workspace_attach_reference_done,
+                            additions.first().reference.displayName,
+                        )
+                    } else {
+                        appContext.resources.getQuantityString(
+                            R.plurals.workspace_attach_reference_done_many,
+                            additions.size,
+                            additions.size,
+                        )
+                    }
                     else -> null
                 }
                 if (message != null) {

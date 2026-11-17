@@ -1794,6 +1794,13 @@
     <string name="workspace_browser_choose_app">选择应用</string>
     <string name="workspace_browser_open_in_mt">在 MT2 管理器中打开</string>
     <string name="workspace_browser_open_with_auto">自动（MT2 优先）</string>
+    <string name="workspace_attach_reference_hint">长按文件或文件夹，可加入当前会话引用</string>
+    <string name="workspace_attach_reference_action">加入会话引用</string>
+    <string name="workspace_attach_reference_failed">无法解析该路径，引用未加入</string>
+    <string name="workspace_attach_reference_done">已加入会话引用：%1$s</string>
+    <plurals name="workspace_attach_reference_done_many">
+        <item quantity="other">已加入 %1$d 个会话引用</item>
+    </plurals>
     <string name="workspace_browser_mt_missing">没有安装 MT2 管理器</string>
     <string name="workspace_browser_mt_failed">MT2 管理器无法打开这个文件</string>
     <string name="workspace_browser_default_app">默认：%1$s</string>

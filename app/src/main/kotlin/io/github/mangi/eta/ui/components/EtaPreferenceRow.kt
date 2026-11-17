@@ -1,7 +1,9 @@
 package io.github.mangi.eta.ui.components
 
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.Row
@@ -32,6 +34,7 @@ import top.yukonga.miuix.kmp.icon.MiuixIcons
 import top.yukonga.miuix.kmp.icon.basic.ArrowRight
 import top.yukonga.miuix.kmp.theme.MiuixTheme
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 internal fun EtaArrowPreference(
     title: String,
@@ -44,12 +47,16 @@ internal fun EtaArrowPreference(
     enabled: Boolean = true,
     holdDownState: Boolean = false,
     onClick: (() -> Unit)? = null,
+    /** 长按动作（例如文件区条目加入会话引用）；与 [onClick] 共存，不互相吞手势。 */
+    onLongClick: (() -> Unit)? = null,
+    onLongClickLabel: String? = null,
 ) {
     EtaPreference(
         title = title, summary = summary, modifier = modifier,
         startAction = startAction, bottomAction = bottomAction,
         titleColor = titleColor, enabled = enabled,
         holdDownState = holdDownState, onClick = onClick,
+        onLongClick = onLongClick, onLongClickLabel = onLongClickLabel,
         endActions = {
             Row(Modifier.weight(1f, fill = false), content = endActions)
             Spacer(Modifier.width(8.dp))
@@ -67,6 +74,7 @@ internal fun EtaArrowPreference(
     )
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 internal fun EtaPreference(
     title: String? = null,
@@ -82,6 +90,9 @@ internal fun EtaPreference(
     holdDownState: Boolean = false,
     onClick: (() -> Unit)? = null,
     onClickLabel: String? = null,
+    /** 长按动作；与 [onClick] 共存时用 combinedClickable，短按行为不变。 */
+    onLongClick: (() -> Unit)? = null,
+    onLongClickLabel: String? = null,
     role: Role? = null,
     content: (@Composable ColumnScope.() -> Unit)? = null,
 ) {
@@ -91,9 +102,25 @@ internal fun EtaPreference(
         titleColor = titleColor, summaryColor = summaryColor, summaryMaxLines = summaryMaxLines,
         titleContent = content,
         enabled = enabled, holdDownState = holdDownState,
-        interaction = if (onClick != null) {
-            Modifier.clickable(enabled = enabled, onClickLabel = onClickLabel, role = role, onClick = onClick)
-        } else Modifier,
+        interaction = when {
+            onClick != null && onLongClick != null -> Modifier.combinedClickable(
+                enabled = enabled,
+                onClickLabel = onClickLabel,
+                onLongClickLabel = onLongClickLabel,
+                role = role,
+                onLongClick = onLongClick,
+                onClick = onClick,
+            )
+            onClick != null -> Modifier.clickable(enabled = enabled, onClickLabel = onClickLabel, role = role, onClick = onClick)
+            onLongClick != null -> Modifier.combinedClickable(
+                enabled = enabled,
+                onLongClickLabel = onLongClickLabel,
+                role = role,
+                onLongClick = onLongClick,
+                onClick = {},
+            )
+            else -> Modifier
+        },
     )
 }
 
