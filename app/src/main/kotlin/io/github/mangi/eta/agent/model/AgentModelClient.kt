@@ -351,7 +351,7 @@ internal object AgentModelClient {
             normalized.put(
                 JSONObject()
                     .put("text", text.take(MAX_PLAN_STEP_CHARS))
-                    .put("status", normalizePlanStatus(item.optString("status"))),
+                    .put("status", item.optString("status")),
             )
         }
         if (normalized.length() == 0) {
@@ -368,17 +368,6 @@ internal object AgentModelClient {
                 .put("message", "计划已更新并显示在会话框上方；按计划清单继续推进。")
                 .toString(),
         )
-    }
-
-    private fun normalizePlanStatus(raw: String): String {
-        val value = raw.trim().lowercase()
-        return when {
-            value == "pending" || value == "in_progress" || value == "done" -> value
-            value.contains("done") || value.contains("complete") || value.contains("finish") -> "done"
-            value.contains("progress") || value.contains("active") || value.contains("doing") ||
-                value.contains("running") -> "in_progress"
-            else -> "pending"
-        }
     }
 
     private fun toolNames(tools: JSONArray): Set<String> =

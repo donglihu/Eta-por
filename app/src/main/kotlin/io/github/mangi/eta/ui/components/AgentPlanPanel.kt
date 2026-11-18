@@ -30,7 +30,9 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import io.github.mangi.eta.R
 import io.github.mangi.eta.ui.model.PLAN_STEP_ACTIVE
+import io.github.mangi.eta.ui.model.PlanPanelState
 import io.github.mangi.eta.ui.model.PlanStepUi
+import io.github.mangi.eta.ui.model.planPanelState
 import top.yukonga.miuix.kmp.basic.Icon
 import top.yukonga.miuix.kmp.basic.Text
 import top.yukonga.miuix.kmp.squircle.squircleBorder
@@ -44,17 +46,22 @@ import androidx.compose.material.icons.rounded.ArrowDropDown
  *
  * 收起态保留进度（3/7），所以即便折起来也知道跑到了哪；
  * 展开态由用户自己按，不跟着 run 状态跳，免得执行中面板自己反复伸缩。
+ *
+ * 标题按「完成度 → 是否还在跑」判定，不看输入框那个开关：
+ * 开关是会话级偏好，跑完不会自己关，拿它当标题状态就会永远停在「执行中」。
+ * 判定口径见 [planPanelState]，四种状态由单测逐条覆盖。
  */
 @Composable
 internal fun AgentPlanPanel(
     steps: List<PlanStepUi>,
-    planMode: Boolean,
+    isRunning: Boolean,
     modifier: Modifier = Modifier,
     expandedKey: String? = null,
 ) {
     if (steps.isEmpty()) return
     var expanded by rememberSaveable(expandedKey) { mutableStateOf(true) }
     val done = steps.count { it.isDone }
+    val state = planPanelState(steps, isRunning)
     Column(
         modifier = modifier
             .fillMaxWidth()
@@ -72,10 +79,11 @@ internal fun AgentPlanPanel(
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Text(
-                text = if (planMode) {
-                    stringResource(R.string.chat_plan_title_planning)
-                } else {
-                    stringResource(R.string.chat_plan_title_executing)
+                text = when (state) {
+                    PlanPanelState.DONE -> stringResource(R.string.chat_plan_title_done)
+                    PlanPanelState.EXECUTING -> stringResource(R.string.chat_plan_title_executing)
+                    PlanPanelState.PLANNING -> stringResource(R.string.chat_plan_title_planning)
+                    PlanPanelState.ENDED -> stringResource(R.string.chat_plan_title_stopped)
                 },
                 style = MiuixTheme.textStyles.footnote1,
                 color = MiuixTheme.colorScheme.onSurface,

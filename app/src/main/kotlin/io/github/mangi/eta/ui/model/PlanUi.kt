@@ -23,6 +23,36 @@ internal const val PLAN_STEP_PENDING = "pending"
 internal const val PLAN_STEP_ACTIVE = "in_progress"
 internal const val PLAN_STEP_DONE = "done"
 
+/**
+ * 计划面板的四种整体状态。
+ *
+ * 判定只看两件事：步骤完成度、run 是否还在跑；
+ * 不看输入框那个 planMode 开关——它是会话级偏好，跑完不会自己关，
+ * 拿它当面板状态就会出现「7/7 还写规划中」「3/3 还写执行中」。
+ */
+internal enum class PlanPanelState {
+    /** 还没开始任何一步：run 在跑但全部 pending。 */
+    PLANNING,
+
+    /** 已经动过至少一步，run 仍在跑。 */
+    EXECUTING,
+
+    /** 全部步骤完成；优先于 [EXECUTING]，否则跑完最后一步还会停在执行中。 */
+    DONE,
+
+    /** run 已结束但步骤没走完：中断、出错，或模型没把最后一步标成 done。 */
+    ENDED,
+}
+
+/** 计划面板状态的唯一判定入口；面板渲染与单测共用这一份口径。 */
+internal fun planPanelState(steps: List<PlanStepUi>, isRunning: Boolean): PlanPanelState {
+    if (steps.isEmpty()) return PlanPanelState.ENDED
+    if (steps.all { it.isDone }) return PlanPanelState.DONE
+    if (!isRunning) return PlanPanelState.ENDED
+    val started = steps.any { it.isDone || it.isActive }
+    return if (started) PlanPanelState.EXECUTING else PlanPanelState.PLANNING
+}
+
 private val KNOWN_STATUS = setOf(PLAN_STEP_PENDING, PLAN_STEP_ACTIVE, PLAN_STEP_DONE)
 
 /** 状态归一：模型给 `completed`、`doing`、`todo` 这类近义词时统一成三种。 */

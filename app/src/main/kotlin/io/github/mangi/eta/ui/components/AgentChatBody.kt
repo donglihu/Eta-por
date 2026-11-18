@@ -1447,7 +1447,7 @@ private fun AgentChatBottomBar(
             ChatNavigatorHandle(onOpen = onOpenNavigator)
             AgentPlanPanel(
                 steps = planSteps,
-                planMode = planMode,
+                isRunning = isStreaming,
                 expandedKey = draftKey,
                 modifier = Modifier.padding(bottom = 8.dp),
             )
