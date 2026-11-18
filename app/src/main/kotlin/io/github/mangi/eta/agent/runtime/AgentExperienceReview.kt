@@ -149,6 +149,7 @@ internal object AgentExperienceReview {
                             skillContext = if (skills) SkillContext(installed) else SkillContext.EMPTY,
                             memoryContext = memoryContext,
                             restrictedToolNames = names,
+                            planToolsEnabled = false,
                             toolExecutor = AgentModelClient.ToolExecutor { call ->
                                 checkCurrent()
                                 if (++calls > 12) {

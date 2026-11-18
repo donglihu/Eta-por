@@ -10,6 +10,7 @@ import io.github.mangi.eta.agent.roleplay.RoleplayRunContext
 import io.github.mangi.eta.config.Prefs
 import io.github.mangi.eta.agent.tool.AgentToolCapabilities
 import io.github.mangi.eta.agent.tool.AgentToolRequirements
+import io.github.mangi.eta.agent.tool.PlanModePolicy
 import io.github.mangi.eta.data.model.AnthropicProviderSetting
 import io.github.mangi.eta.data.model.CustomBody
 import io.github.mangi.eta.data.model.CustomHeader
@@ -28,6 +29,8 @@ import org.json.JSONArray
 import org.json.JSONObject
 
 internal object AgentModelClient {
+    /** 单条计划步骤的字符上限：面板一行显示，超长没有意义，还会把上下文撑起来。 */
+    private const val MAX_PLAN_STEP_CHARS = 300
     private val json = Json {
         ignoreUnknownKeys = true
         encodeDefaults = false
@@ -110,6 +113,8 @@ internal object AgentModelClient {
         onContextSnapshot: (AgentContextSnapshot) -> Unit = {},
         onTranscript: (List<ConversationMessage>) -> Unit = {},
         restrictedToolNames: Set<String>? = null,
+        /** `update_plan` 是否可用：只有主会话的计划面板算数，子代理与复盘不得覆盖它。 */
+        planToolsEnabled: Boolean = true,
         onEvent: (AgentEvent) -> Unit = {}
     ): ModelResponse.Text {
         config.validate()
@@ -130,6 +135,7 @@ internal object AgentModelClient {
             virtualScreenEnabled = initialCapabilities.virtualScreenEnabled,
             virtualScreenFallbackEnabled = initialCapabilities.virtualScreenFallbackEnabled,
             customization = customization,
+            planMode = initialCapabilities.planMode,
         )
         if (rewriteReply) {
             messages.put(messages.length() - 1, AgentConversationCodec.userTextMessage(
@@ -148,7 +154,7 @@ internal object AgentModelClient {
         val transcript = JSONArray()
         // 旧 history 中的无效消息可能在组装时被跳过，系统边界不能由 history 条数倒推。
         val systemCount = AgentPromptBuilder.buildSystemMessages(
-            config, skillContext, memoryContext, initialCapabilities.rootAvailable, roleplayContext, executionContext, initialCapabilities.virtualScreenEnabled, initialCapabilities.virtualScreenFallbackEnabled, customization,
+            config, skillContext, memoryContext, initialCapabilities.rootAvailable, roleplayContext, executionContext, initialCapabilities.virtualScreenEnabled, initialCapabilities.virtualScreenFallbackEnabled, customization, initialCapabilities.planMode,
         ).length()
         // MCP 工具只在 run 开始时压一次：每轮重复解析这 190KB JSON 纯属浪费。
         val remoteToolNames = (0 until additionalTools.length()).mapNotNull { index ->
@@ -181,6 +187,8 @@ internal object AgentModelClient {
                 rewriteReply = rewriteReply,
             )
             // 子代理用 toolFilter 在父工具目录上裁剪；主运行不传，走原样。
+            // 不做 plan 阶段的目录过滤：原生只读边界已下放到审批闸门 + 提示词，
+            // 目录少一个工具并不等于拦住写入，反而让 Runtime 与界面的模型见过的工具不一致。
             return toolFilter?.invoke(built) ?: built
         }
         val tools = toolsFor(initialCapabilities)
@@ -215,7 +223,7 @@ internal object AgentModelClient {
                 capabilities.virtualScreenEnabled != promptVirtualScreenEnabled ||
                 capabilities.virtualScreenFallbackEnabled != promptVirtualScreenFallbackEnabled) {
                 val systemMessages = AgentPromptBuilder.buildSystemMessages(
-                    config, skillContext, memoryContext, capabilities.rootAvailable, roleplayContext, executionContext, capabilities.virtualScreenEnabled, capabilities.virtualScreenFallbackEnabled, customization,
+                    config, skillContext, memoryContext, capabilities.rootAvailable, roleplayContext, executionContext, capabilities.virtualScreenEnabled, capabilities.virtualScreenFallbackEnabled, customization, capabilities.planMode,
                 )
                 for (index in 0 until systemMessages.length()) {
                     messages.put(index, systemMessages.getJSONObject(index))
@@ -247,7 +255,16 @@ internal object AgentModelClient {
             tools = tools,
             provider = provider,
             toolExecutor = ToolExecutor { call ->
-                if (!toolPolicy.allows(call.name)) {
+                if (call.name == PlanModePolicy.PLAN_TOOL_NAME) {
+                    if (!planToolsEnabled) {
+                        ToolResult(
+                            JSONObject().put("ok", false).put("code", "PLAN_TOOL_DISABLED")
+                                .put("message", "计划清单只由主会话维护，本次调用未生效。").toString(),
+                        )
+                    } else {
+                        publishPlan(call, onEvent)
+                    }
+                } else if (!toolPolicy.allows(call.name)) {
                     ToolResult(JSONObject().put("ok", false).put("code", "TOOL_NOT_ALLOWED_BY_POLICY")
                         .put("message", "该工具不在本次工具白名单中，未执行").toString())
                 } else if (restrictedToolNames != null && call.name !in restrictedToolNames) {
@@ -302,6 +319,67 @@ internal object AgentModelClient {
     }
 
     private fun toolName(tool: JSONObject): String? = tool.optJSONObject("function")?.optString("name")
+
+    /**
+     * `update_plan` 的执行体：只做校验、归一与广播，不落库。
+     *
+     * 落库由界面进程统一负责（[AgentEvent.PlanUpdated] → 会话状态 → 会话行），
+     * Runtime 不碰 Room，避免两个进程抢同一份数据库。
+     */
+    private fun publishPlan(call: ToolCall, onEvent: (AgentEvent) -> Unit): ToolResult {
+        val root = runCatching { JSONObject(call.argumentsJson) }.getOrNull()
+        if (root == null) {
+            return ToolResult(
+                JSONObject().put("ok", false).put("code", "PLAN_ARGS_INVALID")
+                    .put("message", "计划参数不是合法 JSON，计划未更新").toString(),
+            )
+        }
+        val steps = root.optJSONArray("steps")
+            ?: root.optJSONObject("plan")?.optJSONArray("steps")
+            ?: root.optJSONArray("plan")
+        if (steps == null) {
+            return ToolResult(
+                JSONObject().put("ok", false).put("code", "PLAN_STEPS_MISSING")
+                    .put("message", "缺少 steps 数组，计划未更新").toString(),
+            )
+        }
+        val normalized = JSONArray()
+        for (index in 0 until steps.length()) {
+            val item = steps.optJSONObject(index) ?: continue
+            val text = item.optString("text").ifBlank { item.optString("step") }.trim()
+            if (text.isEmpty()) continue
+            normalized.put(
+                JSONObject()
+                    .put("text", text.take(MAX_PLAN_STEP_CHARS))
+                    .put("status", normalizePlanStatus(item.optString("status"))),
+            )
+        }
+        if (normalized.length() == 0) {
+            return ToolResult(
+                JSONObject().put("ok", false).put("code", "PLAN_STEPS_EMPTY")
+                    .put("message", "计划步骤为空，计划未更新").toString(),
+            )
+        }
+        val payload = normalized.toString()
+        onEvent(AgentEvent.PlanUpdated(payload))
+        return ToolResult(
+            JSONObject().put("ok", true).put("count", normalized.length())
+                .put("steps", normalized)
+                .put("message", "计划已更新并显示在会话框上方；按计划清单继续推进。")
+                .toString(),
+        )
+    }
+
+    private fun normalizePlanStatus(raw: String): String {
+        val value = raw.trim().lowercase()
+        return when {
+            value == "pending" || value == "in_progress" || value == "done" -> value
+            value.contains("done") || value.contains("complete") || value.contains("finish") -> "done"
+            value.contains("progress") || value.contains("active") || value.contains("doing") ||
+                value.contains("running") -> "in_progress"
+            else -> "pending"
+        }
+    }
 
     private fun toolNames(tools: JSONArray): Set<String> =
         (0 until tools.length()).mapNotNullTo(mutableSetOf()) { toolName(tools.getJSONObject(it)) }

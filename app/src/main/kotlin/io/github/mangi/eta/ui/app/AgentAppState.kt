@@ -76,6 +76,8 @@ import io.github.mangi.eta.ui.model.ConversationModeUi
 import io.github.mangi.eta.ui.model.ConversationNavEntry
 import io.github.mangi.eta.ui.model.ConversationPaneUiState
 import io.github.mangi.eta.ui.model.ConversationSummaryUi
+import io.github.mangi.eta.ui.model.PlanStepUi
+import io.github.mangi.eta.ui.model.PlanStepsCodec
 import io.github.mangi.eta.ui.model.MessageEditUiState
 import io.github.mangi.eta.ui.model.PendingFileReferenceUi
 import io.github.mangi.eta.ui.model.PendingImageUi
@@ -985,6 +987,20 @@ internal class AgentAppState(
                 availableReasoningEfforts = reasoningEffortOptions(normalized),
             )
         )
+        if (selectedConversationId != null) persistConversations()
+    }
+
+    /** 会话框开关：plan 模式按会话持久化，切会话、重启都不丢。 */
+    fun updatePlanMode(enabled: Boolean) {
+        if (homeState.planMode == enabled) return
+        updateCurrentConversation(homeState.copy(planMode = enabled))
+        if (selectedConversationId != null) persistConversations()
+    }
+
+    /** `update_plan` 回传的清单：只在真的变了时改状态，避免每次重组都刷新会话时间戳。 */
+    fun updatePlanSteps(steps: List<PlanStepUi>) {
+        if (homeState.planSteps == steps) return
+        updateCurrentConversation(homeState.copy(planSteps = steps), updateTimestamp = false)
         if (selectedConversationId != null) persistConversations()
     }
 
@@ -2701,6 +2717,8 @@ internal class AgentAppState(
             }
             // 思考档位不再由 AGENT_THINKING_ENABLED 硬门控：开关只决定默认档位，对话内已选的档位直接生效。
             val permittedReasoningEffort = reasoningEffort
+            // 只读标记在发车前定下来：run 进行中用户再切开关，也不改变这一轮的工具边界。
+            val planModeForRun = homeState.planMode
             val config = RuntimeConfigRepository.runtimeConfigFor(runModelId)?.copy(
                 terminalTools = agentBooleanForUi(Prefs.Keys.AGENT_TERMINAL_TOOLS),
                 browserTools = agentBooleanForUi(Prefs.Keys.AGENT_BROWSER_TOOLS),
@@ -2749,6 +2767,7 @@ internal class AgentAppState(
                         runId = runId,
                         prompt = prompt,
                         config = config.copy(supportsSearchSuggestions = true),
+                        planMode = planModeForRun,
                         images = modelImages,
                         history = history,
                         handoff = AgentRuntimeWire.EntryHandoff(
@@ -3144,6 +3163,14 @@ internal class AgentAppState(
         when (event) {
             is AgentEvent.UserSupplementReceived ->
                 insertSupplementMessage(runId, event.index, event.text, persist = persistSupplement)
+            // 计划清单跟着产出走：只更新状态，不推进会话时间戳（和流式增量同级）。
+            is AgentEvent.PlanUpdated -> conversationIdForRun(runId)?.let { id ->
+                val steps = PlanStepsCodec.decode(event.stepsJson)
+                val existing = conversationsById[id]
+                if (steps.isNotEmpty() && existing != null && existing.planSteps != steps) {
+                    updateConversation(id, existing.copy(planSteps = steps), updateTimestamp = false)
+                }
+            }
             is AgentEvent.RunStarted -> if (runId in stopRequestedRunIds) scope.launch(Dispatchers.IO) {
                 AgentRuntimeClient(appContext, AndroidAgentLogger).cancelRun(runId)
             }

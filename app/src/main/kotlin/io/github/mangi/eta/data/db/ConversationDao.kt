@@ -49,7 +49,7 @@ internal interface ConversationDao : ChunkedTextDao {
         "SELECT id, title, thinking_enabled, reasoning_effort, " +
             "applied_runtime_run_ids_json, roleplay_json, revisions_json, " +
             "last_model_usage_json, created_at, updated_at, model_id, pinned, category_id, " +
-            "parent_conversation_id, parent_message_id, branch_root_id " +
+            "parent_conversation_id, parent_message_id, branch_root_id, plan_mode, plan_steps_json " +
             "FROM conversations WHERE id = :conversationId"
     )
     suspend fun conversationMetadataRow(conversationId: String): ConversationMetadata?
@@ -61,7 +61,7 @@ internal interface ConversationDao : ChunkedTextDao {
     @Query(
         "SELECT id, title, thinking_enabled, reasoning_effort, " +
             "applied_runtime_run_ids_json, roleplay_json, revisions_json, last_model_usage_json, created_at, updated_at, model_id, pinned, category_id, " +
-            "parent_conversation_id, parent_message_id, branch_root_id " +
+            "parent_conversation_id, parent_message_id, branch_root_id, plan_mode, plan_steps_json " +
             "FROM conversations ORDER BY pinned DESC, updated_at DESC"
     )
     suspend fun conversationMetadataRows(): List<ConversationMetadata>
@@ -72,7 +72,7 @@ internal interface ConversationDao : ChunkedTextDao {
     @Query(
         "SELECT id, title, thinking_enabled, reasoning_effort, " +
             "applied_runtime_run_ids_json, roleplay_json, revisions_json, last_model_usage_json, created_at, updated_at, model_id, pinned, category_id, " +
-            "parent_conversation_id, parent_message_id, branch_root_id " +
+            "parent_conversation_id, parent_message_id, branch_root_id, plan_mode, plan_steps_json " +
             "FROM conversations ORDER BY pinned DESC, updated_at DESC LIMIT :limit OFFSET :offset"
     )
     suspend fun conversationMetadataPage(limit: Int, offset: Int): List<ConversationMetadata>

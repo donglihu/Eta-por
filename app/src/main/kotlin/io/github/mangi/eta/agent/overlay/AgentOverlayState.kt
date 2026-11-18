@@ -59,6 +59,8 @@ private fun AgentOverlayState.projectEvent(event: AgentEvent): AgentOverlayState
     is AgentEvent.ProviderRequestStarted -> copy(round = event.round).thinkingUnlessWorking()
     is AgentEvent.ModelRetryScheduled -> copy(round = event.round, detailText = event.displayMessage).thinkingUnlessWorking()
     is AgentEvent.ContextCompaction -> copy(detailText = event.displayMessage).thinkingUnlessWorking()
+    // 计划清单只影响会话面板，不影响浮层状态机。
+    is AgentEvent.PlanUpdated -> this
     is AgentEvent.HistoryTrimmed -> this
 
     is AgentEvent.AssistantBlockDelta -> when (event.kind) {

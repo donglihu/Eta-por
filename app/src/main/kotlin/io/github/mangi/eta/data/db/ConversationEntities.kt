@@ -38,6 +38,10 @@ internal data class ConversationEntity(
     @ColumnInfo(name = "parent_message_id") val parentMessageId: String? = null,
     /** 整棵分支树共享的根会话 id；根会话自身填自己的 id，老数据由迁移回填。 */
     @ColumnInfo(name = "branch_root_id") val branchRootId: String? = null,
+    /** Plan 模式开关：会话级持久化，切会话、重启都不丢。 */
+    @ColumnInfo(name = "plan_mode", defaultValue = "0") val planMode: Boolean = false,
+    /** 计划清单 JSON（步骤文本 + 状态）；空串表示这个会话还没有计划。 */
+    @ColumnInfo(name = "plan_steps_json", defaultValue = "''") val planStepsJson: String = "",
 )
 
 internal data class ConversationMetadata(
@@ -58,6 +62,8 @@ internal data class ConversationMetadata(
     @ColumnInfo(name = "parent_conversation_id") val parentConversationId: String? = null,
     @ColumnInfo(name = "parent_message_id") val parentMessageId: String? = null,
     @ColumnInfo(name = "branch_root_id") val branchRootId: String? = null,
+    @ColumnInfo(name = "plan_mode") val planMode: Boolean = false,
+    @ColumnInfo(name = "plan_steps_json") val planStepsJson: String = "",
 )
 
 /** 会话侧栏只读取定长预览，不读取上下文、角色卡与修订正文。 */

@@ -66,17 +66,23 @@ internal class AgentConversationPersistence(initial: AgentConversationStore.Snap
         val history: List<AgentModelClient.ConversationMessage>,
         val journal: List<AgentModelClient.ConversationMessage>,
         val lastModelUsage: io.github.mangi.eta.ui.model.TokenUsageUi?,
+        /** Plan 模式开关与计划清单：跟着会话行一起落库，切会话不丢。 */
+        val planMode: Boolean = false,
+        val planStepsJson: String = "",
     ) {
         constructor(state: AgentChatHomeUiState, title: String, updatedAt: Long) : this(
             title, updatedAt, state.reasoningEffort, state.appliedRuntimeRunIds,
             state.roleplay, if (state.roleplay == null) RoleplayMessageState() else state.roleplayMessages,
             state.modelId, state.messages, state.history, state.journal.ifEmpty { state.history },
             state.lastModelUsage,
+            state.planMode,
+            io.github.mangi.eta.ui.model.PlanStepsCodec.encode(state.planSteps),
         )
 
         fun sameMetadata(other: Content): Boolean =
             title == other.title && updatedAt == other.updatedAt && reasoningEffort == other.reasoningEffort &&
                 appliedRuntimeRunIds == other.appliedRuntimeRunIds && roleplay == other.roleplay &&
-                roleplayMessages == other.roleplayMessages && modelId == other.modelId && lastModelUsage == other.lastModelUsage
+                roleplayMessages == other.roleplayMessages && modelId == other.modelId && lastModelUsage == other.lastModelUsage &&
+                planMode == other.planMode && planStepsJson == other.planStepsJson
     }
 }

@@ -337,6 +337,7 @@ internal class SubagentExecutor(
                 sessionId = "$conversationKey-$subagentId",
                 operationId = "${toolCall.id}-$subagentId",
                 toolFilter = profile::filterTools,
+                planToolsEnabled = false,
                 onEvent = { childEvent ->
                     if (abortCode == null) {
                         when (childEvent) {

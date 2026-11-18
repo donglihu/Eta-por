@@ -144,6 +144,9 @@ internal fun AgentChatInputBar(
     isStreaming: Boolean,
     reasoningEffort: ReasoningEffort,
     availableReasoningEfforts: List<ReasoningEffort>,
+    /** Plan 模式开关：显示在思考图标右侧，开着时本轮只读、只产出计划。 */
+    planMode: Boolean = false,
+    onPlanModeChange: (Boolean) -> Unit = {},
     pendingImages: List<PendingImageUi>,
     pendingFileReferences: List<PendingFileReferenceUi>,
     queuedMessages: List<QueuedMessageUi> = emptyList(),
@@ -740,6 +743,13 @@ internal fun AgentChatInputBar(
                                     onEffortChange = onReasoningEffortChange,
                                 )
                             }
+
+                            // Plan 开关紧跟思考图标：两者都是「这一轮怎么跑」的设置，放一起最好找。
+                            PlanModeChip(
+                                active = planMode,
+                                enabled = !isStreaming,
+                                onClick = { onPlanModeChange(!planMode) },
+                            )
                         }
                     }
 
@@ -943,6 +953,46 @@ private fun ThinkingEffortChip(
             }
         }
     }
+}
+
+/** Plan 开关：一枚小胶囊，选中才填浅底；宽度压在 30dp 内，右侧按钮的位置不会被它挤走。 */
+@Composable
+private fun PlanModeChip(
+    active: Boolean,
+    enabled: Boolean,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val container by animateColorAsState(
+        targetValue = if (active) MiuixTheme.colorScheme.primary.copy(alpha = 0.12f) else Color.Transparent,
+        animationSpec = tween(durationMillis = 160),
+        label = "plan_chip_container",
+    )
+    val content by animateColorAsState(
+        targetValue = when {
+            !enabled -> MiuixTheme.colorScheme.disabledOnSecondaryVariant
+            active -> MiuixTheme.colorScheme.primary
+            else -> MiuixTheme.colorScheme.onSurfaceVariantSummary
+        },
+        animationSpec = tween(durationMillis = 160),
+        label = "plan_chip_content",
+    )
+    val border by animateColorAsState(
+        targetValue = if (active) Color.Transparent else MiuixTheme.colorScheme.dividerLine,
+        animationSpec = tween(durationMillis = 160),
+        label = "plan_chip_border",
+    )
+    Text(
+        text = stringResource(R.string.chat_plan_mode_chip),
+        style = MiuixTheme.textStyles.footnote1,
+        color = content,
+        maxLines = 1,
+        modifier = modifier
+            .squircleBorder(width = 1.dp, color = border, cornerRadius = 14.dp)
+            .squircleSurface(color = container, cornerRadius = 14.dp)
+            .clickable(enabled = enabled, onClick = onClick)
+            .padding(horizontal = 8.dp, vertical = 4.dp),
+    )
 }
 
 /**

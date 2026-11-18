@@ -254,6 +254,13 @@ internal sealed interface AgentEvent {
                 "images=$imageCount, image_bytes=$imageBytes"
     }
 
+    /** 计划清单快照：plan 阶段产出、执行阶段回写状态；只在界面进程落库。 */
+    data class PlanUpdated(
+        val stepsJson: String,
+    ) : AgentEvent {
+        override fun toLogLine(): String = "plan_updated chars=${stepsJson.length}"
+    }
+
     data class RunFinished(
         val round: Int,
         val contentChars: Int

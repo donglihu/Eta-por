@@ -159,6 +159,10 @@ internal fun AgentChatBody(
     isStreaming: Boolean,
     reasoningEffort: ReasoningEffort,
     availableReasoningEfforts: List<ReasoningEffort>,
+    /** Plan 模式开关与计划清单（会话框上方面板）。 */
+    planMode: Boolean = false,
+    planSteps: List<io.github.mangi.eta.ui.model.PlanStepUi> = emptyList(),
+    onPlanModeChange: (Boolean) -> Unit = {},
     pendingImages: List<PendingImageUi>,
     pendingFileReferences: List<PendingFileReferenceUi>,
     queuedMessages: List<QueuedMessageUi> = emptyList(),
@@ -330,6 +334,9 @@ internal fun AgentChatBody(
             isStreaming = isStreaming,
             reasoningEffort = reasoningEffort,
             availableReasoningEfforts = availableReasoningEfforts,
+            planMode = planMode,
+            planSteps = planSteps,
+            onPlanModeChange = onPlanModeChange,
             pendingImages = pendingImages,
             pendingFileReferences = pendingFileReferences,
             queuedMessages = queuedMessages,
@@ -427,6 +434,9 @@ private fun AgentChatScaffold(
     isStreaming: Boolean,
     reasoningEffort: ReasoningEffort,
     availableReasoningEfforts: List<ReasoningEffort>,
+    planMode: Boolean = false,
+    planSteps: List<io.github.mangi.eta.ui.model.PlanStepUi> = emptyList(),
+    onPlanModeChange: (Boolean) -> Unit = {},
     pendingImages: List<PendingImageUi>,
     pendingFileReferences: List<PendingFileReferenceUi>,
     queuedMessages: List<QueuedMessageUi>,
@@ -528,6 +538,9 @@ private fun AgentChatScaffold(
                 isStreaming = isStreaming,
                 reasoningEffort = reasoningEffort,
                 availableReasoningEfforts = availableReasoningEfforts,
+                planMode = planMode,
+                planSteps = planSteps,
+                onPlanModeChange = onPlanModeChange,
                 pendingImages = pendingImages,
                 pendingFileReferences = pendingFileReferences,
                 queuedMessages = queuedMessages,
@@ -1294,6 +1307,9 @@ private fun AgentChatBottomBar(
     isStreaming: Boolean,
     reasoningEffort: ReasoningEffort,
     availableReasoningEfforts: List<ReasoningEffort>,
+    planMode: Boolean = false,
+    planSteps: List<io.github.mangi.eta.ui.model.PlanStepUi> = emptyList(),
+    onPlanModeChange: (Boolean) -> Unit = {},
     pendingImages: List<PendingImageUi>,
     pendingFileReferences: List<PendingFileReferenceUi>,
     queuedMessages: List<QueuedMessageUi>,
@@ -1429,6 +1445,12 @@ private fun AgentChatBottomBar(
                 }
             }
             ChatNavigatorHandle(onOpen = onOpenNavigator)
+            AgentPlanPanel(
+                steps = planSteps,
+                planMode = planMode,
+                expandedKey = draftKey,
+                modifier = Modifier.padding(bottom = 8.dp),
+            )
             AgentChatInputBar(
                 input = input,
                 draftKey = draftKey,
@@ -1440,6 +1462,8 @@ private fun AgentChatBottomBar(
                 isStreaming = isStreaming,
                 reasoningEffort = reasoningEffort,
                 availableReasoningEfforts = availableReasoningEfforts,
+                planMode = planMode,
+                onPlanModeChange = onPlanModeChange,
                 pendingImages = pendingImages,
                 pendingFileReferences = pendingFileReferences,
                 queuedMessages = queuedMessages,

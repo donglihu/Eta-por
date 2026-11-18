@@ -24,8 +24,9 @@ internal object AgentPromptBuilder {
         virtualScreenEnabled: Boolean = false,
         virtualScreenFallbackEnabled: Boolean = false,
         customization: PromptCustomization = PromptCustomization(),
+        planMode: Boolean = false,
     ): JSONArray {
-        val messages = buildSystemMessages(config, skillContext, memoryContext, rootAvailable, roleplayContext, executionContext, virtualScreenEnabled, virtualScreenFallbackEnabled, customization)
+        val messages = buildSystemMessages(config, skillContext, memoryContext, rootAvailable, roleplayContext, executionContext, virtualScreenEnabled, virtualScreenFallbackEnabled, customization, planMode)
         val chatOnly = LocalToolProfileStore.current(config.providerId, config.model) == LocalToolProfile.CHAT
         history.forEach { item ->
             val json = runCatching { AgentConversationCodec.toJsonObject(item) }.getOrNull() ?: return@forEach
@@ -52,6 +53,8 @@ internal object AgentPromptBuilder {
         virtualScreenEnabled: Boolean = false,
         virtualScreenFallbackEnabled: Boolean = false,
         customization: PromptCustomization = PromptCustomization(),
+        /** Plan 模式：系统提示尾部追加约束；执行边界不在此，改由审批闸门 + 提示词自约束负责。 */
+        planMode: Boolean = false,
     ): JSONArray {
         val messages = JSONArray()
         val custom = customization.takeIf { it.active }
@@ -239,6 +242,7 @@ internal object AgentPromptBuilder {
             buildSkillSystemMessage(skillContext)?.let(messages::put)
         }
         custom?.let { value -> customInstructionsMessage(value) }?.let(messages::put)
+        if (planMode) messages.put(systemMessage(PLAN_MODE_INSTRUCTION))
         return messages
     }
 
@@ -360,4 +364,18 @@ internal object AgentPromptBuilder {
         JSONObject()
             .put("role", "system")
             .put("content", content)
+
+    /**
+     * Plan 阶段的约束提示（**提示词级，不是工具级**）。
+     *
+     * 系统提示是请求前缀，切换开关会让缓存前缀失效一次，换的是所有服务商都按标准
+     * system 处理。执行边界不靠删工具，靠模型自约束 + 危险动作审查闸门。
+     */
+    internal val PLAN_MODE_INSTRUCTION: String =
+        "【当前处于 Plan 模式：先计划，后执行】\n" +
+            "1. 先用 update_plan 提交完整计划清单（一步一句话，写清交付结果与验收点），再输出方案说明。\n" +
+            "2. 方案说明包含：已确认的事实与依据、缺失条件与需要用户确认的问题、风险与回滚方式。\n" +
+            "3. 本轮只做规划：不修改文件、不改设备状态、不发外部消息、不操作界面；工具本轮照常可用，靠你自己遵守这条边界。\n" +
+            "4. 计划输出完即进入执行阶段，逐项推进并用 update_plan 回写每一步状态；遇到与原计划不一致的情况先停下说明，不要自行改方案。\n" +
+            "5. 不得把「计划已列出」说成「已经完成」。"
 }

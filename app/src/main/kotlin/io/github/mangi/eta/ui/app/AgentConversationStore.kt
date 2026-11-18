@@ -163,6 +163,8 @@ internal object AgentConversationStore {
                                     thinkingEnabled = state.reasoningEffort.enablesReasoning,
                                     reasoningEffort = state.reasoningEffort.wireValue,
                                     appliedRuntimeRunIdsJson = json.encodeToString(state.appliedRuntimeRunIds),
+                                    planMode = state.planMode,
+                                    planStepsJson = state.planStepsJson,
                                     roleplayJson = state.roleplay?.let { json.encodeToString(it) }.orEmpty(),
                                     revisionsJson = if (state.roleplay == null) "" else json.encodeToString(state.roleplayMessages),
                                     lastModelUsageJson = state.lastModelUsage?.let { json.encodeToString(it) }.orEmpty(),
@@ -347,6 +349,8 @@ internal object AgentConversationStore {
             thinkingEnabled = conversation.reasoningEffortValue.enablesReasoning,
             reasoningEffort = conversation.reasoningEffortValue,
             modelId = conversation.modelId,
+            planMode = conversation.planMode,
+            planSteps = io.github.mangi.eta.ui.model.PlanStepsCodec.decode(conversation.planStepsJson),
         ).let { original ->
             ExternalConversationHistory.repair(conversation.id, original).also { repaired ->
                 if (repaired.history != original.history || repaired.journal != original.journal) unaligned += conversation.id
@@ -372,6 +376,8 @@ internal object AgentConversationStore {
         thinkingEnabled = conversation.reasoningEffortValue.enablesReasoning,
         reasoningEffort = conversation.reasoningEffortValue,
         modelId = conversation.modelId,
+        planMode = conversation.planMode,
+        planSteps = io.github.mangi.eta.ui.model.PlanStepsCodec.decode(conversation.planStepsJson),
     )
 
 

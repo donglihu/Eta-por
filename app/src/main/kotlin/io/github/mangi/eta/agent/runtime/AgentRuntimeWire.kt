@@ -108,6 +108,7 @@ internal object AgentRuntimeWire {
     /** 插话目标会话：带上它表示「只投给这个会话正在跑的 run」；空白＝调用方没有会话信息（旧客户端）。 */
     const val KEY_CONVERSATION_ID: String = "conversation_id"
     private const val KEY_ASSISTANT_SCREEN_CONTEXT = "assistant_screen_context"
+    private const val KEY_PLAN_MODE = "plan_mode"
     private const val KEY_MODEL_SESSION_ID = "model_session_id"
     private const val KEY_PROVIDER_ID = "provider_id"
     private const val KEY_PROVIDER_NAME = "provider_name"
@@ -187,6 +188,8 @@ internal object AgentRuntimeWire {
         val operation: String = OP_CHAT,
         val rewriteTargetMessageId: String? = null,
         val assistantScreenContext: String = "",
+        /** Plan 模式：Runtime 侧据此把写类工具从目录里摘掉，并在执行层拒绝越界调用。 */
+        val planMode: Boolean = false,
     ) {
         // 旧入口沿用会话 handoff；无持久会话的入口以首个 run 为会话起点。
         val effectiveModelSessionId: String
@@ -319,6 +322,7 @@ internal object AgentRuntimeWire {
         putString(KEY_RUN_ID, request.runId)
         AgentWireText.put(this, KEY_PROMPT, request.prompt, payloadDirectory)
         putString(KEY_ASSISTANT_SCREEN_CONTEXT, request.assistantScreenContext)
+        putBoolean(KEY_PLAN_MODE, request.planMode)
         putString(KEY_MODEL_SESSION_ID, request.modelSessionId)
         putString(KEY_PROVIDER_ID, request.config.providerId)
         putString(KEY_PROVIDER_NAME, request.config.providerName)
@@ -450,6 +454,7 @@ internal object AgentRuntimeWire {
             assistantScreenContext = bundle.getString(KEY_ASSISTANT_SCREEN_CONTEXT).orEmpty().also {
                 require(it.length <= AssistantScreenContextProjection.MAX_CHARS) { "助理屏幕上下文超过容量预算" }
             },
+            planMode = bundle.getBoolean(KEY_PLAN_MODE, false),
             operation = bundle.getString("operation")?.also { require(it in setOf(OP_CHAT, OP_COMPACT, OP_REWRITE_REPLY)) } ?: OP_CHAT,
             rewriteTargetMessageId = bundle.getString("rewrite_target_message_id")?.also {
                 require(it.isNotBlank() && it.length <= 256) { "Invalid rewrite target" }
@@ -822,6 +827,12 @@ internal object AgentRuntimeWire {
                 event.command?.let { putString("command", it) }
             }
 
+            is AgentEvent.PlanUpdated -> {
+                putString(KEY_TYPE, "plan_updated")
+                // 步骤数量与单步长度都在产出侧限过，这里只防越界，不做截断——截断会毁掉 JSON。
+                putString("steps_json", event.stepsJson)
+            }
+
             is AgentEvent.ToolFinished -> {
                 putString(KEY_TYPE, "tool_finished")
                 putInt("round", event.round)
@@ -988,6 +999,10 @@ internal object AgentRuntimeWire {
             name = bundle.getString("name").orEmpty(),
             argsPreview = bundle.getString("args_preview").orEmpty(),
             command = bundle.getString("command"),
+        )
+
+        "plan_updated" -> AgentEvent.PlanUpdated(
+            stepsJson = bundle.getString("steps_json").orEmpty(),
         )
 
         "tool_finished" -> AgentEvent.ToolFinished(

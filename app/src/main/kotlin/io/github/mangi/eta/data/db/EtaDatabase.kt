@@ -8,7 +8,7 @@ import androidx.room.RoomDatabase
 import androidx.room.migration.Migration
 
 /** 结构版本的唯一来源：@Database 与自检页共用，文案里不再写字面量。 */
-internal const val ETA_DB_SCHEMA_VERSION = 34
+internal const val ETA_DB_SCHEMA_VERSION = 35
 
 @Database(
     entities = [
@@ -86,6 +86,7 @@ internal abstract class EtaDatabase : RoomDatabase() {
                         MIGRATION_31_32,
                         MIGRATION_32_33,
                         MIGRATION_33_34,
+                        MIGRATION_34_35,
                     )
                     .addCallback(object : Callback() {
                         override fun onCreate(db: androidx.sqlite.db.SupportSQLiteDatabase) { createTextChunkCleanup(db) }
@@ -252,6 +253,18 @@ internal abstract class EtaDatabase : RoomDatabase() {
 
         internal val MIGRATION_33_34 = Migration(33, 34) { database ->
             database.execSQL("ALTER TABLE mcp_servers ADD COLUMN tools_truncation_reason TEXT")
+        }
+
+        /**
+         * 35：Plan 模式。
+         *
+         * 两列一次到位：`plan_mode` 记住会话开关，`plan_steps_json` 记住计划清单。
+         * 走 [addColumnIfMissing]，两条来源路径（装机版 34 起、旧版一次跳多级）都能落库，
+         * 重跑也不会撞 `duplicate column`。
+         */
+        internal val MIGRATION_34_35 = Migration(34, 35) { database ->
+            database.addColumnIfMissing("conversations", "plan_mode", "INTEGER NOT NULL DEFAULT 0")
+            database.addColumnIfMissing("conversations", "plan_steps_json", "TEXT NOT NULL DEFAULT ''")
         }
 
         /** 只在列不存在时 ALTER，供 [MIGRATION_32_33] 合并两条来源路径。 */

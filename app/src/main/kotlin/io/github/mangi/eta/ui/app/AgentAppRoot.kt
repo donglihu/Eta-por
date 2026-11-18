@@ -572,6 +572,7 @@ fun AgentAppRoot(
                             when (action) {
                                 is AgentHomeAction.ReasoningEffortChanged ->
                                     agentState.updateReasoningEffort(action.effort)
+                                is AgentHomeAction.PlanModeChanged -> agentState.updatePlanMode(action.enabled)
                                 AgentHomeAction.CompactContext -> agentState.compactCurrentContext()
                                 is AgentHomeAction.ModelSelected -> agentState.selectModel(action.modelId)
                                 is AgentHomeAction.OpenConversation -> agentState.selectConversation(action.conversationKey)

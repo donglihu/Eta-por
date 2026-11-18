@@ -307,7 +307,7 @@ internal class AgentRuntimeRunExecutor(
                     }
                     AgentRuntimePolicy.constrain(rawSubagentConfig, currentPermissions())
                 },
-                capabilitiesProvider = { AgentToolCapabilities.capture(appContext) },
+                capabilitiesProvider = { AgentToolCapabilities.capture(appContext).copy(planMode = request.planMode) },
                 configForOverride = { modelId, effort ->
                     val overridden = RuntimeConfigRepository.subagentRuntimeConfig(
                         request.config, overrideModelId = modelId, overrideEffortWire = effort,
@@ -415,7 +415,7 @@ internal class AgentRuntimeRunExecutor(
                     AgentRunCheckpointStore.saveTranscript(appContext, request.runId, transcript)
                     session.updateTranscript(transcript)
                 },
-                capabilitiesProvider = { executor.capabilitiesForRun(AgentToolCapabilities.capture(appContext)) },
+                capabilitiesProvider = { executor.capabilitiesForRun(AgentToolCapabilities.capture(appContext).copy(planMode = request.planMode)) },
                 prompt = request.prompt,
                 assistantScreenContext = request.assistantScreenContext,
                 toolExecutor = runToolExecutor,

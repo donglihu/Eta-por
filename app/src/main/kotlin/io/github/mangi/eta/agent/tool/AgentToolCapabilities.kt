@@ -36,6 +36,13 @@ internal data class AgentToolCapabilities(
     val virtualScreenEnabled: Boolean = false,
     val virtualScreenFallbackEnabled: Boolean = false,
     val virtualUiTreeAvailable: Boolean = true,
+    /**
+     * Plan 模式标记：**只用于注入提示词**。
+     *
+     * 执行边界不在这里：写类工具照常声明、照常可调用，改不改动作由模型的自约束与
+     * 既有的危险动作审查闸门（审批卡）决定，不再按工具名做目录级硬过滤。
+     */
+    val planMode: Boolean = false,
 ) {
     fun unavailableCode(name: String): String? {
         if (virtualScreenEnabled && name in VirtualScreenRoutingPolicy.uiTools) {

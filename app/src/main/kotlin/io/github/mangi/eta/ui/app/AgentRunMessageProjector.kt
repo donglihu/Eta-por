@@ -29,6 +29,8 @@ internal class AgentRunMessageProjector(
         messages: List<AgentChatMessageUi>,
         replayEpochMs: Long? = null,
     ): List<AgentChatMessageUi> = when (event) {
+        // 计划清单走会话状态，不进消息流。
+        is AgentEvent.PlanUpdated -> messages
         is AgentEvent.AssistantBlockStart ->
             startAssistantBlock(runId, event, messages, replayEpochMs = replayEpochMs)
         is AgentEvent.AssistantBlockDelta -> when (event.kind) {

@@ -83,6 +83,10 @@ internal data class AgentChatUiState(
     val thinkingEnabled: Boolean,
     val reasoningEffort: ReasoningEffort = ReasoningEffort.fromLegacy(thinkingEnabled),
     val availableReasoningEfforts: List<ReasoningEffort> = emptyList(),
+    /** Plan 模式：本轮只读；写类工具在 Runtime 侧就不声明。 */
+    val planMode: Boolean = false,
+    /** 计划清单：`update_plan` 产出，展示在会话框上方，可展开收起。 */
+    val planSteps: List<PlanStepUi> = emptyList(),
     val pendingImages: List<PendingImageUi> = emptyList(),
     val pendingFileReferences: List<PendingFileReferenceUi> = emptyList(),
     val queuedMessages: List<QueuedMessageUi> = emptyList(),
