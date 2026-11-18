@@ -77,7 +77,12 @@ class RemoteModelFetcherTest {
         assertTrue(explicit.canDisable)
         assertFalse(explicit.mandatory)
         assertEquals(null, models.getValue("unknown-default").reasoningCapabilities!!.defaultEffort)
-        assertEquals(listOf(ReasoningEffort.DEFAULT), models.getValue("legacy-flag").reasoningCapabilities!!.selectableEfforts)
+        // legacy-flag 只声明「支持思考档」，没有档位明细、也没声明强制思考：
+        // 现在按「可关闭 + 档位未知」处理，必须留出 Off，否则用户关不掉思考。
+        assertEquals(
+            listOf(ReasoningEffort.OFF, ReasoningEffort.DEFAULT),
+            models.getValue("legacy-flag").reasoningCapabilities!!.selectableEfforts,
+        )
         assertEquals(null, models.getValue("plain").reasoningCapabilities)
     }
 

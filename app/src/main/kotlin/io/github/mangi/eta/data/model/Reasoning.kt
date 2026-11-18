@@ -84,7 +84,10 @@ data class ModelReasoningCapabilities(
 ) {
     val selectableEfforts: List<ReasoningEffort>
         get() = buildList {
-            if (canDisable && !mandatory) add(ReasoningEffort.OFF)
+            // 只要模型不是「强制思考」（mandatory），就允许用户关掉思考。
+            // canDisable 只是远端的能力声明；自定义/聚合网关常常只给 reasoning=1、不给档位明细，
+            // canDisable 会是 false，但没有任何依据把用户锁死在思考上，因此这里放宽到 !mandatory。
+            if (!mandatory) add(ReasoningEffort.OFF)
             add(ReasoningEffort.DEFAULT)
             supportedEfforts
                 .asSequence()

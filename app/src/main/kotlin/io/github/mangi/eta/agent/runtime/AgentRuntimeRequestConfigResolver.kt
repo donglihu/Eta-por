@@ -2,6 +2,7 @@ package io.github.mangi.eta.agent.runtime
 
 import io.github.mangi.eta.agent.model.AgentModelClient
 import io.github.mangi.eta.data.model.ProviderAuthModes
+import io.github.mangi.eta.data.model.ReasoningEffort
 
 internal object AgentRuntimeRequestConfigResolver {
     fun constrainPresentation(
@@ -41,8 +42,14 @@ internal object AgentRuntimeRequestConfigResolver {
             ) { "账号登录配置已变更，请重新选择服务商和模型" }
         }
         val effort = if (preserveReasoningChoice) {
-            runtimeConfig.reasoningCapabilities?.normalize(entry.effectiveReasoningEffort)
-                ?: runtimeConfig.effectiveReasoningEffort
+            val requestedEffort = entry.effectiveReasoningEffort
+            if (requestedEffort == ReasoningEffort.OFF) {
+                // 用户显式关掉思考时不能被能力表 normalize 回 DEFAULT。
+                ReasoningEffort.OFF
+            } else {
+                runtimeConfig.reasoningCapabilities?.normalize(requestedEffort)
+                    ?: runtimeConfig.effectiveReasoningEffort
+            }
         } else runtimeConfig.effectiveReasoningEffort
         val config = runtimeConfig.copy(
             terminalTools = entry.terminalTools,

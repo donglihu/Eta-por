@@ -235,8 +235,10 @@ private fun SettingsPageContent(
     var savedDefaultEffort by remember(agentPrefs) {
         mutableStateOf(Prefs.defaultReasoningEffort(agentPrefs))
     }
-    val effectiveSelectedEffort = remember(effectiveCapabilities, savedDefaultEffort) {
-        effectiveCapabilities?.normalize(savedDefaultEffort) ?: ReasoningEffort.DEFAULT
+    val effectiveSelectedEffort = remember(effectiveCapabilities, savedDefaultEffort, defaultThinkingEnabled) {
+        // 默认启用思考关掉时，默认档位就是 OFF；不要在这里回退成 DEFAULT 让人误以为还在思考。
+        if (!defaultThinkingEnabled) ReasoningEffort.OFF
+        else effectiveCapabilities?.normalize(savedDefaultEffort) ?: ReasoningEffort.DEFAULT
     }
     val selectedEffortIndex = remember(effortOptions, effectiveSelectedEffort) {
         effortOptions.indexOf(effectiveSelectedEffort).takeIf { it >= 0 } ?: 0

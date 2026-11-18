@@ -5,6 +5,7 @@ import io.github.mangi.eta.data.model.ModelReasoningCapabilities
 import io.github.mangi.eta.data.model.ProviderSourceTypes
 import io.github.mangi.eta.data.model.ReasoningEffort
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Test
 
@@ -189,10 +190,14 @@ class ReasoningCapabilityResolverTest {
             listOf(ReasoningEffort.DEFAULT),
             resolve(ProviderSourceTypes.MINIMAX, "MiniMax-M3").selectableEfforts,
         )
+        // 自定义/聚合网关常常只回 reasoning=1、不给档位明细：此时不能把用户锁死在思考上。
+        // 必须留出 Off，否则「默认启用思考」关掉后，会话框思考菜单里只剩 Default 被勾选。
+        val custom = resolve(ProviderSourceTypes.CUSTOM, "unknown-thinking-model")
         assertEquals(
-            listOf(ReasoningEffort.DEFAULT),
-            resolve(ProviderSourceTypes.CUSTOM, "unknown-thinking-model").selectableEfforts,
+            listOf(ReasoningEffort.OFF, ReasoningEffort.DEFAULT),
+            custom.selectableEfforts,
         )
+        assertFalse(custom.mandatory)
     }
 
     @Test

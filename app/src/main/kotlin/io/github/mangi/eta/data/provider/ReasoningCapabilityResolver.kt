@@ -32,9 +32,13 @@ internal object ReasoningCapabilityResolver {
         }
         return catalogCapabilities(sourceType, model.modelId)
             ?: familyCapabilities(sourceType, model.modelId)
+            // 模型只声明了 reasoning=1、没有档位明细（自定义/聚合网关的常见情况）：
+            // 不能伪造「强制思考 + 只有 Default 一项」，否则会话框思考菜单里只剩 Default 被勾选，
+            // 用户关掉「默认启用思考」也关不掉。这里退化成「可关闭、档位未声明」。
             ?: ModelReasoningCapabilities(
                 defaultEnabled = true,
-                mandatory = true,
+                mandatory = false,
+                canDisable = true,
             )
     }
 

@@ -334,7 +334,7 @@ internal class AgentAppState(
             homeState.copy(
                 thinkingEnabled = effort.enablesReasoning,
                 reasoningEffort = effort,
-                availableReasoningEfforts = currentReasoningCapabilities?.selectableEfforts.orEmpty(),
+                availableReasoningEfforts = reasoningEffortOptions(effort),
             )
         } else {
             homeState.withCurrentReasoningCapabilities()
@@ -383,16 +383,44 @@ internal class AgentAppState(
         homeState = homeState.copy(
             thinkingEnabled = effort.enablesReasoning,
             reasoningEffort = effort,
-            availableReasoningEfforts = currentReasoningCapabilities?.selectableEfforts.orEmpty(),
+            availableReasoningEfforts = reasoningEffortOptions(effort),
         )
     }
 
+    /**
+     * 会话框思考菜单的可选项：能力表声明的档位，必要时补上 OFF。
+     *
+     * 「默认启用思考」关掉、或当前档位已经是 OFF 时，菜单必须能勾到 OFF；
+     * 否则能力表一旦把 OFF 剔掉（模型自报强制思考），用户看到的就是 Default 被勾选、怎么点都关不掉。
+     */
+    private fun reasoningEffortOptions(current: ReasoningEffort): List<ReasoningEffort> {
+        val declared = currentReasoningCapabilities?.selectableEfforts.orEmpty()
+        if (declared.isEmpty() || ReasoningEffort.OFF in declared) return declared
+        val thinkingEnabled = agentBooleanForUi(Prefs.Keys.AGENT_THINKING_ENABLED)
+        return if (!thinkingEnabled || current == ReasoningEffort.OFF) {
+            listOf(ReasoningEffort.OFF) + declared
+        } else {
+            declared
+        }
+    }
+
     private fun AgentChatHomeUiState.withCurrentReasoningCapabilities(): AgentChatHomeUiState {
-        val normalized = currentReasoningCapabilities?.normalize(reasoningEffort) ?: ReasoningEffort.OFF
+        val capabilities = currentReasoningCapabilities
+        val thinkingEnabled = agentBooleanForUi(Prefs.Keys.AGENT_THINKING_ENABLED)
+        val normalized = when {
+            // 模型根本不给思考能力：保持关闭。
+            capabilities == null -> ReasoningEffort.OFF
+            // 「默认启用思考」已关闭时，DB 沿用的 DEFAULT 视为「跟随默认」→ 回落 OFF；
+            // 会话里显式选过的具体档位（low/high/...）仍然保留，不被开关吃掉。
+            !thinkingEnabled && reasoningEffort == ReasoningEffort.DEFAULT -> ReasoningEffort.OFF
+            // 本来就已经是 OFF，不要再交给 normalize：normalize(OFF) 在 OFF 不在可选档位时会回退 DEFAULT。
+            reasoningEffort == ReasoningEffort.OFF && !capabilities.mandatory -> ReasoningEffort.OFF
+            else -> capabilities.normalize(reasoningEffort)
+        }
         return copy(
             thinkingEnabled = normalized.enablesReasoning,
             reasoningEffort = normalized,
-            availableReasoningEfforts = currentReasoningCapabilities?.selectableEfforts.orEmpty(),
+            availableReasoningEfforts = reasoningEffortOptions(normalized),
         )
     }
 
@@ -888,11 +916,16 @@ internal class AgentAppState(
 
     fun updateReasoningEffort(effort: ReasoningEffort) {
         currentDraftReasoningCustomized = true
-        val normalized = currentReasoningCapabilities?.normalize(effort) ?: ReasoningEffort.OFF
+        val normalized = when {
+            // 用户显式点了 Off：这就是明确意图，不再交给 normalize 回退成 DEFAULT。
+            effort == ReasoningEffort.OFF -> ReasoningEffort.OFF
+            else -> currentReasoningCapabilities?.normalize(effort) ?: ReasoningEffort.OFF
+        }
         updateCurrentConversation(
             homeState.copy(
                 thinkingEnabled = normalized.enablesReasoning,
                 reasoningEffort = normalized,
+                availableReasoningEfforts = reasoningEffortOptions(normalized),
             )
         )
         if (selectedConversationId != null) persistConversations()
