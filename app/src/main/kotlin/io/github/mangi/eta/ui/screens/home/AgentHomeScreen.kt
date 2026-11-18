@@ -65,6 +65,7 @@ internal fun AgentHomeScreen(
             planMode = state.planMode,
             planSteps = state.planSteps,
             onPlanModeChange = { enabled -> onAction(AgentHomeAction.PlanModeChanged(enabled)) },
+            onClearPlan = { onAction(AgentHomeAction.ClearPlan) },
             pendingImages = state.pendingImages,
             pendingFileReferences = state.pendingFileReferences,
             messageEdit = state.messageEdit,

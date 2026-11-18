@@ -2372,13 +2372,12 @@
     <string name="task_completion_capsule_ok">已完成</string>
     <string name="task_completion_capsule_fail">失败</string>
     <string name="task_completion_capsule_stopped">已停止</string>
-    <!-- Plan 模式：输入框开关 + 会话框上方的计划清单 -->
+    <!-- Plan 模式：输入框开关 + 会话框上方的任务清单 -->
     <string name="chat_plan_mode_chip">计划</string>
-    <string name="chat_plan_title_planning">计划 · 规划中</string>
-    <string name="chat_plan_title_executing">计划 · 执行中</string>
-    <string name="chat_plan_title_done">计划 · 已完成</string>
-    <string name="chat_plan_title_stopped">计划 · 已结束</string>
-    <string name="chat_plan_progress">%1$d/%2$d</string>
+    <string name="chat_plan_title_tasks">任务待办</string>
+    <string name="chat_plan_progress_done">%1$d/%2$d 完成</string>
+    <string name="chat_plan_step_active">进行中</string>
     <string name="chat_plan_expand">展开计划</string>
     <string name="chat_plan_collapse">收起计划</string>
+    <string name="chat_plan_clear">清除计划</string>
 </resources>

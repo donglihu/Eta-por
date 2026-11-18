@@ -1004,6 +1004,13 @@ internal class AgentAppState(
         if (selectedConversationId != null) persistConversations()
     }
 
+    /** 任务清单右上角叉号：清掉本会话的计划清单，消息与 run 状态都不动。 */
+    fun clearPlan() {
+        if (homeState.planSteps.isEmpty()) return
+        updateCurrentConversation(homeState.copy(planSteps = emptyList()), updateTimestamp = false)
+        if (selectedConversationId != null) persistConversations()
+    }
+
     /** 聊天内切换同时改当前会话绑定与默认模型；默认模型供新会话和系统助手入口使用。 */
     fun selectModel(modelId: String) {
         if (

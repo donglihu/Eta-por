@@ -106,6 +106,39 @@ class PlanPanelStateTest {
         assertEquals(emptyList<PlanStepUi>(), PlanStepsCodec.decode(null))
     }
 
+    @Test
+    fun focusStepPrefersRunningStep() {
+        // 折叠态标题行挂的是「正在干什么」，不是「下一步干什么」。
+        val steps = listOf(
+            PlanStepUi("先做这个", PLAN_STEP_DONE),
+            PlanStepUi("正在做这个", PLAN_STEP_ACTIVE),
+            PlanStepUi("还没开始", PLAN_STEP_PENDING),
+        )
+        assertEquals("正在做这个", planFocusStep(steps)?.text)
+    }
+
+    @Test
+    fun focusStepFallsBackToFirstUnfinished() {
+        val steps = listOf(
+            PlanStepUi("已完成", PLAN_STEP_DONE),
+            PlanStepUi("接下来", PLAN_STEP_PENDING),
+            PlanStepUi("再之后", PLAN_STEP_PENDING),
+        )
+        assertEquals("接下来", planFocusStep(steps)?.text)
+    }
+
+    @Test
+    fun focusStepShowsLastStepWhenAllDone() {
+        // 全部完成后折叠行仍要能看出这份计划是什么事。
+        val steps = listOf(PlanStepUi("第一步", PLAN_STEP_DONE), PlanStepUi("收尾", PLAN_STEP_DONE))
+        assertEquals("收尾", planFocusStep(steps)?.text)
+    }
+
+    @Test
+    fun focusStepIsNullForEmptyPlan() {
+        assertEquals(null, planFocusStep(emptyList()))
+    }
+
     private fun allDone(count: Int) = step(PLAN_STEP_DONE, count)
 
     private fun step(status: String, count: Int) = List(count) { index ->

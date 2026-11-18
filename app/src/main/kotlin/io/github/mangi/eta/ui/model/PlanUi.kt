@@ -53,6 +53,19 @@ internal fun planPanelState(steps: List<PlanStepUi>, isRunning: Boolean): PlanPa
     return if (started) PlanPanelState.EXECUTING else PlanPanelState.PLANNING
 }
 
+/**
+ * 折叠态标题行显示哪一步的摘要：优先正在执行的那一步，用户折起面板也知道在干什么。
+ *
+ * 取不到 in_progress 时退回第一条未完成；全部完成时给最后一条，
+ * 让「已完成」的折叠行仍能看出这份计划是什么事。
+ */
+internal fun planFocusStep(steps: List<PlanStepUi>): PlanStepUi? {
+    if (steps.isEmpty()) return null
+    steps.firstOrNull { it.isActive }?.let { return it }
+    steps.firstOrNull { !it.isDone }?.let { return it }
+    return steps.last()
+}
+
 private val KNOWN_STATUS = setOf(PLAN_STEP_PENDING, PLAN_STEP_ACTIVE, PLAN_STEP_DONE)
 
 /** 状态归一：模型给 `completed`、`doing`、`todo` 这类近义词时统一成三种。 */

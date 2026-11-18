@@ -9,6 +9,8 @@ sealed interface AgentHomeAction {
     data class ReasoningEffortChanged(val effort: ReasoningEffort) : AgentHomeAction
     /** 会话框开关：切 Plan 模式（先规划再执行）。 */
     data class PlanModeChanged(val enabled: Boolean) : AgentHomeAction
+    /** 任务清单右上角叉号：清掉本会话的计划，不删消息。 */
+    data object ClearPlan : AgentHomeAction
     data class ModelSelected(val modelId: String) : AgentHomeAction
     data class SubmitMessage(val text: String) : AgentHomeAction
 
