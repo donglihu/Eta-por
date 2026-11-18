@@ -228,12 +228,28 @@ private fun SettingsPageContent(
     }
     val defaultThinkingKey = Prefs.Keys.AGENT_THINKING_ENABLED
     val defaultThinkingFallback = Prefs.Keys.BOOLEAN_DEFAULTS.getValue(defaultThinkingKey)
-    val defaultThinkingEnabled = remember(agentPrefs, enhancementHistory) {
-        agentPrefs?.getBoolean(defaultThinkingKey, defaultThinkingFallback)
-            ?: enhancementHistory.checked(defaultThinkingKey, defaultThinkingFallback)
+    var defaultThinkingEnabled by remember(agentPrefs) {
+        mutableStateOf(
+            agentPrefs?.getBoolean(defaultThinkingKey, defaultThinkingFallback)
+                ?: enhancementHistory.checked(defaultThinkingKey, defaultThinkingFallback),
+        )
     }
     var savedDefaultEffort by remember(agentPrefs) {
         mutableStateOf(Prefs.defaultReasoningEffort(agentPrefs))
+    }
+    // 会话框里改档位会回写同一份全局偏好；这里跟着刷新，否则设置页还显示旧默认值、下拉也被误禁用。
+    DisposableEffect(agentPrefs) {
+        val targetPrefs = agentPrefs ?: return@DisposableEffect onDispose {}
+        val listener = SharedPreferences.OnSharedPreferenceChangeListener { changedPrefs, key ->
+            when (key) {
+                defaultThinkingKey ->
+                    defaultThinkingEnabled = changedPrefs.getBoolean(defaultThinkingKey, defaultThinkingFallback)
+                Prefs.Keys.AGENT_DEFAULT_REASONING_EFFORT ->
+                    savedDefaultEffort = Prefs.defaultReasoningEffort(changedPrefs)
+            }
+        }
+        targetPrefs.registerOnSharedPreferenceChangeListener(listener)
+        onDispose { targetPrefs.unregisterOnSharedPreferenceChangeListener(listener) }
     }
     val effectiveSelectedEffort = remember(effectiveCapabilities, savedDefaultEffort, defaultThinkingEnabled) {
         // 默认启用思考关掉时，默认档位就是 OFF；不要在这里回退成 DEFAULT 让人误以为还在思考。

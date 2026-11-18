@@ -169,6 +169,14 @@ internal class AgentAppState(
     private var currentReasoningCapabilities: ModelReasoningCapabilities? = null
     private var currentDraftReasoningCustomized = false
     private var localPrefsListener: SharedPreferences.OnSharedPreferenceChangeListener? = null
+
+    /**
+     * 正在由本类写「默认启用思考」/默认档位。
+     *
+     * 会话框选档会回写全局偏好，设置页改开关也会回灌当前会话；护栏用来挡掉自己写出去的回调，
+     * 避免两边互相当成「用户改动」来回覆盖。
+     */
+    private var publishingReasoningPreference = false
     private var providers: List<ProviderSetting> = emptyList()
     private var defaultModelId: String? = null
     private var defaultProviderId: String? = null
@@ -366,8 +374,10 @@ internal class AgentAppState(
             ) {
                 return@OnSharedPreferenceChangeListener
             }
+            // 自己刚写出去的值：不回灌，否则会跟会话框的选择互相打架。
+            if (publishingReasoningPreference) return@OnSharedPreferenceChangeListener
             scope.launch(Dispatchers.Main.immediate) {
-                syncUnboundDraftDefaultReasoning()
+                applyReasoningPreferenceToOpenState()
             }
         }
         localPrefsListener = listener
@@ -377,14 +387,59 @@ internal class AgentAppState(
         }
     }
 
-    private fun syncUnboundDraftDefaultReasoning() {
-        if (!isUnboundBlankDraft() || currentDraftReasoningCustomized) return
-        val effort = defaultReasoningEffort(currentReasoningCapabilities)
-        homeState = homeState.copy(
-            thinkingEnabled = effort.enablesReasoning,
-            reasoningEffort = effort,
-            availableReasoningEfforts = reasoningEffortOptions(effort),
+    /**
+     * 设置页改「默认启用思考」或默认档位 → 当前打开的会话（草稿或已绑定会话）立即跟随。
+     *
+     * 两处本来是同一条全局偏好（[Prefs.Keys.AGENT_THINKING_ENABLED] + 默认档位）的两个视图，
+     * 任何一侧改动都写同一份偏好，另一侧监听偏好变化后落到自己身上；目标值与现状一致时直接返回，
+     * 自身写入引发的回调因此天然收敛。
+     */
+    private fun applyReasoningPreferenceToOpenState() {
+        val thinkingEnabled = agentBooleanForUi(Prefs.Keys.AGENT_THINKING_ENABLED)
+        val target = if (thinkingEnabled) {
+            defaultReasoningEffort(currentReasoningCapabilities)
+        } else {
+            ReasoningEffort.OFF
+        }
+        val options = reasoningEffortOptions(target)
+        if (homeState.reasoningEffort == target &&
+            homeState.thinkingEnabled == target.enablesReasoning &&
+            homeState.availableReasoningEfforts == options
+        ) {
+            return
+        }
+        currentDraftReasoningCustomized = true
+        updateCurrentConversation(
+            homeState.copy(
+                thinkingEnabled = target.enablesReasoning,
+                reasoningEffort = target,
+                availableReasoningEfforts = options,
+            ),
         )
+        if (selectedConversationId != null) persistConversations()
+    }
+
+    /**
+     * 会话框选档 → 回写全局偏好，让设置页的开关与默认档位立刻同步。
+     *
+     * 关掉思考（OFF）只把开关置 false，保留原默认档位，重新打开时还能回到用户上次选的具体档位；
+     * 选中的是具体档位（含 Default）时，开关置 true 并把默认档位一并更新。
+     */
+    private fun publishReasoningPreference(effort: ReasoningEffort) {
+        val prefs = Prefs.localAgentPreferences() ?: return
+        publishingReasoningPreference = true
+        try {
+            val editor = prefs.edit()
+                .putBoolean(Prefs.Keys.AGENT_THINKING_ENABLED, effort.enablesReasoning)
+            if (effort.enablesReasoning) {
+                editor.putString(Prefs.Keys.AGENT_DEFAULT_REASONING_EFFORT, effort.wireValue)
+            }
+            editor.commit()
+        } catch (_: Throwable) {
+            // 写失败时保持原偏好不变；会话内已按用户点选生效，不回滚界面。
+        } finally {
+            publishingReasoningPreference = false
+        }
     }
 
     /**
@@ -410,11 +465,11 @@ internal class AgentAppState(
         val normalized = when {
             // 模型根本不给思考能力：保持关闭。
             capabilities == null -> ReasoningEffort.OFF
-            // 「默认启用思考」已关闭时，DB 沿用的 DEFAULT 视为「跟随默认」→ 回落 OFF；
-            // 会话里显式选过的具体档位（low/high/...）仍然保留，不被开关吃掉。
-            !thinkingEnabled && reasoningEffort == ReasoningEffort.DEFAULT -> ReasoningEffort.OFF
-            // 本来就已经是 OFF，不要再交给 normalize：normalize(OFF) 在 OFF 不在可选档位时会回退 DEFAULT。
-            reasoningEffort == ReasoningEffort.OFF && !capabilities.mandatory -> ReasoningEffort.OFF
+            // 设置页的开关是全局唯一真相：关掉就一律 OFF。
+            // （以前只把 DB 里沿用的 DEFAULT 回落成 OFF，显式选过 high/low 的会话会跟设置对不上。）
+            !thinkingEnabled -> ReasoningEffort.OFF
+            // 开关打开、会话里存的却是 OFF：视为「跟随默认」，回到默认档位，避免两处显示不一致。
+            reasoningEffort == ReasoningEffort.OFF -> defaultReasoningEffort(capabilities)
             else -> capabilities.normalize(reasoningEffort)
         }
         return copy(
@@ -921,6 +976,8 @@ internal class AgentAppState(
             effort == ReasoningEffort.OFF -> ReasoningEffort.OFF
             else -> currentReasoningCapabilities?.normalize(effort) ?: ReasoningEffort.OFF
         }
+        // 先落全局偏好，再刷新会话状态：菜单可选档位依赖开关值，顺序反了会多算一版。
+        publishReasoningPreference(normalized)
         updateCurrentConversation(
             homeState.copy(
                 thinkingEnabled = normalized.enablesReasoning,
@@ -3435,7 +3492,7 @@ internal class AgentAppState(
             input = draft.input,
             thinkingEnabled = draft.reasoningEffort.enablesReasoning,
             reasoningEffort = draft.reasoningEffort,
-            availableReasoningEfforts = currentReasoningCapabilities?.selectableEfforts.orEmpty(),
+            availableReasoningEfforts = reasoningEffortOptions(draft.reasoningEffort),
             pendingImages = draft.pendingImages,
             pendingFileReferences = draft.pendingFileReferences,
             modelId = draft.modelId,
