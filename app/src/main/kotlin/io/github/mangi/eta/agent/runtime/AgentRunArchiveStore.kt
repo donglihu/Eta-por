@@ -8,6 +8,7 @@ import io.github.mangi.eta.data.db.EtaDatabase
 import io.github.mangi.eta.data.db.RuntimeArchiveEventEntity
 import io.github.mangi.eta.data.db.RuntimeArchiveRunEntity
 import io.github.mangi.eta.data.db.RuntimeArchiveRunWithEvents
+import java.util.Collections
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.runBlocking
 import org.json.JSONArray
@@ -21,6 +22,11 @@ import org.json.JSONArray
  * thinking and tool activity that third-party assistant surfaces cannot show.
  */
 internal object AgentRunArchiveStore {
+
+    fun createEventBuffer(handoff: AgentRuntimeWire.EntryHandoff?): MutableList<AgentEvent>? {
+        if (handoff == null || AgentExternalArchivePayload.from(handoff.payload) == null) return null
+        return Collections.synchronizedList(mutableListOf())
+    }
 
     data class ArchivedRun(
         val handoff: AgentRuntimeWire.EntryHandoff,

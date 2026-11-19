@@ -631,7 +631,7 @@ internal class AgentRuntimeRunExecutor(
 
         if (cancelled && session.isTerminal) {
             runCatching {
-                persistArtifacts(snapshotRequest(request), result, archivedEvents)
+                persistArtifacts(snapshotRequest(request), result, snapshotArchivedEvents(archivedEvents))
             }.onFailure { throwable ->
                 AndroidAgentLogger.error(
                     "Agent runtime cancelled result persistence failed: " +
@@ -659,7 +659,7 @@ internal class AgentRuntimeRunExecutor(
                         "Agent runtime checkpoint seal failed: type=${throwable.safeLogType()}"
                     )
                 }
-            runCatching { persistArtifacts(completedRequest, result, archivedEvents) }
+            runCatching { persistArtifacts(completedRequest, result, snapshotArchivedEvents(archivedEvents)) }
                 .onFailure { throwable ->
                     AndroidAgentLogger.error(
                         "Agent runtime artifact persistence failed: type=${throwable.safeLogType()}"
@@ -749,9 +749,16 @@ internal class AgentRuntimeRunExecutor(
     ) {
         checkpointRecorder?.accept(event)
         if (!session.emit(event)) return
-        // 文本增量只对需要回放重建正文的外部归档有意义，见 execute() 里的说明。
-        if (archiveDeltaEvents || event !is AgentEvent.AssistantBlockDelta) {
-            archivedEvents += event
+        // 多 Subagent 并发会跨线程回调 acceptEvent；只缓存可落盘事件，避免瞬态进度堆积内存。
+        if (archivedEvents != null) {
+            event.recoveryProjection()?.let { durable ->
+                synchronized(archivedEvents) {
+                    if (archiveDeltaEvents || durable !is AgentEvent.AssistantBlockDelta) {
+                        archivedEvents.add(durable)
+                    }
+                }
+            }
+        }
         }
         if (event is AgentEvent.ModelRetryScheduled) {
             AndroidAgentLogger.warn("Agent runtime event: ${event.toLogLine()}")
@@ -764,5 +771,9 @@ internal class AgentRuntimeRunExecutor(
                     "Agent runtime event projection failed: type=${throwable.safeLogType()}"
                 }
             }
+    }
+    private fun snapshotArchivedEvents(archivedEvents: MutableList<AgentEvent>?): List<AgentEvent> {
+        if (archivedEvents == null) return emptyList()
+        return synchronized(archivedEvents) { archivedEvents.toList() }
     }
 }

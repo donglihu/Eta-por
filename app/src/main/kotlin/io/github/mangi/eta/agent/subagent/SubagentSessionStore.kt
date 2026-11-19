@@ -17,6 +17,7 @@ import java.util.concurrent.atomic.AtomicInteger
 internal object SubagentSessionStore {
     private const val MAX_CONVERSATIONS = 16
     private const val MAX_AGENTS_PER_CONVERSATION = 16
+    private const val MAX_HISTORY_MESSAGES_PER_AGENT = 64
 
     /** 单个子代理历史保留的字符预算：`resume` 只需要最近一段上下文。 */
     const val MAX_HISTORY_CHARS_PER_AGENT = 240_000
@@ -163,5 +164,12 @@ internal object SubagentSessionStore {
 
     private fun notifyEvicted(message: String) {
         onEvicted?.invoke(message)
+
+    fun clearConversation(conversationKey: String) {
+        if (conversationKey.isBlank()) return
+        synchronized(lock) {
+            buckets.remove(conversationKey)
+        }
+    }
     }
 }
