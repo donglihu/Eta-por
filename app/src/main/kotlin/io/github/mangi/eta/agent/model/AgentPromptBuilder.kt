@@ -242,7 +242,15 @@ internal object AgentPromptBuilder {
             buildSkillSystemMessage(skillContext)?.let(messages::put)
         }
         custom?.let { value -> customInstructionsMessage(value) }?.let(messages::put)
-        if (planMode) messages.put(systemMessage(PLAN_MODE_INSTRUCTION))
+        if (planMode) {
+            // 计划约束放系统提示最前面：整段系统提示很长，末尾那条最容易被稀释；
+            // 有些服务商只保留首条 system，放末尾等于没注入——这正是「开关开着却不生效」的来源之一。
+            if (messages.length() == 0) {
+                messages.put(systemMessage(PLAN_MODE_INSTRUCTION))
+            } else {
+                messages.put(0, systemMessage(PLAN_MODE_INSTRUCTION))
+            }
+        }
         return messages
     }
 
@@ -369,13 +377,18 @@ internal object AgentPromptBuilder {
      * Plan 阶段的约束提示（**提示词级，不是工具级**）。
      *
      * 系统提示是请求前缀，切换开关会让缓存前缀失效一次，换的是所有服务商都按标准
-     * system 处理。执行边界不靠删工具，靠模型自约束 + 危险动作审查闸门。
+     * system 处理。执行边界不靠删工具，靠这份自约束 + 运行侧的计划闸门。
+     *
+     * 这里只写一件事：**先交清单，再动手**。旧版本第 3 条说「本轮只做规划」、
+     * 第 4 条又说「计划输出完即进入执行阶段」，两条互相打架，模型于是自行决定听哪条，
+     * 表现就是「开着 plan 模式却直接开工」。
      */
     internal val PLAN_MODE_INSTRUCTION: String =
-        "【当前处于 Plan 模式：先计划，后执行】\n" +
-            "1. 先用 update_plan 提交完整计划清单（一步一句话，写清交付结果与验收点），再输出方案说明。\n" +
-            "2. 方案说明包含：已确认的事实与依据、缺失条件与需要用户确认的问题、风险与回滚方式。\n" +
-            "3. 本轮只做规划：不修改文件、不改设备状态、不发外部消息、不操作界面；工具本轮照常可用，靠你自己遵守这条边界。\n" +
-            "4. 计划输出完即进入执行阶段，逐项推进并用 update_plan 回写每一步状态；遇到与原计划不一致的情况先停下说明，不要自行改方案。\n" +
+        "【Plan 模式：先提交计划清单，再执行】\n" +
+            "1. 本轮第一步必须调用 update_plan 提交完整计划清单（一步一句话，写清交付结果与验收点）。" +
+            "提交清单之前只允许只读查询；改文件、改设备状态、发外部消息、操作界面这类动作会被运行侧直接拒绝（PLAN_REQUIRED_FIRST）。\n" +
+            "2. 清单提交后补一段方案说明：已确认的事实与依据、缺失条件与需要用户确认的问题、风险与回滚方式。\n" +
+            "3. 说明完就进入执行：按清单顺序逐项推进，每开始或完成一步都用 update_plan 回写全量清单与状态。\n" +
+            "4. 遇到与原计划不一致的情况先停下说明，不要自行改方案，也不要悄悄扩大范围。\n" +
             "5. 不得把「计划已列出」说成「已经完成」。"
 }

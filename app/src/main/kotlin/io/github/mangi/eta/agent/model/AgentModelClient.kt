@@ -243,6 +243,11 @@ internal object AgentModelClient {
             }
             return publishedTools
         }
+        // 计划闸门：Plan 模式下，本轮提交计划清单之前不许动副作用工具。
+        // 只在「plan 模式 + 主会话 + 正常对话」时生效；重写回复、压缩、子代理都不参与。
+        // 它不裁剪工具目录——工具照常声明，只是把「先计划」从口头约定变成确定性行为。
+        val planGateActive = initialCapabilities.planMode && planToolsEnabled && !rewriteReply && !compactOnly
+        val planSubmitted = java.util.concurrent.atomic.AtomicBoolean(false)
         val loop = AgentLoop(
             transcript = transcript,
             systemCount = systemCount,
@@ -262,8 +267,22 @@ internal object AgentModelClient {
                                 .put("message", "计划清单只由主会话维护，本次调用未生效。").toString(),
                         )
                     } else {
-                        publishPlan(call, onEvent)
+                        val published = publishPlan(call, onEvent)
+                        // 只有真的收下计划才放闸；参数不合法要让模型继续被挡，先修好清单。
+                        val accepted = runCatching { JSONObject(published.content) }
+                            .getOrNull()?.optBoolean("ok") == true
+                        if (accepted) planSubmitted.set(true)
+                        published
                     }
+                } else if (planGateActive && !planSubmitted.get() &&
+                    !PlanModePolicy.isReadOnlyTool(call.name)
+                ) {
+                    // Plan 模式首步：先给清单，别先动手。拒绝理由写清楚，模型下一轮就会改走 update_plan。
+                    ToolResult(
+                        JSONObject().put("ok", false)
+                            .put("code", PlanModePolicy.CODE_PLAN_REQUIRED_FIRST)
+                            .put("message", PlanModePolicy.planRequiredFirstMessage(call.name)).toString(),
+                    )
                 } else if (!toolPolicy.allows(call.name)) {
                     ToolResult(JSONObject().put("ok", false).put("code", "TOOL_NOT_ALLOWED_BY_POLICY")
                         .put("message", "该工具不在本次工具白名单中，未执行").toString())

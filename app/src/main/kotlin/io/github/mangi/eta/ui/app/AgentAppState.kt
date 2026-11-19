@@ -993,7 +993,10 @@ internal class AgentAppState(
     /** 会话框开关：plan 模式按会话持久化，切会话、重启都不丢。 */
     fun updatePlanMode(enabled: Boolean) {
         if (homeState.planMode == enabled) return
-        updateCurrentConversation(homeState.copy(planMode = enabled))
+        // 重新开启＝开一轮新的规划：上一轮的清单不能留在面板上，
+        // 否则新计划出来之前，用户看到的还是上一轮的旧步骤，看着就像「开关没生效」。
+        val steps = if (enabled) emptyList() else homeState.planSteps
+        updateCurrentConversation(homeState.copy(planMode = enabled, planSteps = steps))
         if (selectedConversationId != null) persistConversations()
     }
 
@@ -2463,15 +2466,15 @@ internal class AgentAppState(
             history = history,
             userHistoryMessage = userHistoryMessage,
             messages = messages,
-            state = homeState.copy(
-                journal = editBoundary?.journalPrefix ?: homeState.journal,
+            state = state.copy(
+                journal = editBoundary?.journalPrefix ?: state.journal,
                 input = "",
                 pendingImages = emptyList(),
                 pendingFileReferences = emptyList(),
                 pendingMessageRefs = emptyList(),
                 messageEdit = null,
             ),
-            reasoningEffort = homeState.reasoningEffort,
+            reasoningEffort = state.reasoningEffort,
         )
     }
 
@@ -2659,6 +2662,11 @@ internal class AgentAppState(
     ) {
         runConversationIds[runId] = conversationId
         currentRunId = runId
+        // 只读标记在这一刻定死：取本次派发带进来的会话快照，不读可变的 homeState。
+        // 这里以前读 homeState.planMode，而这段代码要在落库 await 之后才跑，
+        // 那一刻 homeState 可能已经切到别的会话（或正在收排队消息），开关就被读成 false。
+        // 重写回复与压缩不是用户新开的一轮，不参与 plan。
+        val planModeForRun = state.planMode && operation == AgentRuntimeWire.OP_CHAT
         // 发送即绑定：会话记住本轮实际使用的模型，回落到默认模型时也随之更新。
         val runModelId = state.effectiveModelId
 
@@ -2666,6 +2674,8 @@ internal class AgentAppState(
             conversationId,
             state.copy(
                 modelId = runModelId,
+                // 新一轮规划从空清单开始，上一轮的步骤不跟过来；执行阶段的回写会重新填满它。
+                planSteps = if (planModeForRun) emptyList() else state.planSteps,
                 isStreaming = true,
                 history = if (operation == AgentRuntimeWire.OP_REWRITE_REPLY) state.history else history + listOfNotNull(userHistoryMessage),
                 journal = state.journal.ifEmpty { state.history } + listOfNotNull(userHistoryMessage),
@@ -2724,8 +2734,6 @@ internal class AgentAppState(
             }
             // 思考档位不再由 AGENT_THINKING_ENABLED 硬门控：开关只决定默认档位，对话内已选的档位直接生效。
             val permittedReasoningEffort = reasoningEffort
-            // 只读标记在发车前定下来：run 进行中用户再切开关，也不改变这一轮的工具边界。
-            val planModeForRun = homeState.planMode
             val config = RuntimeConfigRepository.runtimeConfigFor(runModelId)?.copy(
                 terminalTools = agentBooleanForUi(Prefs.Keys.AGENT_TERMINAL_TOOLS),
                 browserTools = agentBooleanForUi(Prefs.Keys.AGENT_BROWSER_TOOLS),

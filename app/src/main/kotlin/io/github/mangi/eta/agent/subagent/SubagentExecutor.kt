@@ -332,8 +332,9 @@ internal class SubagentExecutor(
                 additionalTools = profile.filterTools(mcpTools),
                 executionContext = executionContext,
                 // 灵屏工具是否可见由 profile 决定（screen 允许，其余禁用）；
-                // capabilities 沿用父任务的实际状态，让 screen 子代理与父共用同一块灵屏。
-                capabilitiesProvider = capabilitiesProvider,
+                // capabilities 沿用父任务的实际状态，让 screen 子代理与父共用同一块灵屏；
+                // 计划面板只属于主会话，子代理不参与 Plan 模式（否则它会去调被禁用的 update_plan）。
+                capabilitiesProvider = { capabilitiesProvider().copy(planMode = false) },
                 sessionId = "$conversationKey-$subagentId",
                 operationId = "${toolCall.id}-$subagentId",
                 toolFilter = profile::filterTools,
