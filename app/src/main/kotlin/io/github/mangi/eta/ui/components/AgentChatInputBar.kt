@@ -745,9 +745,10 @@ internal fun AgentChatInputBar(
                             }
 
                             // Plan 开关紧跟思考图标：两者都是「这一轮怎么跑」的设置，放一起最好找。
+                            // 运行中也允许切换：改的是下一轮的策略，不必等当前任务结束。
                             PlanModeChip(
                                 active = planMode,
-                                enabled = !isStreaming,
+                                enabled = true,
                                 onClick = { onPlanModeChange(!planMode) },
                             )
                         }
@@ -773,7 +774,6 @@ internal fun AgentChatInputBar(
 
                         AgentModelPickerButton(
                             state = modelPickerState,
-                            isStreaming = isStreaming,
                             popupAnchorTopPx = inputContainerTopPx,
                             popupMaxHeight = thinkingPopupMaxHeight,
                             onModelSelected = onModelSelected,

@@ -44,6 +44,8 @@ internal class AgentLoop(
     private val purpose: ProviderRequestPurpose = ProviderRequestPurpose.CHAT,
     private val roleplayContext: RoleplayRunContext? = null,
     initialSupplementIndex: Int = 0,
+    /** 用户补充指令被注入成新的一轮时回调：Plan 模式据此重新武装闸门并清空上一轮清单。 */
+    private val onUserTurnAppended: (() -> Unit)? = null,
 ) {
     data class Result(
         val content: String,
@@ -310,6 +312,7 @@ internal class AgentLoop(
         val supplement = runController.pollSteeringMessage() ?: return false
         appendMessage(steeringMessage(supplement))
         context.userAppended()
+        onUserTurnAppended?.invoke()
         return true
     }
 
@@ -317,6 +320,7 @@ internal class AgentLoop(
         val supplement = runController.pollSteeringOrSeal() ?: return false
         appendMessage(steeringMessage(supplement))
         context.userAppended()
+        onUserTurnAppended?.invoke()
         return true
     }
 

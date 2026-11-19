@@ -1917,6 +1917,7 @@
     <string name="text_action_cut">剪切</string>
     <string name="chat_queue_steer_now">立即插话发送</string>
     <string name="chat_queue_steer_images_deferred">包含图片的消息将在当前任务完成后优先发送</string>
+    <string name="chat_model_switch_next_turn">已切换到 %1$s，从下一轮对话开始生效</string>
     <string name="chat_queue_remove">移除排队消息</string>
     <string name="conversation_move_category_search">搜索分类</string>
     <string name="conversation_move_category_create">新建分类并移入</string>

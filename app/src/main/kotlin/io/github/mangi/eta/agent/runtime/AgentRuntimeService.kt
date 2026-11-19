@@ -156,8 +156,16 @@ internal class AgentRuntimeService : Service(), LifecycleOwner, SavedStateRegist
     private var resultConversationId: String? = null
     private var resultArchive: Pair<String, String>? = null
     private val supplementsLock = Any()
-    private val activeSupplements = mutableListOf<AgentUiHandoffPayload.Supplement>()
-    private var nextSupplementIndex = 1
+
+    /**
+     * 运行中补充消息按 run 隔离。
+     *
+     * 以前是 service 级单例：启动第二个会话的 run 会把第一个 run 的补充清单清空，
+     * 而 `withActiveSupplements()` 又会把这份全局清单挂到任意 run 的请求快照上——
+     * 多会话并行时 A 会话插的话被写进 B 会话的历史，就是这条链路串的台。
+     */
+    private val supplementsByRun = mutableMapOf<String, MutableList<AgentUiHandoffPayload.Supplement>>()
+    private val supplementIndexByRun = mutableMapOf<String, Int>()
     @Volatile
     private var lastCompletedRunContext: CompletedRunContext? = null
     private val hideToken = Any()
@@ -642,19 +650,26 @@ internal class AgentRuntimeService : Service(), LifecycleOwner, SavedStateRegist
                     ?.let { key -> handoff.source to key }
             }
         synchronized(supplementsLock) {
-            activeSupplements.clear()
-            nextSupplementIndex = 1
+            val seeded = mutableListOf<AgentUiHandoffPayload.Supplement>()
+            var nextIndex = 1
             if (request.handoff?.source == AgentRuntimeWire.AGENT_UI_HANDOFF_SOURCE) {
                 val payload = AgentUiHandoffPayload.from(request.handoff.payload)
-                activeSupplements += payload.supplements
-                nextSupplementIndex = payload.lastSupplementIndex + 1
+                seeded += payload.supplements
+                nextIndex = payload.lastSupplementIndex + 1
             }
+            supplementsByRun[request.runId] = seeded
+            supplementIndexByRun[request.runId] = nextIndex
         }
 
         thread(name = "agent-runtime") {
             try {
                 executeRun(session, request, reviewGeneration)
             } finally {
+                synchronized(supplementsLock) {
+                    // 只清自己这一份：并发 run 的补充清单不能被别人带着消失。
+                    supplementsByRun.remove(request.runId)
+                    supplementIndexByRun.remove(request.runId)
+                }
                 AgentExecutionService.updateRunStatus(this, null)
                 AgentExecutionService.release("run:${request.runId}")
             }
@@ -1140,7 +1155,7 @@ internal class AgentRuntimeService : Service(), LifecycleOwner, SavedStateRegist
         }
         val session = runId.takeIf(String::isNotBlank)?.let(sessions::get)
         val event = if (session != null && text.isNotBlank()) {
-            session.steer(text) { recordSupplementEvent(text) }
+            session.steer(text) { recordSupplementEvent(session.runId, text) }
         } else {
             null
         }
@@ -1186,7 +1201,7 @@ internal class AgentRuntimeService : Service(), LifecycleOwner, SavedStateRegist
         }
         if (target != null) {
             val event = target.steer(supplementText) {
-                recordSupplementEvent(supplementText)
+                recordSupplementEvent(target.runId, supplementText)
             }
             if (event != null) {
                 AndroidAgentLogger.info(
@@ -1227,13 +1242,16 @@ internal class AgentRuntimeService : Service(), LifecycleOwner, SavedStateRegist
         startRun(continuationRequest)
     }
 
-    private fun recordSupplementEvent(text: String): AgentEvent.UserSupplementReceived {
+    /** 补充消息按 run 编号：索引与清单都跟着各自的 run 走，跨会话并行时互不覆盖。 */
+    private fun recordSupplementEvent(runId: String, text: String): AgentEvent.UserSupplementReceived {
         val supplement = synchronized(supplementsLock) {
+            val nextIndex = supplementIndexByRun[runId] ?: 1
+            supplementIndexByRun[runId] = nextIndex + 1
             AgentUiHandoffPayload.Supplement(
-                index = nextSupplementIndex++,
+                index = nextIndex,
                 text = text,
                 createdAt = System.currentTimeMillis(),
-            ).also { activeSupplements += it }
+            ).also { supplementsByRun.getOrPut(runId) { mutableListOf() } += it }
         }
         return AgentEvent.UserSupplementReceived(
             index = supplement.index,
@@ -1279,7 +1297,10 @@ internal class AgentRuntimeService : Service(), LifecycleOwner, SavedStateRegist
     private fun AgentRuntimeWire.RunRequest.withActiveSupplements(): AgentRuntimeWire.RunRequest {
         val handoff = handoff ?: return this
         if (handoff.source != AgentRuntimeWire.AGENT_UI_HANDOFF_SOURCE) return this
-        val supplements = synchronized(supplementsLock) { activeSupplements.toList() }
+        // 只取自己这个 run 的补充：全局清单会把别的会话的插话挂进来（串台根因之一）。
+        val supplements = synchronized(supplementsLock) {
+            supplementsByRun[runId]?.toList().orEmpty()
+        }
         if (supplements.isEmpty()) return this
         val payload = AgentUiHandoffPayload.from(handoff.payload).copy(
             supplements = supplements,

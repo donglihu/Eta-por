@@ -77,7 +77,6 @@ import top.yukonga.miuix.kmp.theme.MiuixTheme
 @Composable
 internal fun AgentModelPickerButton(
     state: AgentModelPickerUiState,
-    isStreaming: Boolean,
     popupAnchorTopPx: Int,
     popupMaxHeight: Dp,
     onModelSelected: (String) -> Unit,
@@ -88,7 +87,9 @@ internal fun AgentModelPickerButton(
     // 每次打开面板换一个 key，搜索词、筛选与滚动位置都从头开始。
     var sheetSession by remember { mutableIntStateOf(0) }
     val selected = state.selectedModel
-    val enabled = !isStreaming && !state.isChanging && state.providerGroups.isNotEmpty()
+    // 运行中也能切模型：当前这一轮已经用启动时快照的模型在跑，切换只改会话绑定，
+    // 从下一轮生效。以前这里跟着 isStreaming 一起禁用，用户想换模型必须干等任务结束。
+    val enabled = !state.isChanging && state.providerGroups.isNotEmpty()
     LaunchedEffect(enabled) {
         if (!enabled) {
             showPopup = false

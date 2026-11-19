@@ -19,6 +19,7 @@ internal object AgentPlanToolCatalog {
                 description = "维护当前任务的计划清单（会话框上方的计划面板）。" +
                     "plan 阶段：先调用它提交完整步骤，再输出方案说明，随后直接进入执行。" +
                     "执行阶段：每完成或开始一步就调用它回写状态，让用户看到进度。" +
+                    "用户在运行中补充新指令＝新的一轮：先更新清单再动手，旧清单不再适用。" +
                     "只描述步骤文本与状态，不要写工具名、路径或内部推理。",
                 parameters = JSONObject()
                     .put("type", "object")

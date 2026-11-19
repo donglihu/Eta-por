@@ -247,7 +247,13 @@ internal object AgentModelClient {
         // 只在「plan 模式 + 主会话 + 正常对话」时生效；重写回复、压缩、子代理都不参与。
         // 它不裁剪工具目录——工具照常声明，只是把「先计划」从口头约定变成确定性行为。
         val planGateActive = initialCapabilities.planMode && planToolsEnabled && !rewriteReply && !compactOnly
-        val planSubmitted = java.util.concurrent.atomic.AtomicBoolean(false)
+        val planGate = io.github.mangi.eta.agent.tool.PlanGate(active = planGateActive)
+        // 运行中用户补发指令＝新的一轮：清空上一轮清单并重新武装闸门。
+        // 以前闸门一个 run 只武装一次，第二轮起的插话都会绕过「先计划」直接动手，
+        // 表现就是「开着 Plan 模式，多轮对话后不生效」。
+        fun armPlanForNewUserTurn() {
+            if (planGate.armForNewUserTurn()) onEvent(AgentEvent.PlanUpdated(""))
+        }
         val loop = AgentLoop(
             transcript = transcript,
             systemCount = systemCount,
@@ -271,12 +277,10 @@ internal object AgentModelClient {
                         // 只有真的收下计划才放闸；参数不合法要让模型继续被挡，先修好清单。
                         val accepted = runCatching { JSONObject(published.content) }
                             .getOrNull()?.optBoolean("ok") == true
-                        if (accepted) planSubmitted.set(true)
+                        if (accepted) planGate.onPlanAccepted()
                         published
                     }
-                } else if (planGateActive && !planSubmitted.get() &&
-                    !PlanModePolicy.isReadOnlyTool(call.name)
-                ) {
+                } else if (!planGate.allowsTool(call.name)) {
                     // Plan 模式首步：先给清单，别先动手。拒绝理由写清楚，模型下一轮就会改走 update_plan。
                     ToolResult(
                         JSONObject().put("ok", false)
@@ -308,6 +312,7 @@ internal object AgentModelClient {
             purpose = if (rewriteReply) ProviderRequestPurpose.REPLY_REWRITE else ProviderRequestPurpose.CHAT,
             roleplayContext = roleplayContext,
             initialSupplementIndex = initialSupplementIndex,
+            onUserTurnAppended = ::armPlanForNewUserTurn,
             remoteToolNames = remoteToolNames,
             toolsForRound = ::toolsForRound,
         )
