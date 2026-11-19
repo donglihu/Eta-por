@@ -47,6 +47,14 @@ import top.yukonga.miuix.kmp.squircle.squircleSurface
 import top.yukonga.miuix.kmp.theme.MiuixTheme
 
 /**
+ * 标题行图标按钮的触控边长。
+ *
+ * 取 40dp：既明显大于原来的 26dp（原写法只有 20dp 图标 + 3dp 内边距，
+ * 手感上「看得见按不中」），又不至于把标题行撑到 48dp 那么高、破坏设计图的紧凑比例。
+ */
+private val HeaderIconTouchTarget = 40.dp
+
+/**
  * 会话框上方的任务清单：标题行常驻，展开才是完整步骤。
  *
  * 标题固定为「任务待办」，状态不写进标题：
@@ -62,7 +70,8 @@ internal fun AgentPlanPanel(
     isRunning: Boolean,
     modifier: Modifier = Modifier,
     expandedKey: String? = null,
-    onClear: (() -> Unit)? = null,
+    /** 右上角叉号：清空本会话的任务清单。默认非空，保证按钮始终在。 */
+    onClear: () -> Unit = {},
 ) {
     if (steps.isEmpty()) return
     var expanded by rememberSaveable(expandedKey) { mutableStateOf(false) }
@@ -121,31 +130,19 @@ internal fun AgentPlanPanel(
                 }
             }
             Spacer(modifier = Modifier.width(6.dp))
-            Icon(
-                imageVector = if (expanded) Icons.Rounded.ExpandLess else Icons.Rounded.ExpandMore,
+            PlanHeaderIconButton(
+                icon = if (expanded) Icons.Rounded.ExpandLess else Icons.Rounded.ExpandMore,
                 contentDescription = stringResource(
                     if (expanded) R.string.chat_plan_collapse else R.string.chat_plan_expand,
                 ),
-                modifier = Modifier
-                    .clip(CircleShape)
-                    .clickable { expanded = !expanded }
-                    .padding(3.dp)
-                    .size(20.dp),
-                tint = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                onClick = { expanded = !expanded },
             )
-            if (onClear != null) {
-                Spacer(modifier = Modifier.width(2.dp))
-                Icon(
-                    imageVector = Icons.Rounded.Close,
-                    contentDescription = stringResource(R.string.chat_plan_clear),
-                    modifier = Modifier
-                        .clip(CircleShape)
-                        .clickable(onClick = onClear)
-                        .padding(3.dp)
-                        .size(20.dp),
-                    tint = MiuixTheme.colorScheme.onSurfaceVariantSummary,
-                )
-            }
+            Spacer(modifier = Modifier.width(2.dp))
+            PlanHeaderIconButton(
+                icon = Icons.Rounded.Close,
+                contentDescription = stringResource(R.string.chat_plan_clear),
+                onClick = onClear,
+            )
         }
         AnimatedVisibility(
             visible = expanded,
@@ -161,8 +158,36 @@ internal fun AgentPlanPanel(
     }
 }
 
-/** 进度胶囊：`0/8 完成`，浅底圆角，和行内的「进行中」胶囊同一套视觉。 */
+/**
+ * 标题行右侧的图标按钮：图形本身 20dp，外面套 [HeaderIconTouchTarget] 的触控区。
+ *
+ * 之前的写法只有 `20dp + padding(3dp)` ≈ 26dp 的点击范围，低于 48dp 最小触控目标，
+ * 手感上是「看得见但按不中」；这里把图形与点击范围分开，
+ * 图标仍是 20dp 保持设计图的视觉比例，变大的只是那圈可点区域。
+ */
 @Composable
+private fun PlanHeaderIconButton(
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    contentDescription: String,
+    onClick: () -> Unit,
+) {
+    Box(
+        modifier = Modifier
+            .size(HeaderIconTouchTarget)
+            .clip(CircleShape)
+            .clickable(onClick = onClick),
+        contentAlignment = Alignment.Center,
+    ) {
+        Icon(
+            imageVector = icon,
+            contentDescription = contentDescription,
+            modifier = Modifier.size(20.dp),
+            tint = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+        )
+    }
+}
+
+/** 进度胶囊：`0/8 完成`，浅底圆角，和行内的「进行中」胶囊同一套视觉。 */@Composable
 private fun ProgressBadge(done: Int, total: Int) {
     Box(
         modifier = Modifier
