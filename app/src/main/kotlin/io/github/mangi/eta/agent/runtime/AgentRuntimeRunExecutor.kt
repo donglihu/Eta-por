@@ -17,6 +17,9 @@ import io.github.mangi.eta.agent.memory.AgentMemoryContextBuilder
 import io.github.mangi.eta.agent.memory.ConversationMemoryPins
 import io.github.mangi.eta.agent.roleplay.CharacterMemoryTools
 import io.github.mangi.eta.agent.roleplay.RoleplayRunContext
+import io.github.mangi.eta.agent.scheduler.ScheduledTaskRunContext
+import io.github.mangi.eta.agent.scheduler.ScheduledTaskToolCatalog
+import io.github.mangi.eta.agent.scheduler.ScheduledTaskToolExecutor
 import io.github.mangi.eta.agent.subagent.AgentSubagentToolCatalog
 import io.github.mangi.eta.agent.subagent.SubagentExecutor
 import io.github.mangi.eta.data.model.enabledModel
@@ -156,6 +159,10 @@ internal class AgentRuntimeRunExecutor(
             val uiPayload = request.handoff
                 ?.takeIf { it.source == AgentRuntimeWire.AGENT_UI_HANDOFF_SOURCE }
                 ?.let { AgentUiHandoffPayload.from(it.payload) }
+            val scheduledRunContext = request.handoff
+                ?.takeIf { it.source == AgentRuntimeWire.SCHEDULED_TASK_HANDOFF_SOURCE }
+                ?.let { AgentExternalArchivePayload.from(it.payload)?.adapterPayload }
+                ?.let(ScheduledTaskRunContext::fromAdapterPayload)
             val conversationId = uiPayload?.conversationId
                 ?.takeIf { it.isNotBlank() }
             memoryConversationId = conversationId
@@ -220,12 +227,16 @@ internal class AgentRuntimeRunExecutor(
             timing.stage("root_probe", mark)
             mark = stageMark()
             val pendingSkillConflict = PendingSkillConflictCapabilityParser.parse(request.history)
-            val mcpSnapshot = runBlocking {
-                runCatching { McpRunSnapshot.load() }.getOrElse { throwable ->
-                    AndroidAgentLogger.warnThrottled("agent_mcp_snapshot_failed") {
-                        "MCP tool snapshot unavailable: type=${throwable.safeLogType()}"
+            val mcpSnapshot = if (scheduledRunContext?.capabilities?.mcpTools == false) {
+                McpRunSnapshot.EMPTY
+            } else {
+                runBlocking {
+                    runCatching { McpRunSnapshot.load() }.getOrElse { throwable ->
+                        AndroidAgentLogger.warnThrottled("agent_mcp_snapshot_failed") {
+                            "MCP tool snapshot unavailable: type=${throwable.safeLogType()}"
+                        }
+                        McpRunSnapshot.EMPTY
                     }
-                    McpRunSnapshot.EMPTY
                 }
             }
             val mcpTools = JSONArray().also(mcpSnapshot::appendModelTools)
@@ -425,47 +436,83 @@ internal class AgentRuntimeRunExecutor(
                     )
                 },
             )
-            val runTools = JSONArray(mcpTools.toString()).also { tools ->
-                if (subagentAllowed()) {
-                    // 把用户勾选的授权模型写进工具描述，否则主 Agent 根本不知道有哪些可选。
-                    val subagentCfg = runCatching {
-                        runBlocking { io.github.mangi.eta.data.datastore.SettingsDataStore.subagentSettings() }
-                    }.getOrNull()
-                    val authorized = if (subagentCfg?.allowModelSelection == true) {
-                        subagentCfg.effectiveGrants.mapNotNull { grant ->
-                            val resolved = runCatching {
-                                runBlocking {
-                                    io.github.mangi.eta.data.repository.ProviderRepository.ensureBuiltInsMerged()
-                                    val all = io.github.mangi.eta.data.repository.ProviderRepository.allProviders()
-                                    all.enabledModelByApiId(grant.modelId) ?: all.enabledModel(grant.modelId)
-                                }
-                            }.getOrNull() ?: return@mapNotNull null
-                            val selectable = resolved.model.reasoningCapabilities
-                                ?.selectableEfforts?.map { it.wireValue }.orEmpty()
-                            val efforts = if (grant.allowedEfforts.isEmpty()) {
-                                selectable
-                            } else {
-                                selectable.filter { it in grant.allowedEfforts }
-                            }
-                            // 主 Agent 只认得对外 modelId（如 cn:hy3），不能给它内部 UUID。
-                            io.github.mangi.eta.agent.subagent.SubagentModelOption(
-                                modelId = resolved.model.modelId,
-                                efforts = efforts,
-                                contextWindow = resolved.model.contextWindowOverride
-                                    ?: resolved.model.contextWindow,
-                                supportsThinking = resolved.model.reasoning == true,
-                            )
+            val scheduledToolExecutor = ScheduledTaskToolExecutor(
+                context = appContext,
+                activeRunContext = scheduledRunContext,
+            )
+            val subagentCfg = runCatching {
+                runBlocking { io.github.mangi.eta.data.datastore.SettingsDataStore.subagentSettings() }
+            }.getOrNull()
+            val authorized = if (subagentCfg?.allowModelSelection == true) {
+                subagentCfg.effectiveGrants.mapNotNull { grant ->
+                    val resolved = runCatching {
+                        runBlocking {
+                            io.github.mangi.eta.data.repository.ProviderRepository.ensureBuiltInsMerged()
+                            val all = io.github.mangi.eta.data.repository.ProviderRepository.allProviders()
+                            all.enabledModelByApiId(grant.modelId) ?: all.enabledModel(grant.modelId)
                         }
+                    }.getOrNull() ?: return@mapNotNull null
+                    val selectable = resolved.model.reasoningCapabilities
+                        ?.selectableEfforts?.map { it.wireValue }.orEmpty()
+                    val efforts = if (grant.allowedEfforts.isEmpty()) {
+                        selectable
                     } else {
-                        emptyList()
+                        selectable.filter { it in grant.allowedEfforts }
                     }
-                    AgentSubagentToolCatalog.appendSchemas(tools, authorizedModels = authorized)
+                    io.github.mangi.eta.agent.subagent.SubagentModelOption(
+                        modelId = resolved.model.modelId,
+                        efforts = efforts,
+                        contextWindow = resolved.model.contextWindowOverride
+                            ?: resolved.model.contextWindow,
+                        supportsThinking = resolved.model.reasoning == true,
+                    )
                 }
-                if (historyTool != null) tools.put(AgentConversationToolCatalog.schema())
-                if (characterMemoryTools != null && memoryEnabled) CharacterMemoryTools.appendSchemas(tools)
+            } else {
+                emptyList()
             }
+            val runTools = buildRunTools(
+                mcpTools = mcpTools,
+                subagentAllowed = subagentAllowed(),
+                includeHistoryTool = historyTool != null,
+                includeCharacterMemoryTools = characterMemoryTools != null && memoryEnabled,
+                authorizedModels = authorized,
+                includeScheduledManageTool = scheduledRunContext == null &&
+                    request.operation == AgentRuntimeWire.OP_CHAT,
+                includeScheduledSelfRunTools = scheduledRunContext != null,
+            )
+            val scheduledToolFilter: ((JSONArray) -> JSONArray)? =
+                if (scheduledRunContext != null && !scheduledRunContext.capabilities.guiTools) {
+                    { sourceTools ->
+                        JSONArray().also { filtered ->
+                            for (index in 0 until sourceTools.length()) {
+                                val tool = sourceTools.getJSONObject(index)
+                                val name = tool.optJSONObject("function")?.optString("name").orEmpty()
+                                if (!AgentToolRequirements.requiresGuiControl(name)) {
+                                    filtered.put(tool)
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    null
+                }
             val runToolExecutor = AgentModelClient.ToolExecutor { call ->
-                if (call.name in AgentSubagentToolCatalog.names) {
+                if (call.name in ScheduledTaskToolCatalog.manageNames) {
+                    scheduledToolExecutor.executeManage(call)
+                } else if (call.name in ScheduledTaskToolCatalog.selfRunNames) {
+                    scheduledToolExecutor.executeSelfRun(call)
+                } else if (scheduledRunContext != null &&
+                    !scheduledRunContext.capabilities.guiTools &&
+                    AgentToolRequirements.requiresGuiControl(call.name)
+                ) {
+                    AgentModelClient.ToolResult(
+                        JSONObject()
+                            .put("ok", false)
+                            .put("code", "GUI_DISABLED_IN_SCHEDULED_TASK")
+                            .put("message", "当前定时任务未开启应用界面（GUI）操作权限，本次未执行")
+                            .toString(),
+                    )
+                } else if (call.name in AgentSubagentToolCatalog.names) {
                     if (!subagentAllowed()) {
                         AgentModelClient.ToolResult(
                             JSONObject()
@@ -532,6 +579,8 @@ internal class AgentRuntimeRunExecutor(
                 capabilitiesProvider = { executor.capabilitiesForRun(AgentToolCapabilities.capture(appContext).copy(planMode = request.planMode)) },
                 prompt = request.prompt,
                 assistantScreenContext = request.assistantScreenContext,
+                extraSystemContext = scheduledRunContext?.buildSystemGuidance().orEmpty(),
+                toolFilter = scheduledToolFilter,
                 toolExecutor = runToolExecutor,
                 images = request.images,
                 history = request.history,
@@ -775,5 +824,36 @@ internal class AgentRuntimeRunExecutor(
     private fun snapshotArchivedEvents(archivedEvents: MutableList<AgentEvent>?): List<AgentEvent> {
         if (archivedEvents == null) return emptyList()
         return synchronized(archivedEvents) { archivedEvents.toList() }
+    }
+
+    companion object {
+        internal fun supportsHistoryTool(operation: String): Boolean =
+            operation == AgentRuntimeWire.OP_CHAT || operation == AgentRuntimeWire.OP_COMPACT
+
+        internal fun buildRunTools(
+            mcpTools: JSONArray,
+            subagentAllowed: Boolean,
+            includeHistoryTool: Boolean,
+            includeCharacterMemoryTools: Boolean,
+            isToolEnabled: (String) -> Boolean = { io.github.mangi.eta.config.Prefs.isEnabled(it) },
+            authorizedModels: List<io.github.mangi.eta.agent.subagent.SubagentModelOption> = emptyList(),
+            includeScheduledManageTool: Boolean = false,
+            includeScheduledSelfRunTools: Boolean = false,
+        ): JSONArray = JSONArray(mcpTools.toString()).also { tools ->
+            if (subagentAllowed) AgentSubagentToolCatalog.appendSchemas(tools, authorizedModels)
+            if (includeHistoryTool) tools.put(AgentConversationToolCatalog.schema())
+            if (includeScheduledManageTool) ScheduledTaskToolCatalog.appendManageTool(tools)
+            if (includeScheduledSelfRunTools) ScheduledTaskToolCatalog.appendSelfRunTools(tools)
+            if (includeCharacterMemoryTools) {
+                val temp = JSONArray().also(CharacterMemoryTools::appendSchemas)
+                for (index in 0 until temp.length()) {
+                    val schema = temp.getJSONObject(index)
+                    val name = schema.getJSONObject("function").getString("name")
+                    if (isToolEnabled(name)) {
+                        tools.put(schema)
+                    }
+                }
+            }
+        }
     }
 }

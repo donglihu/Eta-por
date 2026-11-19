@@ -20,6 +20,7 @@ import io.github.mangi.eta.data.repository.AgentMemoryRepository
 import io.github.mangi.eta.data.repository.AppearanceSettingsRepository
 import io.github.mangi.eta.agent.github.GitHubAccountManager
 import io.github.mangi.eta.data.repository.McpServerRepository
+import io.github.mangi.eta.data.repository.ScheduledTaskRepository
 import io.github.mangi.eta.data.repository.LinuxEnvironmentSettingsRepository
 import io.github.mangi.eta.data.repository.ProviderRepository
 import io.github.mangi.eta.ui.app.PredictiveBackController
@@ -96,6 +97,20 @@ class EtaApp : Application(), XposedServiceHelper.OnServiceListener {
         io.github.mangi.eta.agent.model.AgentRequestSnapshot.init(this)
         ProviderRepository.init(this)
         McpServerRepository.init(this)
+        ScheduledTaskRepository.init(this)
+        applicationScope.launch {
+            runCatching {
+                ScheduledTaskRepository.reconcileAfterRestartOrClockChange(
+                    recomputeAllSchedules = false,
+                    rescheduleAlarm = true,
+                    context = this@EtaApp,
+                )
+            }.onFailure { throwable ->
+                AndroidAgentLogger.warn(
+                    "Scheduled task reconcile failed: type=${throwable.safeLogType()}"
+                )
+            }
+        }
         GitHubAccountManager.init(this)
         applicationScope.launch(Dispatchers.IO) {
             // 恢复与补排各步骤独立兜底：任何一步抛错只记自己的日志，绝不让同一段

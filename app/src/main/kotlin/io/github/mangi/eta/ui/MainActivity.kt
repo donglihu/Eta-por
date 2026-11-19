@@ -42,6 +42,7 @@ class MainActivity : ComponentActivity() {
     private var speechSettingsRequested by mutableStateOf(false)
     private var terminalRequested by mutableStateOf(false)
     private var linuxEnvironmentRequested by mutableStateOf(false)
+    private var scheduledTaskRequestedId by mutableStateOf<String?>(null)
     /** 上次前台补查自动备份的时间，用来节流 onResume。 */
     private var lastAutoBackupCheckAt = 0L
 
@@ -93,6 +94,9 @@ class MainActivity : ComponentActivity() {
                         openLinuxEnvironment = linuxEnvironmentRequested,
                         onLinuxEnvironmentOpened = { linuxEnvironmentRequested = false; intent?.action = null },
                         onSpeechSettingsOpened = { speechSettingsRequested = false; intent?.action = null },
+
+                        requestedScheduledTaskId = scheduledTaskRequestedId,
+                        onScheduledTaskOpened = { scheduledTaskRequestedId = null; intent?.action = null },
                         onAssistantConversationOpened = { opened ->
                             assistantConversationKey = null
                             if (opened && assistantConversationSource == AgentRuntimeWire.ETA_VOICE_HANDOFF_SOURCE) {
@@ -250,6 +254,10 @@ class MainActivity : ComponentActivity() {
             }
             return
         }
+        if (intent?.action == ACTION_OPEN_SCHEDULED_TASK_DETAIL) {
+            scheduledTaskRequestedId = intent.getStringExtra(EXTRA_SCHEDULED_TASK_ID)?.takeIf(String::isNotBlank)
+            return
+        }
         if (intent?.action != EtaAssistantOverlayService.ACTION_OPEN_CONVERSATION) return
         assistantConversationSource = AgentRuntimeWire.ETA_VOICE_HANDOFF_SOURCE
         assistantConversationKey = intent.getStringExtra(
@@ -310,5 +318,7 @@ class MainActivity : ComponentActivity() {
         const val ACTION_OPEN_ARCHIVED_CONVERSATION = "io.github.mangi.eta.action.OPEN_ARCHIVED_CONVERSATION"
         const val EXTRA_HANDOFF_SOURCE = "io.github.mangi.eta.extra.HANDOFF_SOURCE"
         const val EXTRA_CONVERSATION_KEY = "io.github.mangi.eta.extra.CONVERSATION_KEY"
+        const val ACTION_OPEN_SCHEDULED_TASK_DETAIL = "io.github.mangi.eta.action.OPEN_SCHEDULED_TASK_DETAIL"
+        const val EXTRA_SCHEDULED_TASK_ID = "io.github.mangi.eta.extra.SCHEDULED_TASK_ID"
     }
 }

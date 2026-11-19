@@ -2486,4 +2486,20 @@
     <string name="expert_detail_delete_summary">将删除「%1$s」，此操作不可恢复。确定删除？</string>
     <string name="expert_detail_delete_confirm">删除</string>
   <string name="capability_import_insufficient_storage">存储空间不足，无法暂存这张图片</string>
+
+  <string name="route_scheduled_tasks">定时任务</string>
+  <string name="route_scheduled_task_detail">任务详情</string>
+  <string name="route_scheduled_task_new">新建定时任务</string>
+  <string name="route_scheduled_task_edit">编辑定时任务</string>
+  <string name="scheduled_notification_channel_results">定时任务结果</string>
+  <string name="scheduled_notification_channel_results_desc">由 Eta 定时任务交付的摘要与更新</string>
+  <string name="scheduled_notification_channel_alerts">定时任务提醒</string>
+  <string name="scheduled_notification_channel_alerts_desc">失败、自动暂停提醒与待解锁操作</string>
+  <string name="scheduled_notification_completed_fallback">定时任务已完成。点按查看完整对话。</string>
+  <string name="scheduled_notification_failed_title">任务失败：%1$s</string>
+  <string name="scheduled_notification_auto_disabled_title">任务已暂停：%1$s</string>
+  <string name="scheduled_notification_failed_fallback">执行失败。点按查看详情。</string>
+  <string name="scheduled_notification_gui_ready_title">可以运行：%1$s</string>
+  <string name="scheduled_action_run_now">立即运行</string>
+  <string name="scheduled_action_stop">停止</string>
 </resources>

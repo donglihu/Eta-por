@@ -8,7 +8,7 @@ import androidx.room.RoomDatabase
 import androidx.room.migration.Migration
 
 /** 结构版本的唯一来源：@Database 与自检页共用，文案里不再写字面量。 */
-internal const val ETA_DB_SCHEMA_VERSION = 36
+internal const val ETA_DB_SCHEMA_VERSION = 37
 
 @Database(
     entities = [
@@ -32,6 +32,8 @@ internal const val ETA_DB_SCHEMA_VERSION = 36
         AgentTaskEntity::class,
         AgentTaskRunEntity::class,
         TokenUsageRecordEntity::class,
+        ScheduledTaskEntity::class,
+        ScheduledTaskRunEntity::class,
     ],
     version = ETA_DB_SCHEMA_VERSION,
     exportSchema = false,
@@ -45,6 +47,7 @@ internal abstract class EtaDatabase : RoomDatabase() {
     abstract fun characterDao(): CharacterDao
     abstract fun agentTaskDao(): AgentTaskDao
     abstract fun tokenUsageDao(): TokenUsageDao
+    abstract fun scheduledTaskDao(): ScheduledTaskDao
 
     companion object {
         @Volatile
@@ -88,6 +91,7 @@ internal abstract class EtaDatabase : RoomDatabase() {
                         MIGRATION_33_34,
                         MIGRATION_34_35,
                         MIGRATION_35_36,
+                        MIGRATION_36_37,
                     )
                     .addCallback(object : Callback() {
                         override fun onCreate(db: androidx.sqlite.db.SupportSQLiteDatabase) { createTextChunkCleanup(db) }
@@ -297,6 +301,65 @@ internal abstract class EtaDatabase : RoomDatabase() {
                 found
             }
             if (!exists) execSQL("ALTER TABLE $table ADD COLUMN $column $definition")
+        }
+
+        internal val MIGRATION_36_37 = Migration(36, 37) { database ->
+            database.execSQL(
+                "CREATE TABLE IF NOT EXISTS scheduled_tasks (" +
+                    "id TEXT NOT NULL PRIMARY KEY, " +
+                    "name TEXT NOT NULL, " +
+                    "prompt TEXT NOT NULL, " +
+                    "enabled INTEGER NOT NULL, " +
+                    "trigger_kind TEXT NOT NULL, " +
+                    "schedule_json TEXT NOT NULL, " +
+                    "misfire_policy TEXT NOT NULL, " +
+                    "misfire_window_minutes INTEGER NOT NULL, " +
+                    "quiet_hours_json TEXT NOT NULL, " +
+                    "delivery_mode TEXT NOT NULL, " +
+                    "session_mode TEXT NOT NULL, " +
+                    "dedicated_conversation_key TEXT, " +
+                    "model_id TEXT, " +
+                    "reasoning_effort TEXT, " +
+                    "capabilities_json TEXT NOT NULL, " +
+                    "timeout_seconds INTEGER NOT NULL, " +
+                    "memo TEXT NOT NULL, " +
+                    "memo_updated_at INTEGER NOT NULL, " +
+                    "next_run_at INTEGER, " +
+                    "last_run_at INTEGER, " +
+                    "last_status TEXT, " +
+                    "last_summary TEXT NOT NULL, " +
+                    "consecutive_failures INTEGER NOT NULL, " +
+                    "auto_disabled_reason TEXT, " +
+                    "created_at INTEGER NOT NULL, " +
+                    "updated_at INTEGER NOT NULL)"
+            )
+            database.execSQL(
+                "CREATE INDEX IF NOT EXISTS index_scheduled_tasks_enabled_next_run_at " +
+                    "ON scheduled_tasks (enabled, next_run_at)"
+            )
+            database.execSQL(
+                "CREATE TABLE IF NOT EXISTS scheduled_task_runs (" +
+                    "id TEXT NOT NULL PRIMARY KEY, " +
+                    "task_id TEXT NOT NULL, " +
+                    "trigger_source TEXT NOT NULL, " +
+                    "scheduled_for_at INTEGER, " +
+                    "started_at INTEGER NOT NULL, " +
+                    "finished_at INTEGER, " +
+                    "status TEXT NOT NULL, " +
+                    "summary TEXT NOT NULL, " +
+                    "notified INTEGER NOT NULL, " +
+                    "archive_conversation_key TEXT, " +
+                    "model_label TEXT NOT NULL, " +
+                    "FOREIGN KEY(task_id) REFERENCES scheduled_tasks(id) ON DELETE CASCADE)"
+            )
+            database.execSQL(
+                "CREATE INDEX IF NOT EXISTS index_scheduled_task_runs_task_id_started_at " +
+                    "ON scheduled_task_runs (task_id, started_at)"
+            )
+            database.execSQL(
+                "CREATE INDEX IF NOT EXISTS index_scheduled_task_runs_status " +
+                    "ON scheduled_task_runs (status)"
+            )
         }
 
         private fun createTextChunkCleanup(database: androidx.sqlite.db.SupportSQLiteDatabase) {

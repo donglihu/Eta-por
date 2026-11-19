@@ -32,6 +32,8 @@ internal data class LocalToolRequirement(
     val rootRequirement: RootRequirement,
     val lsposedRequirement: LsposedRequirement = LsposedRequirement.NONE,
     val accessibility: Boolean = false,
+    /** GUI 触点：手势/观察/输入等在定时任务无 GUI 权限时禁止执行。 */
+    val gui: Boolean = false,
     val systemAccess: ToolSystemAccess = ToolSystemAccess.NONE,
     val colorOs: Boolean = false,
     val vivoAlternative: Boolean = false,
@@ -220,6 +222,15 @@ internal object AgentToolRequirements {
             "replace_text", "clear_text", "paste_text", "press_key", "open_system_panel",
             "wait_for_text", "wait_for_package",
         ).forEach { name -> put(name, getValue(name).copy(accessibility = true)) }
+        listOf(
+            "observe_screen", "launch_app", "present_to_user", "open_uri", "open_system_panel",
+            "wait", "wait_for_text", "wait_for_package", "set_clipboard", "get_clipboard",
+        ).forEach { name -> put(name, getValue(name).copy(gui = true)) }
+        listOf(
+            "tap", "tap_area", "tap_element", "tap_smart", "long_press", "long_press_element", "swipe",
+            "scroll", "scroll_element", "type_text", "input_text", "replace_text", "clear_text",
+            "paste_text", "press_key",
+        ).forEach { name -> put(name, getValue(name).copy(gui = true)) }
         mapOf(
             "recent_notifications" to ToolSystemAccess.NOTIFICATIONS,
             "search_notification_history" to ToolSystemAccess.NOTIFICATIONS,
@@ -262,6 +273,8 @@ internal object AgentToolRequirements {
         requireNotNull(find(name)) { "Missing tool requirements: $name" }.rootRequirement
 
     fun requiresAccessibility(name: String): Boolean = find(name)?.accessibility == true
+
+    fun requiresGuiControl(name: String?): Boolean = name?.let(::find)?.gui == true
 
     /**
      * 最近一次 [project] 里被过滤掉的未登记工具名。
