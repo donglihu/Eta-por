@@ -61,6 +61,7 @@ internal object AgentRuntimeRequestConfigResolver {
             thinkingEnabled = effort.enablesReasoning,
             reasoningEffort = effort,
             autoCompactionEnabled = runtimeConfig.autoCompactionEnabled && entry.autoCompactionEnabled,
+            autoCompactionTriggerPercent = runtimeConfig.autoCompactionTriggerPercent,
             supportsSearchSuggestions = entry.supportsSearchSuggestions,
         )
         val handoff = request.handoff ?: return request.copy(config = config)

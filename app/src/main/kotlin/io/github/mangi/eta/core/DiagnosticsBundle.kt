@@ -27,7 +27,7 @@ import kotlinx.coroutines.withContext
 internal object DiagnosticsBundle {
 
     /** 手动诊断包的默认落盘目录；自动导出在它的「自动」子目录，互不覆盖。 */
-    const val DEFAULT_DIR = "/storage/emulated/0/ai共享文件夹/诊断包备份"
+    const val DEFAULT_DIR = SharedStorage.DIAGNOSTICS_DIR
 
     suspend fun collect(context: Context): ByteArray = withContext(Dispatchers.IO) {
         val root = runCatching { RootAccess.isGranted }.getOrDefault(false)

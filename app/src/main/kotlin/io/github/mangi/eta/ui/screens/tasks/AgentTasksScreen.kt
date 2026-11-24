@@ -1,6 +1,7 @@
 package io.github.mangi.eta.ui.screens.tasks
 
 import android.content.Context
+import android.content.Intent
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -36,12 +37,18 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import io.github.mangi.eta.R
+import io.github.mangi.eta.agent.automation.AgentKeepaliveScheduler
 import io.github.mangi.eta.agent.automation.AgentTaskScheduler
 import io.github.mangi.eta.agent.automation.AgentTaskTools
+import io.github.mangi.eta.core.AndroidAgentLogger
+import io.github.mangi.eta.core.safeLogType
+import io.github.mangi.eta.data.datastore.SettingsDataStore
 import io.github.mangi.eta.data.db.AgentTaskEntity
 import io.github.mangi.eta.data.db.AgentTaskRunEntity
 import io.github.mangi.eta.data.db.EtaDatabase
+import io.github.mangi.eta.ui.components.EtaArrowPreference
 import io.github.mangi.eta.ui.components.EtaPreference
+import io.github.mangi.eta.ui.components.EtaPreferenceDivider
 import io.github.mangi.eta.ui.components.EtaPreferenceColors
 import io.github.mangi.eta.ui.components.EtaPreferenceGroup
 import io.github.mangi.eta.ui.components.EtaSwitch
@@ -73,6 +80,12 @@ internal fun AgentTasksScreen(onBack: () -> Unit) {
     val tasks by dao.observeTasks().collectAsState(initial = emptyList())
     val runs by dao.observeRuns().collectAsState(initial = emptyList())
     val scope = rememberCoroutineScope()
+    // 保活开关独立订阅：只这一位变化，不必等整份 Settings 重绘。
+    val keepaliveEnabled by SettingsDataStore.keepaliveEnabledFlow().collectAsState(initial = false)
+    // 电池优化白名单引导：null 表示已在白名单，不需要再显示入口。
+    val batteryOptimization by remember {
+        mutableStateOf(AgentKeepaliveScheduler.batteryOptimizationIntent(context))
+    }
     var triggers by remember { mutableStateOf<List<TaskTriggerUi>>(emptyList()) }
     var selectedTrigger by remember { mutableStateOf<TaskTriggerUi?>(null) }
     val lifecycle = LocalLifecycleOwner.current.lifecycle
@@ -134,6 +147,42 @@ internal fun AgentTasksScreen(onBack: () -> Unit) {
                         title = stringResource(R.string.automation_create_hint),
                         summary = stringResource(R.string.automation_create_summary),
                     )
+                }
+            }
+            item(key = "keepalive-settings") {
+                EtaPreferenceGroup {
+                    EtaSwitchPreference(
+                        title = stringResource(R.string.keepalive_settings_title),
+                        summary = stringResource(R.string.keepalive_settings_summary),
+                        summaryMaxLines = 3,
+                        checked = keepaliveEnabled,
+                        onCheckedChange = { value ->
+                            // 同步入口，内部自起后台线程（存设置 + 排/撤 job + 起/停服务）。
+                            // 这里刻意不用协程作用域：ETA 纪律禁止 Compose 侧用
+                            // rememberCoroutineScope() 做异步，viewModelScope 才归后台任务用。
+                            AgentKeepaliveScheduler.setEnabled(context, value)
+                        },
+                    )
+                    batteryOptimization?.let { intent ->
+                        EtaPreferenceDivider(hasLeading = true)
+                        EtaArrowPreference(
+                            title = stringResource(R.string.keepalive_battery_title),
+                            summary = stringResource(R.string.keepalive_battery_summary),
+                            enabled = keepaliveEnabled,
+                            onClick = {
+                                // 部分 ROM 没有这个系统页，启动失败只记日志，不抛给界面。
+                                // 这里的 context 是 applicationContext，必须带 NEW_TASK 才起得来 Activity。
+                                val launch = Intent(intent).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                runCatching { context.startActivity(launch) }
+                                    .onFailure { error ->
+                                        AndroidAgentLogger.warn(
+                                            "Battery optimization page unavailable: type=" +
+                                                error.safeLogType()
+                                        )
+                                    }
+                            },
+                        )
+                    }
                 }
             }
             item(key = "trigger-catalog-heading") {

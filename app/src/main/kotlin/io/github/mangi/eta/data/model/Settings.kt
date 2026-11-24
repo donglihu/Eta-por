@@ -8,6 +8,10 @@ data class Settings(
     val selectedModelId: String? = null,
     val memoryEnabled: Boolean = true,
     val memoryAutoCompactEnabled: Boolean = true,
+    /** 记忆核心注入预算（字符）；0 表示跟随上下文窗口自动计算。 */
+    val memoryCoreBudgetChars: Int = 0,
+    /** 记忆标题索引注入预算（字符）；0 表示自动。 */
+    val memoryHeadingBudgetChars: Int = 0,
     val autoMemoryEnabled: Boolean = true,
     val autoSkillsEnabled: Boolean = true,
     val virtualScreenEnabled: Boolean = false,
@@ -39,8 +43,19 @@ data class Settings(
     val autoBackupLastErrorAt: Long = 0L,
     /** 自定义自动备份目录；空串表示默认的「外部存储/Eta备份」。 */
     val autoBackupDirectory: String = "",
+    /**
+     * 通过 SAF 授权的备份文件夹（tree URI）；非空时优先于 [autoBackupDirectory]。
+     *
+     * 分区存储下公共存储根目录（例如 /storage/emulated/0/ETA）用 File 路径写不进去，
+     * 走系统文件夹授权后由 MediaProvider 代理写入，才能落到用户真正想要的位置。
+     */
+    val autoBackupTreeUri: String = "",
+    /** [autoBackupTreeUri] 的展示名（文件夹名），只用于界面显示。 */
+    val autoBackupTreeLabel: String = "",
     /** 自动备份格式：json（轻量 JSON）/ full（全量压缩包，含私有目录）。 */
     val autoBackupFormat: String = AutoBackupFormat.JSON,
+    /** 全量备份时是否连同 Linux 容器（files/terminal*）一起打包。 */
+    val autoBackupIncludeLinux: Boolean = false,
     /** 极致自动排查：本地定时巡检，只报异常，异常即留档。 */
     val diagPatrolEnabled: Boolean = false,
 
@@ -59,6 +74,14 @@ data class Settings(
     /** 上次巡检等级（正常/注意/异常），给界面和增量对比用。 */
     val diagPatrolLastLevel: String = "",
     val diagPatrolLastSummary: String = "",
+
+    /**
+     * 可选后台保活：用户明确要求 Eta 常驻后台时开。
+     *
+     * 默认 false —— 常驻会常驻一条通知并持有 WifiLock，属于「用户主动选」的能力，
+     * 不能默认打开替用户决定。
+     */
+    val keepaliveEnabled: Boolean = false,
 
     /** 流体云常驻：没有任务时也在流体云保留一条 Eta 入口。 */
     val overlayFluidPinned: Boolean = false,
@@ -82,6 +105,10 @@ data class Settings(
 
     /** 最近打开过的会话 id（逗号分隔，最新在前）：重启后侧栏那一栏还在。 */
     val recentOpenedConversationIds: String = "",
+    /** 工具调用审查档位：read_only / strict / standard / smart / auto；缺省 standard。 */
+    val toolReviewMode: String = "standard",
+    /** 智能档的「决策模型」：裁决用自定义模型的 ID；空串表示跟随主对话模型。 */
+    val toolReviewDecisionModelId: String = "",
     val appearance: AppearanceSettings = AppearanceSettings(),
 )
 

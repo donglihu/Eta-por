@@ -18,6 +18,9 @@ import io.github.mangi.eta.ui.model.ToolAccessUiState
 import io.github.mangi.eta.ui.model.ToolToggleKind
 import io.github.mangi.eta.ui.model.AgentHomeAction
 import io.github.mangi.eta.ui.model.AgentModelPickerUiState
+import io.github.mangi.eta.ui.model.AgentModelOptionUi
+import io.github.mangi.eta.agent.model.ModelTestDetail
+import io.github.mangi.eta.agent.model.ModelTestState
 import io.github.mangi.eta.ui.model.roleplayChatUi
 
 /**
@@ -43,6 +46,16 @@ internal fun AgentHomeScreen(
     onRefreshToolAccess: () -> Unit = {},
     /** 未接入模型时，空状态卡与提示条上的「去接入」。 */
     onOpenModelProviders: () -> Unit = {},
+    onTestModel: (AgentModelOptionUi) -> Unit = {},
+    /** 每个模型的测速结果，按模型 id 挂在行上（对齐 miniAI 的行内反馈）。 */
+    modelTestStates: Map<String, ModelTestState> = emptyMap(),
+    onShowTestDetail: (AgentModelOptionUi) -> Unit = {},
+    modelTestDetail: ModelTestDetail? = null,
+    onDismissTestDetail: () -> Unit = {},
+    /** 召唤/取消专家后通知上层：下一轮请求要立刻带上新专家。 */
+    onExpertSelectionChanged: () -> Unit = {},
+    /** 专家中心里改过召唤状态后递增，让输入栏图标重读。 */
+    expertRefreshToken: Int = 0,
     isDrawerOpen: Boolean = false,
     modifier: Modifier = Modifier,
 ) {
@@ -68,11 +81,19 @@ internal fun AgentHomeScreen(
             onClearPlan = { onAction(AgentHomeAction.ClearPlan) },
             pendingImages = state.pendingImages,
             pendingFileReferences = state.pendingFileReferences,
+            pendingSkillRefs = state.pendingSkillRefs,
             messageEdit = state.messageEdit,
             onReasoningEffortChange = { onAction(AgentHomeAction.ReasoningEffortChanged(it)) },
             onCompactContext = { onAction(AgentHomeAction.CompactContext) },
             canCompactContext = state.canCompactContext,
             onModelSelected = { onAction(AgentHomeAction.ModelSelected(it)) },
+            onTestModel = onTestModel,
+            modelTestStates = modelTestStates,
+            onShowTestDetail = onShowTestDetail,
+            modelTestDetail = modelTestDetail,
+            onDismissTestDetail = onDismissTestDetail,
+            onExpertSelectionChanged = onExpertSelectionChanged,
+            expertRefreshToken = expertRefreshToken,
             onSubmit = { text -> onAction(AgentHomeAction.SubmitMessage(text)) },
             onInterruptAndSubmit = { text -> onAction(AgentHomeAction.InterruptAndSubmitMessage(text)) },
             onQueueMessage = { text -> onAction(AgentHomeAction.QueueMessage(text)) },
@@ -90,6 +111,7 @@ internal fun AgentHomeScreen(
             onAttachFolder = { uri -> onAction(AgentHomeAction.FolderAttached(uri)) },
             onAttachFilePath = { path -> onAction(AgentHomeAction.FilePathAttached(path)) },
             onRemoveFileReference = { id -> onAction(AgentHomeAction.RemoveFileReference(id)) },
+            onRemoveSkillReference = { id -> onAction(AgentHomeAction.RemoveSkillReference(id)) },
             onEditMessage = { id -> onAction(AgentHomeAction.EditMessage(id)) },
             onCancelMessageEdit = { onAction(AgentHomeAction.CancelMessageEdit) },
             searchJump = state.searchJump,
@@ -125,6 +147,12 @@ internal fun AgentHomeScreen(
                     ToolToggleKind.Mcp -> onAction(AgentHomeAction.ToggleMcpServer(item.id, enabled))
                     ToolToggleKind.Skill -> onAction(AgentHomeAction.ToggleSkill(item.id, enabled))
                 }
+            },
+            onAttachSkillReference = { skillId, name ->
+                onAction(AgentHomeAction.AttachSkillReference(skillId, name))
+            },
+            onAttachMcpReference = { serverId, name ->
+                onAction(AgentHomeAction.AttachMcpReference(serverId, name))
             },
             onSuggestionClick = { prompt ->
                 onAction(AgentHomeAction.SubmitMessage(prompt))

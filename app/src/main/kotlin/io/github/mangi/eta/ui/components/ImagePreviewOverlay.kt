@@ -301,7 +301,8 @@ private fun decodeMediaBitmap(
     maxPx: Int = 2048,
 ): ImageBitmap? = runCatching {
     when {
-        source.startsWith("data:image") -> decodeDataUrlBitmap(source)
+        // data URL 也要降采样：原尺寸解码一张 4000×3000 就是 48MB ARGB_8888。
+        source.startsWith("data:image") -> decodeDataUrlBitmap(source, maxPx)
         source.startsWith("content://") ->
             context.contentResolver.openInputStream(Uri.parse(source))?.use { input ->
                 val bytes = input.readBytes()

@@ -616,6 +616,10 @@ private fun titleForRoute(route: AppRoute?): String = when (route) {
     is AppRoute.McpServerDetail -> stringResource(R.string.route_mcp_server_detail)
     is AppRoute.ModelProviderDetail -> stringResource(R.string.route_provider_details)
     is AppRoute.ModelProviderNew -> stringResource(R.string.route_new_provider)
+    is AppRoute.ExpertCenter -> "专家"
+    is AppRoute.ExpertDetail -> "专家详情"
+    is AppRoute.SkillStore -> "技能商店"
+    is AppRoute.LogViewer -> "日志"
     null -> stringResource(R.string.app_name)
 }
 

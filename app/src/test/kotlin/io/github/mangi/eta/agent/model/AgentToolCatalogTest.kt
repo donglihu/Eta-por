@@ -1,5 +1,6 @@
 package io.github.mangi.eta.agent.model
 
+import io.github.mangi.eta.agent.tool.AgentToolCapabilities
 import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
@@ -185,6 +186,32 @@ class AgentToolCatalogTest {
             listOf("replace_range", "append", "clear"),
             properties.getJSONObject("mode").getJSONArray("enum").stringValues(),
         )
+    }
+
+    /**
+     * 计划清单工具只在启用计划模式时声明。
+     *
+     * 回归背景（2026-11-22）：以前无条件追加 `update_plan`，模型照着工具描述
+     * 「先提交计划清单再执行」在非计划模式里也会调它，于是没勾开关也冒出任务待办面板。
+     */
+    @Test
+    fun planToolIsDeclaredOnlyWhenPlanModeEnabled() {
+        val off = AgentToolCatalog.build(
+            terminalTools = true,
+            browserTools = true,
+            capabilities = AgentToolCapabilities(rootAvailable = true, planMode = false),
+        ).toolNames()
+        assertFalse("非计划模式不得声明 update_plan", "update_plan" in off)
+
+        val on = AgentToolCatalog.build(
+            terminalTools = true,
+            browserTools = true,
+            capabilities = AgentToolCapabilities(rootAvailable = true, planMode = true),
+        )
+        assertTrue("计划模式必须声明 update_plan", "update_plan" in on.toolNames())
+        // 其余工具不受开关影响：开关只该增删这一个工具。
+        assertEquals(on.toolNames().toSet() - "update_plan", off.toSet())
+        assertTrue(on.function("update_plan").getString("description").contains("只有本轮启用计划模式时才使用它"))
     }
 
     private fun JSONArray.toolNames(): List<String> =

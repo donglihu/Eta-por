@@ -99,19 +99,16 @@ private fun buildPermissionHealthState(context: Context): PermissionHealthUiStat
                 title = context.getString(R.string.state_location_permissions_b53f9c),
                 summary = when (locationAccess) {
                     DeviceLocationProvider.AccessState.DENIED -> context.getString(R.string.state_ui_used_to_understand_the_location_of_mobile_phones_af52e9)
-                    DeviceLocationProvider.AccessState.FOREGROUND_ONLY -> context.getString(R.string.capability_location_foreground)
                     DeviceLocationProvider.AccessState.DISABLED -> context.getString(R.string.state_ui_system_location_service_is_turned_off_3902e7)
                     DeviceLocationProvider.AccessState.AVAILABLE -> context.getString(R.string.state_ui_only_read_when_the_agent_calls_the_tool_8cf77b)
                 },
                 status = when (locationAccess) {
                     DeviceLocationProvider.AccessState.DENIED -> PermissionStatusUi.Missing
-                    DeviceLocationProvider.AccessState.FOREGROUND_ONLY -> PermissionStatusUi.Warning
                     DeviceLocationProvider.AccessState.DISABLED -> PermissionStatusUi.Disabled
                     DeviceLocationProvider.AccessState.AVAILABLE -> PermissionStatusUi.Available
                 },
                 primaryActionLabel = when (locationAccess) {
                     DeviceLocationProvider.AccessState.DENIED -> context.getString(R.string.state_ui_to_authorize_762ec4)
-                    DeviceLocationProvider.AccessState.FOREGROUND_ONLY -> context.getString(R.string.state_ui_go_to_settings_1f2998)
                     DeviceLocationProvider.AccessState.DISABLED -> context.getString(R.string.state_ui_to_open_13ec17)
                     DeviceLocationProvider.AccessState.AVAILABLE -> null
                 },

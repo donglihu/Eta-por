@@ -98,12 +98,16 @@ import io.github.mangi.eta.ui.model.commandPaletteEntries
 import io.github.mangi.eta.data.repository.SpeechSettingsRepository
 import io.github.mangi.eta.ui.model.AgentContextUsageUi
 import io.github.mangi.eta.ui.model.AgentModelPickerUiState
+import io.github.mangi.eta.agent.model.ModelTestState
+import io.github.mangi.eta.ui.model.AgentModelOptionUi
 import io.github.mangi.eta.ui.model.PendingFileReferenceUi
+import io.github.mangi.eta.ui.model.SkillReferenceUi
 import io.github.mangi.eta.ui.model.MessageReferenceUi
 import io.github.mangi.eta.ui.model.PendingImageUi
 import io.github.mangi.eta.ui.model.QueuedMessageUi
 import io.github.mangi.eta.ui.model.filterAgentCommands
 import io.github.mangi.eta.ui.model.ToolToggleItem
+import io.github.mangi.eta.ui.model.ToolToggleKind
 import io.github.mangi.eta.ui.model.ToolAccessUiState
 import kotlin.math.roundToInt
 import top.yukonga.miuix.kmp.basic.DropdownImpl
@@ -149,6 +153,7 @@ internal fun AgentChatInputBar(
     onPlanModeChange: (Boolean) -> Unit = {},
     pendingImages: List<PendingImageUi>,
     pendingFileReferences: List<PendingFileReferenceUi>,
+    pendingSkillRefs: List<SkillReferenceUi> = emptyList(),
     queuedMessages: List<QueuedMessageUi> = emptyList(),
     inputSyncVersion: Int = 0,
     isEditingMessage: Boolean,
@@ -158,8 +163,15 @@ internal fun AgentChatInputBar(
     onCompactContext: () -> Unit,
     canCompactContext: Boolean,
     onModelSelected: (String) -> Unit,
-    onSubmit: (String) -> Unit,
-    onInterruptAndSubmit: (String) -> Unit = onSubmit,
+    onTestModel: (AgentModelOptionUi) -> Unit = {},
+    /** 每个模型的测速状态：直接回写在模型行上，不弹窗。 */
+    modelTestStates: Map<String, ModelTestState> = emptyMap(),
+    onShowTestDetail: (AgentModelOptionUi) -> Unit = {},
+    /** 召唤/取消专家后通知上层刷新，让提示与下一轮请求看到新状态。 */
+    onExpertSelectionChanged: () -> Unit = {},
+    /** 外部（专家中心）改过召唤状态时递增，用来让按钮重读。 */
+    expertRefreshToken: Int = 0,
+    onSubmit: (String) -> Unit,    onInterruptAndSubmit: (String) -> Unit = onSubmit,
     onQueueMessage: (String) -> Unit = {},
     onSteerQueuedMessage: (String) -> Unit = {},
     onRecallQueuedMessage: (String, String) -> Unit = { _, _ -> },
@@ -176,6 +188,7 @@ internal fun AgentChatInputBar(
     /** 未接入模型时，提示条上的「去接入」：跳到模型服务页。 */
     onOpenModelProviders: () -> Unit = {},
     onRemoveFileReference: (String) -> Unit,
+    onRemoveSkillReference: (String) -> Unit = {},
     onCancelMessageEdit: () -> Unit,
     /** 可用的斜杠命令；为空时输入框不弹命令面板。 */
     commands: List<AgentCommand> = emptyList(),
@@ -198,6 +211,8 @@ internal fun AgentChatInputBar(
     toolAccess: ToolAccessUiState,
     onRefreshToolAccess: () -> Unit,
     onToggleTool: (ToolToggleItem, Boolean) -> Unit,
+    onAttachSkillReference: (skillId: String, name: String) -> Unit = { _, _ -> },
+    onAttachMcpReference: (serverId: String, name: String) -> Unit = { _, _ -> },
     modifier: Modifier = Modifier,
 ) {
     val keyboard = LocalSoftwareKeyboardController.current
@@ -309,7 +324,8 @@ internal fun AgentChatInputBar(
     val canSend = modelReady && (
         textFieldState.text.isNotBlank() ||
             pendingImages.isNotEmpty() ||
-            pendingFileReferences.isNotEmpty()
+            pendingFileReferences.isNotEmpty() ||
+            pendingSkillRefs.isNotEmpty()
         )
     val density = LocalDensity.current
     val statusBarTopPx = WindowInsets.statusBars.getTop(density)
@@ -377,6 +393,18 @@ internal fun AgentChatInputBar(
             PendingFileReferenceStrip(
                 references = pendingFileReferences,
                 onRemoveReference = onRemoveFileReference,
+                modifier = Modifier.padding(bottom = 8.dp),
+            )
+        }
+
+        AnimatedVisibility(
+            visible = pendingSkillRefs.isNotEmpty(),
+            enter = fadeIn(tween(160)),
+            exit = fadeOut(tween(100)) + shrinkVertically(tween(160)),
+        ) {
+            PendingSkillReferenceStrip(
+                references = pendingSkillRefs,
+                onRemoveReference = onRemoveSkillReference,
                 modifier = Modifier.padding(bottom = 8.dp),
             )
         }
@@ -658,6 +686,12 @@ internal fun AgentChatInputBar(
                     onRefresh = onRefreshToolAccess,
                     onToggle = onToggleTool,
                     onDismiss = { showToolSheet = false },
+                    onAttachReference = { item ->
+                        when (item.kind) {
+                            ToolToggleKind.Skill -> onAttachSkillReference(item.id, item.title)
+                            ToolToggleKind.Mcp -> onAttachMcpReference(item.id, item.title)
+                        }
+                    },
                 )
                 Box(
                     modifier = Modifier
@@ -777,7 +811,21 @@ internal fun AgentChatInputBar(
                             popupAnchorTopPx = inputContainerTopPx,
                             popupMaxHeight = thinkingPopupMaxHeight,
                             onModelSelected = onModelSelected,
+                            modelTestStates = modelTestStates,
+                            onTestModel = onTestModel,
+                            onShowTestDetail = onShowTestDetail,
                         )
+
+                        // 专家入口在模型按钮右侧（对齐 miniAI）：先定「谁」，再定「用哪个模型」。
+                        // 运行中收起：右侧组要腾位置给「暂停 / 停止 / 发送」，留着它会把发送按钮挤出屏幕。
+                        if (!isStreaming) {
+                            ExpertPickerButton(
+                                popupAnchorTopPx = inputContainerTopPx,
+                                popupMaxHeight = thinkingPopupMaxHeight,
+                                refreshToken = expertRefreshToken,
+                                onSelectionChanged = onExpertSelectionChanged,
+                            )
+                        }
 
                         if (isStreaming) {
                             // 运行中一变三：暂停/恢复、停止、插话发送；插话走 steering，不打断当前运行。
@@ -1020,7 +1068,8 @@ private fun PendingImageStrip(
                     .background(MiuixTheme.colorScheme.surfaceContainer)
                     .clickable { onPreviewImage(index) },
             ) {
-                rememberDataUrlBitmap(image.dataUrl)?.let { bitmap ->
+                // 60dp 小方框只按 256 长边解码：不传 maxPx 会全量解码，8 张待发图最坏 66MB 常驻输入条。
+                rememberDataUrlBitmap(image.dataUrl, 256)?.let { bitmap ->
                     Image(
                         bitmap = bitmap,
                         contentDescription = null,

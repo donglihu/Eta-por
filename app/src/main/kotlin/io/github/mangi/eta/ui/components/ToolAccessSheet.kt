@@ -11,6 +11,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -41,6 +42,9 @@ internal fun ToolAccessSheet(
     onRefresh: () -> Unit,
     onToggle: (item: ToolToggleItem, enabled: Boolean) -> Unit,
     onDismiss: () -> Unit,
+    /** 长按任意一行加入会话引用；MCP 与技能共用同一入口，按 [ToolToggleItem.kind] 分流。 */
+    onAttachReference: (item: ToolToggleItem) -> Unit = {},
+    onAttachSkill: (item: ToolToggleItem) -> Unit = {},
 ) {
     // 每次打开都重新拉一次：MCP 列表和技能列表都可能被别处改过。
     androidx.compose.runtime.LaunchedEffect(show) {
@@ -94,7 +98,11 @@ internal fun ToolAccessSheet(
                         SectionHeader(stringResource(R.string.tool_access_mcp_section))
                     }
                     items(items = mcpItems, key = { "mcp-${it.id}" }) { item ->
-                        ToolToggleRow(item = item, onToggle = onToggle)
+                        ToolToggleRow(
+                            item = item,
+                            onToggle = onToggle,
+                            onLongPress = { onAttachReference(item) },
+                        )
                     }
                 }
                 if (skillItems.isNotEmpty()) {
@@ -102,7 +110,11 @@ internal fun ToolAccessSheet(
                         SectionHeader(stringResource(R.string.tool_access_skill_section))
                     }
                     items(items = skillItems, key = { "skill-${it.id}" }) { item ->
-                        ToolToggleRow(item = item, onToggle = onToggle)
+                        ToolToggleRow(
+                            item = item,
+                            onToggle = onToggle,
+                            onLongPress = { onAttachReference(item) },
+                        )
                     }
                 }
                 if (state.items.isEmpty()) {
@@ -139,14 +151,30 @@ private fun SectionHeader(title: String) {
 }
 
 @Composable
-private fun ToolToggleRow(item: ToolToggleItem, onToggle: (ToolToggleItem, Boolean) -> Unit) {
+private fun ToolToggleRow(
+    item: ToolToggleItem,
+    onToggle: (ToolToggleItem, Boolean) -> Unit,
+    onLongPress: ((ToolToggleItem) -> Unit)? = null,
+) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
             .padding(vertical = 6.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Column(modifier = Modifier.weight(1f)) {
+        Column(
+            modifier = Modifier.weight(1f).let { m ->
+                if (onLongPress != null) {
+                    m.combinedClickable(
+                        onClick = {},
+                        // 长按是独立动作，必须有独立 action 名：读屏只播报 onClick 时，
+                        // 无障碍用户既发现不了这个动作，也无法与短按区分。
+                        onLongClickLabel = "查看「${item.title}」的详细说明",
+                        onLongClick = { onLongPress(item) },
+                    )
+                } else m
+            },
+        ) {
             Text(
                 text = item.title,
                 style = MiuixTheme.textStyles.body2,

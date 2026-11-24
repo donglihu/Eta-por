@@ -1,5 +1,6 @@
 package io.github.mangi.eta.agent.runtime
 
+import io.github.mangi.eta.core.StableLogType
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.ArrayDeque
@@ -141,4 +142,8 @@ internal class AgentRunController {
     }
 }
 
-internal class AgentRunCancelledException : RuntimeException("Agent run cancelled")
+internal class AgentRunCancelledException : RuntimeException("Agent run cancelled"), StableLogType {
+
+    /** R8 会重命名类名，日志类型走固定 token，避免线上出现 `type=tp`。 */
+    override val stableLogType: String get() = "AgentRunCancelledException"
+}

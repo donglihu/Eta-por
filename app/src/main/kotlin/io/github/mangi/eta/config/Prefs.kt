@@ -51,7 +51,28 @@ internal object Prefs {
         const val AGENT_THINKING_ENABLED = "agent_thinking_enabled"
         const val AGENT_DEFAULT_REASONING_EFFORT = "agent_default_reasoning_effort"
         const val AGENT_AUTO_COMPACTION_ENABLED = "agent_auto_compaction_enabled"
+        /**
+         * 自动压缩上下文阈值：上下文窗口占用百分比，0 表示关闭。
+         *
+         * 取代原来的纯布尔开关：旧键仍保留作为迁移来源与旧 Hook 的兼容读点，
+         * 但新 UI 只写这一项，读一律走 [Prefs.autoCompactionTriggerPercent]。
+         */
+        const val AGENT_AUTO_COMPACTION_TRIGGER_PERCENT = "agent_auto_compaction_trigger_percent"
+        /** 阈值可选档位；0 = 关闭（只能手动压缩）。 */
+        val AUTO_COMPACTION_TRIGGER_PERCENT_CHOICES: List<Int> = listOf(0, 20, 30, 40, 50, 80, 90)
+        /** 默认阈值：模型窗口用掉 80% 时触发自动压缩。 */
+        const val AUTO_COMPACTION_TRIGGER_PERCENT_DEFAULT = 80
+        /** 上限：留 10% 给摘要请求本身与下一轮回复，避免刚压缩完又立刻超限。 */
+        const val AUTO_COMPACTION_TRIGGER_PERCENT_MAX = 90
         const val AGENT_SUBAGENT_ENABLED = "agent_subagent_enabled"
+        /**
+         * 资源域闸门（AgentResourceGate）总开关。
+         *
+         * 默认 `true`（走按域排队）；写成 `false` 退回旧的全局锁 AgentToolGate，作为线上回滚手段——
+         * 不需要重出包。读取点只有 [io.github.mangi.eta.agent.model.AgentResourceGate.refreshEnabledFromPrefs]，
+         * 读失败一律按 `true`。本轮不提供设置页开关，手动切法见该类的 KDoc。
+         */
+        const val AGENT_RESOURCE_GATE_ENABLED = "agent_resource_gate_enabled"
         const val AGENT_RUNTIME_CONFIG_JSON = "agent_runtime_config_json"
 
         /** 全部布尔开关及其默认值。 */
@@ -137,6 +158,57 @@ internal object Prefs {
     fun getString(key: String): String {
         return remote?.getString(key, "") ?: ""
     }
+
+    /**
+     * 自动压缩阈值（上下文窗口占用百分比，0 = 关闭）。
+     *
+     * 迁移规则：新键存在就直接用，并把任意历史值吸附到当前合法档位
+     * （旧档位 60/70/85/95 收敛到 20/30/40/50/80/90，不会因为档位改版就静默关闭压缩）；
+     * 只有旧布尔开关的存量用户按 true → 80%、false → 0 折算。结果夹到 0..[Keys.AUTO_COMPACTION_TRIGGER_PERCENT_MAX]。
+     */
+    fun autoCompactionTriggerPercent(
+        preferences: SharedPreferences? = localAgent ?: remote,
+    ): Int {
+        val stored = runCatching {
+            preferences?.getInt(Keys.AGENT_AUTO_COMPACTION_TRIGGER_PERCENT, -1)
+        }.getOrNull()
+        if (stored != null && stored >= 0) {
+            return normalizeAutoCompactionPercent(stored)
+        }
+        val legacyDefault = Keys.BOOLEAN_DEFAULTS.getValue(Keys.AGENT_AUTO_COMPACTION_ENABLED)
+        val legacyEnabled = runCatching {
+            preferences?.getBoolean(Keys.AGENT_AUTO_COMPACTION_ENABLED, legacyDefault)
+        }.getOrNull() ?: legacyDefault
+        return if (legacyEnabled) Keys.AUTO_COMPACTION_TRIGGER_PERCENT_DEFAULT else 0
+    }
+
+    /**
+     * 把任意百分比吸附到最近的合法档位。
+     *
+     * 档位只允许 [Keys.AUTO_COMPACTION_TRIGGER_PERCENT_CHOICES] 里的值，0 永远表示关闭；
+     * 旧版本写过的 60/70/85/95 与手改值都按最近档位收敛，UI 下拉因此永远能命中一项。
+     */
+    fun normalizeAutoCompactionPercent(percent: Int): Int {
+        if (percent <= 0) return 0
+        return Keys.AUTO_COMPACTION_TRIGGER_PERCENT_CHOICES
+            .filter { it > 0 }
+            .minByOrNull { kotlin.math.abs(it - percent) }
+            ?: Keys.AUTO_COMPACTION_TRIGGER_PERCENT_DEFAULT
+    }
+
+    /**
+     * 写入自动压缩阈值，并同步旧布尔键（0 = 关闭）。
+     *
+     * 同步旧键的原因：仍在运行的旧 Hook 进程与旧版入口只认布尔键，不回写会让两边口径打架。
+     */
+    fun putAutoCompactionTriggerPercent(preferences: SharedPreferences, percent: Int): Boolean =
+        runCatching {
+            val clamped = normalizeAutoCompactionPercent(percent)
+            preferences.edit()
+                .putInt(Keys.AGENT_AUTO_COMPACTION_TRIGGER_PERCENT, clamped)
+                .putBoolean(Keys.AGENT_AUTO_COMPACTION_ENABLED, clamped > 0)
+                .commit()
+        }.getOrDefault(false)
 
     fun defaultReasoningEffort(
         preferences: SharedPreferences? = localAgent ?: remote,

@@ -20,6 +20,15 @@ internal class AgentRuntimeSession(
     private val operation: String = AgentRuntimeWire.OP_CHAT,
     /** 这次 run 属于哪条对话；系统入口/子智能体可能为空，结束通知就退回 runId。 */
     val conversationKey: String = "",
+    /**
+     * 派发那一刻的会话标题快照。
+     *
+     * 结束通知在主线程排队执行，而停止路径上撤卡（RunProgressNotifier.removeRun）和
+     * runningSessionInfo.remove 早就先跑完了：靠卡片或运行表反查标题只能拿到空串，
+     * 结束通知就退化成「已停止」，用户看不出是哪条对话。标题是启动时已知的常量，
+     * 因此随会话一起带走，不依赖任何会被提前清掉的运行时状态。
+     */
+    val conversationTitle: String = "",
 ) {
     val virtualUiRouted = java.util.concurrent.atomic.AtomicBoolean(false)
     val mainScreenFallbackApproved = java.util.concurrent.atomic.AtomicBoolean(false)
@@ -156,8 +165,10 @@ internal class AgentRuntimeSession(
             previous.index == projected.index
         ) {
             replayEvents[replayEvents.lastIndex] = previous.copy(
+                // 回放不投递文本增量：attach 逐条跳过 AssistantBlockDelta，界面文本由终态提供。
+                // 这里只累加计数、不再拼接整段增量，省掉每来一片都重拼全文的 O(k²) 复制。
                 deltaChars = previous.deltaChars + projected.deltaChars,
-                delta = previous.delta + projected.delta,
+                delta = "",
             )
         } else {
             replayEvents += projected
@@ -193,6 +204,36 @@ internal class AgentRuntimeSession(
     fun cancel(reason: String): Boolean {
         val result = lock.withLock {
             if (state != State.RUNNING) return false
+            state = State.TERMINAL
+            AgentRuntimeWire.RunResult(
+                runId = runId,
+                ok = false,
+                content = "",
+                error = reason,
+                contextSnapshot = latestContext,
+                transcript = AgentToolBatchRecovery.completeInterrupted(latestTranscript),
+                operation = operation,
+            )
+        }
+        controller.cancel()
+        lock.withLock {
+            subscribers.forEach { it.resultSink(result) }
+            subscribers.clear()
+            replayEvents.clear()
+            searchSuggestionsBudget.clear()
+        }
+        return true
+    }
+
+    /**
+     * 超时兜底的强制终态：仅当提交方在 COMMITTING 窗口卡死（beforePublish 死锁 /
+     * 执行线程丢失）时由取消超时路径调用。与 [cancel] 不同，它允许从 COMMITTING
+     * 转移，保证 UI 不会永远停在「停止中」。发布前清空 subscribers，使稍后完成的
+     * complete() 无法再向订阅者投递第二个结果（其 forEach 因订阅者已清而空转）。
+     */
+    fun forceTerminal(reason: String): Boolean {
+        val result = lock.withLock {
+            if (state == State.TERMINAL) return false
             state = State.TERMINAL
             AgentRuntimeWire.RunResult(
                 runId = runId,

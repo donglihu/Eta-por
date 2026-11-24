@@ -2,6 +2,7 @@ package io.github.mangi.eta.agent.device
 
 import android.content.Context
 import android.net.Uri
+import android.os.Environment
 import android.provider.DocumentsContract
 import android.provider.MediaStore
 import android.provider.OpenableColumns
@@ -22,6 +23,7 @@ internal class AgentFileReferenceGateway(
     private val resolveDocumentPath: (Uri) -> String? = { null },
     private val importDocument: ((Uri) -> Resolution)? = null,
     private val rootAvailable: () -> Boolean = { RootAccess.isGranted },
+    private val primaryStorageRoot: String = SHARED_STORAGE_ROOT,
     private val executeRootCommand: (String) -> BoundedRootCommandExecutor.Result,
 ) {
     constructor(logger: AgentLogger) : this(
@@ -53,6 +55,7 @@ internal class AgentFileReferenceGateway(
                 )
             }
         },
+        primaryStorageRoot = resolveSharedStorageRoot(),
     )
 
     fun resolveDocumentUri(
@@ -66,7 +69,7 @@ internal class AgentFileReferenceGateway(
                 DocumentsContract.getDocumentId(uri)
             }
         }.getOrNull()
-        val mappedPath = documentId?.let { mapPrimaryStorageDocument(uri.authority, it) }
+        val mappedPath = documentId?.let { mapPrimaryStorageDocument(uri.authority, it, primaryStorageRoot) }
             ?: resolveDocumentPath(uri)
         val resolved = mappedPath?.let { resolveAbsolutePath(it, expectedKind) }
         if (resolved is Resolution.Success) return resolved
@@ -180,7 +183,7 @@ internal class AgentFileReferenceGateway(
 
     internal sealed interface Resolution {
         data class Success(val reference: AgentFileReference) : Resolution
-        data class Failure(val error: Error) : Resolution
+        data class Failure(val error: Error, val limitBytes: Long? = null) : Resolution
     }
 
     internal companion object {
@@ -188,22 +191,38 @@ internal class AgentFileReferenceGateway(
         const val SHARED_STORAGE_ROOT = "/storage/emulated/0"
 
         private const val MEDIA_DOCUMENTS_AUTHORITY = "com.android.providers.media.documents"
-        internal const val MAX_IMPORT_BYTES = 32L * 1024 * 1024
+        internal const val MIN_IMPORT_BYTES = 1L * 1024 * 1024
+        internal const val IMPORT_SAFETY_MARGIN_BYTES = 64L * 1024 * 1024
+        internal const val MAX_IMPORT_LIMIT_BYTES = 4L * 1024 * 1024 * 1024
+        private const val IMPORT_SAFETY_MARGIN_DIVISOR = 10L
 
-        internal fun importDocumentUri(context: Context, uri: Uri): Resolution {
+        internal fun importDocumentUri(
+            context: Context,
+            uri: Uri,
+            usableSpaceProvider: (File) -> Long = { file -> file.usableSpace },
+        ): Resolution {
             val workspace = TerminalPrivateStorage.workspace(context.filesDir)
             val importDirectory = File(workspace, "imports/${UUID.randomUUID()}")
             var completed = false
+            var limit = MIN_IMPORT_BYTES
             return try {
                 val name = documentDisplayName(context, uri)
                 val displayName = safeImportName(name)
                 if (!importDirectory.mkdirs()) return Resolution.Failure(Error.ImportFailed)
+                // 上限按工作区所在分区实际可用空间计算，不再写死 32 MiB。
+                limit = computeImportLimit(usableSpaceProvider(importDirectory))
+                // 提供方若暴露 SIZE 就先预检，避免白写一遍再失败；拿不到就靠流式计数兜底。
+                documentDisplaySize(context, uri)?.let { declaredSize ->
+                    if (declaredSize > limit) {
+                        return Resolution.Failure(Error.ImportTooLarge, limitBytes = limit)
+                    }
+                }
                 val importedFile = File(importDirectory, displayName)
                 val input = context.contentResolver.openInputStream(uri)
                     ?: return Resolution.Failure(Error.ImportFailed)
                 input.use { source ->
                     importedFile.outputStream().use { destination ->
-                        BoundedFileCopy.copy(source, destination, MAX_IMPORT_BYTES)
+                        BoundedFileCopy.copy(source, destination, limit)
                     }
                 }
                 completed = true
@@ -215,7 +234,7 @@ internal class AgentFileReferenceGateway(
                     ),
                 )
             } catch (_: BoundedFileCopy.TooLargeException) {
-                Resolution.Failure(Error.ImportTooLarge)
+                Resolution.Failure(Error.ImportTooLarge, limitBytes = limit)
             } catch (_: SecurityException) {
                 Resolution.Failure(Error.AccessDenied)
             } catch (_: IOException) {
@@ -225,6 +244,28 @@ internal class AgentFileReferenceGateway(
             } finally {
                 if (!completed) importDirectory.deleteRecursively()
             }
+        }
+
+        internal fun computeImportLimit(usableSpace: Long): Long {
+            val safetyMargin =
+                maxOf(IMPORT_SAFETY_MARGIN_BYTES, usableSpace / IMPORT_SAFETY_MARGIN_DIVISOR)
+            return (usableSpace - safetyMargin).coerceIn(MIN_IMPORT_BYTES, MAX_IMPORT_LIMIT_BYTES)
+        }
+
+        private fun documentDisplaySize(context: Context, uri: Uri): Long? = try {
+            context.contentResolver.query(
+                uri, arrayOf(OpenableColumns.SIZE), null, null, null,
+            )?.use { cursor ->
+                val index = cursor.getColumnIndex(OpenableColumns.SIZE)
+                if (index >= 0 && cursor.moveToFirst() && !cursor.isNull(index)) {
+                    cursor.getLong(index)
+                } else {
+                    null
+                }
+            }
+        } catch (_: RuntimeException) {
+            // 文档提供方可以不暴露 SIZE；实际限制仍由流式复制兜底。
+            null
         }
 
         private fun documentDisplayName(context: Context, uri: Uri): String? = try {
@@ -246,25 +287,38 @@ internal class AgentFileReferenceGateway(
             .takeUnless { it.isBlank() || it == "." || it == ".." }
             ?: "imported-file"
 
-        fun mapPrimaryStorageDocument(authority: String?, documentId: String): String? {
+        fun mapPrimaryStorageDocument(
+            authority: String?,
+            documentId: String,
+            primaryStorageRoot: String = SHARED_STORAGE_ROOT,
+        ): String? {
             if (authority != EXTERNAL_STORAGE_DOCUMENTS_AUTHORITY) return null
             if (documentId.hasUnsupportedControlCharacter()) return null
             val separator = documentId.indexOf(':')
-            if (separator < 0 || !documentId.substring(0, separator).equals("primary", ignoreCase = true)) {
+            if (separator < 0) return null
+            val volumeId = documentId.substring(0, separator)
+            val relativePath = documentId.substring(separator + 1)
+            if (
+                volumeId.isBlank() ||
+                volumeId.contains('/') ||
+                volumeId.contains('\\') ||
+                volumeId == "." ||
+                volumeId == ".."
+            ) {
                 return null
             }
-            val relativePath = documentId.substring(separator + 1)
             if (
                 relativePath.startsWith('/') ||
                 relativePath.split('/').any { it == "." || it == ".." }
             ) {
                 return null
             }
-            return if (relativePath.isEmpty()) {
-                SHARED_STORAGE_ROOT
+            val root = if (volumeId.equals("primary", ignoreCase = true)) {
+                primaryStorageRoot
             } else {
-                "$SHARED_STORAGE_ROOT/$relativePath"
+                "/storage/$volumeId"
             }
+            return if (relativePath.isEmpty()) root else "$root/$relativePath"
         }
 
         private fun queryLocalDocumentPath(context: Context, uri: Uri): String? {
@@ -328,4 +382,16 @@ internal class AgentFileReferenceGateway(
         private const val VALIDATION_TIMEOUT_MS = 5_000L
         private const val MAX_VALIDATION_OUTPUT_BYTES = 8 * 1024
     }
+}
+
+/**
+ * 共享存储根目录优先取 [Environment.getExternalStorageDirectory]：多用户 / 工作资料下
+ * 它可能不是 /storage/emulated/0，硬编码常量会在这些场景指错位置。取不到时退回
+ * [AgentFileReferenceGateway.SHARED_STORAGE_ROOT]，保持既有语义。
+ */
+@Suppress("DEPRECATION")
+private fun resolveSharedStorageRoot(): String = try {
+    Environment.getExternalStorageDirectory().absolutePath
+} catch (_: RuntimeException) {
+    AgentFileReferenceGateway.SHARED_STORAGE_ROOT
 }

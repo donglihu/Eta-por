@@ -341,4 +341,54 @@ class AgentRuntimeSessionTest {
         assertEquals(1, results.size)
         assertFalse(session.cancel("late"))
     }
+
+    @Test
+    fun commitWindowCancelStillRejectsButForceTerminalTakesOver() {
+        // 提交窗口（COMMITTING）内普通 cancel 必须保持「不抢提交胜者」的原语义（返回 false），
+        // 避免「客户端收到已停止、outbox 却留下成功结果」的分裂状态。
+        val persistenceStarted = CountDownLatch(1)
+        val allowPersistence = CountDownLatch(1)
+        val results = Collections.synchronizedList(mutableListOf<AgentRuntimeWire.RunResult>())
+        val session = AgentRuntimeSession(runId = "run-commit-window", resultSink = results::add)
+        val worker = Thread {
+            session.complete(
+                result = AgentRuntimeWire.RunResult(
+                    runId = "run-commit-window",
+                    ok = true,
+                    content = "done",
+                ),
+                beforePublish = {
+                    persistenceStarted.countDown()
+                    allowPersistence.await(2, TimeUnit.SECONDS)
+                },
+            )
+        }.apply { isDaemon = true }
+        worker.start()
+        try {
+            assertTrue(persistenceStarted.await(1, TimeUnit.SECONDS))
+            // 提交方正在 beforePublish：普通 cancel 拒绝接管。
+            assertFalse(session.cancel("too late"))
+            // 但超时兜底的 forceTerminal 能从 COMMITTING 强制接管并发布「已停止」。
+            assertTrue(session.forceTerminal("已停止"))
+            assertTrue(session.isTerminal)
+            assertEquals("已停止", results.single().error)
+        } finally {
+            allowPersistence.countDown()
+            worker.join(2_000)
+        }
+        // forceTerminal 清空 subscribers 后，稍后完成的 complete() 不得再投递第二个结果。
+        assertEquals(1, results.size)
+    }
+
+    @Test
+    fun forceTerminalIsIdempotentAndRejectsAfterTerminal() {
+        val results = mutableListOf<AgentRuntimeWire.RunResult>()
+        val session = AgentRuntimeSession(runId = "run-force-idempotent", resultSink = results::add)
+        assertTrue(session.forceTerminal("已停止"))
+        assertTrue(session.isTerminal)
+        assertEquals(1, results.size)
+        // 已终态后再次强制接管无效，不重复发布。
+        assertFalse(session.forceTerminal("已停止"))
+        assertEquals(1, results.size)
+    }
 }

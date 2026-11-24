@@ -47,12 +47,12 @@ import androidx.compose.material.icons.rounded.Language
 import androidx.compose.material.icons.rounded.RocketLaunch
 import androidx.compose.material.icons.rounded.Terminal
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -90,7 +90,11 @@ import io.github.mangi.eta.data.model.ReasoningEffort
 import io.github.mangi.eta.ui.app.AgentConversationRevisionReducer
 import io.github.mangi.eta.ui.app.LocalBlurEnabled
 import io.github.mangi.eta.ui.markdown.StreamingMarkdownState
+import io.github.mangi.eta.ui.markdown.StreamingMarkdownStateCache
 import io.github.mangi.eta.ui.model.AgentChatMessageUi
+import io.github.mangi.eta.ui.model.AgentModelOptionUi
+import io.github.mangi.eta.agent.model.ModelTestDetail
+import io.github.mangi.eta.agent.model.ModelTestState
 import io.github.mangi.eta.ui.model.AgentCommand
 import io.github.mangi.eta.ui.model.CommandConfirmUi
 import io.github.mangi.eta.ui.model.CommandPaletteUi
@@ -99,12 +103,14 @@ import io.github.mangi.eta.ui.model.AgentPaletteEntry
 import io.github.mangi.eta.ui.model.ToolAccessUiState
 import io.github.mangi.eta.ui.model.ToolToggleItem
 import io.github.mangi.eta.ui.model.AgentContextUsageUi
+import io.github.mangi.eta.ui.model.PlanStepUi
 import io.github.mangi.eta.ui.model.AgentMessageUi
 import io.github.mangi.eta.ui.model.MessageReferenceUi
 import io.github.mangi.eta.ui.model.AgentModelPickerUiState
 import io.github.mangi.eta.ui.model.MessageEditUiState
 import io.github.mangi.eta.ui.model.SearchJumpUiState
 import io.github.mangi.eta.ui.model.PendingFileReferenceUi
+import io.github.mangi.eta.ui.model.SkillReferenceUi
 import io.github.mangi.eta.ui.model.PendingImageUi
 import io.github.mangi.eta.ui.model.QueuedMessageUi
 import io.github.mangi.eta.ui.model.ResumableRunUiState
@@ -161,11 +167,13 @@ internal fun AgentChatBody(
     availableReasoningEfforts: List<ReasoningEffort>,
     /** Plan 模式开关与计划清单（会话框上方面板）。 */
     planMode: Boolean = false,
-    planSteps: List<io.github.mangi.eta.ui.model.PlanStepUi> = emptyList(),
+    /** 计划清单：不给默认值——漏传会直接编译失败，而不是静默让面板永远不显示。 */
+    planSteps: List<io.github.mangi.eta.ui.model.PlanStepUi>,
     onPlanModeChange: (Boolean) -> Unit = {},
-    onClearPlan: () -> Unit = {},
+    onClearPlan: () -> Unit,
     pendingImages: List<PendingImageUi>,
     pendingFileReferences: List<PendingFileReferenceUi>,
+    pendingSkillRefs: List<SkillReferenceUi> = emptyList(),
     queuedMessages: List<QueuedMessageUi> = emptyList(),
     inputSyncVersion: Int = 0,
     messageEdit: MessageEditUiState?,
@@ -173,6 +181,14 @@ internal fun AgentChatBody(
     onCompactContext: () -> Unit,
     canCompactContext: Boolean,
     onModelSelected: (String) -> Unit,
+    onTestModel: (AgentModelOptionUi) -> Unit = {},
+    modelTestStates: Map<String, ModelTestState> = emptyMap(),
+    onShowTestDetail: (AgentModelOptionUi) -> Unit = {},
+    modelTestDetail: ModelTestDetail? = null,
+    onDismissTestDetail: () -> Unit = {},
+    onExpertSelectionChanged: () -> Unit = {},
+    /** 外部（专家中心）改过召唤状态时递增，让输入栏图标重读。 */
+    expertRefreshToken: Int = 0,
     onSubmit: (String) -> Unit,
     onInterruptAndSubmit: (String) -> Unit = onSubmit,
     onQueueMessage: (String) -> Unit = {},
@@ -189,6 +205,7 @@ internal fun AgentChatBody(
     onAttachFolder: (String) -> Unit,
     onAttachFilePath: (String) -> Unit,
     onRemoveFileReference: (String) -> Unit,
+    onRemoveSkillReference: (String) -> Unit = {},
     onEditMessage: (String) -> Unit,
     onCancelMessageEdit: () -> Unit,
     onDeleteMessage: (String) -> Unit,
@@ -235,29 +252,39 @@ internal fun AgentChatBody(
     onRemoveReference: (String) -> Unit,
     onRefreshToolAccess: () -> Unit,
     onToggleTool: (ToolToggleItem, Boolean) -> Unit,
+    onAttachSkillReference: (skillId: String, name: String) -> Unit = { _, _ -> },
+    onAttachMcpReference: (serverId: String, name: String) -> Unit = { _, _ -> },
     modifier: Modifier = Modifier,
 ) {
     val scrollState = rememberLazyListState()
     // 可 @ 引用的消息：只取有正文的用户／助手消息，序号按消息流位置给。
+    // 先截尾部窗口再映射：面板只展示最后 80 条，前面的消息不必裁剪、压空白、截检索串。
     val referenceCandidates = remember(messages) {
-        messages.mapIndexedNotNull { index, message ->
-            val content = when (message) {
-                is UserMessageUi -> message.content
-                is AgentMessageUi -> message.content
-                else -> null
-            }?.trim().orEmpty()
-            if (content.isEmpty()) {
-                null
-            } else {
-                MessageReferenceUi(
-                    messageId = message.id,
-                    sequence = index + 1,
-                    fromUser = message is UserMessageUi,
-                    preview = content.replace(Regex("\\s+"), " ").take(60),
-                    searchText = content.take(4_000),
+        val windowStart = (messages.size - MessageReferenceCandidateLimit).coerceAtLeast(0)
+        buildList(minOf(messages.size, MessageReferenceCandidateLimit)) {
+            for (index in windowStart until messages.size) {
+                val message = messages[index]
+                val rawContent = when (message) {
+                    is UserMessageUi -> message.content
+                    is AgentMessageUi -> message.content
+                    else -> null
+                } ?: continue
+                val content = rawContent.trim()
+                if (content.isEmpty()) continue
+                add(
+                    MessageReferenceUi(
+                        messageId = message.id,
+                        // 序号是消息流里的全局位置，窗口截断不能改变编号。
+                        sequence = index + 1,
+                        fromUser = message is UserMessageUi,
+                        preview = content.take(MessageReferencePreviewSourceChars)
+                            .replace(MessageReferenceWhitespace, " ")
+                            .take(MessageReferencePreviewChars),
+                        searchText = content.take(MessageReferenceSearchChars),
+                    ),
                 )
             }
-        }.takeLast(80)
+        }
     }
     val keyboard = LocalSoftwareKeyboardController.current
     val density = LocalDensity.current
@@ -341,6 +368,7 @@ internal fun AgentChatBody(
             onClearPlan = onClearPlan,
             pendingImages = pendingImages,
             pendingFileReferences = pendingFileReferences,
+            pendingSkillRefs = pendingSkillRefs,
             queuedMessages = queuedMessages,
             inputSyncVersion = inputSyncVersion,
             messageEdit = messageEdit,
@@ -370,6 +398,11 @@ internal fun AgentChatBody(
             onCompactContext = onCompactContext,
             canCompactContext = canCompactContext,
             onModelSelected = onModelSelected,
+            onTestModel = onTestModel,
+            modelTestStates = modelTestStates,
+            onShowTestDetail = onShowTestDetail,
+            onExpertSelectionChanged = onExpertSelectionChanged,
+            expertRefreshToken = expertRefreshToken,
             onStop = onStop,
             isPaused = isPaused,
             onPause = onPause,
@@ -380,6 +413,7 @@ internal fun AgentChatBody(
             onAttachFolder = onAttachFolder,
             onAttachFilePath = onAttachFilePath,
             onRemoveFileReference = onRemoveFileReference,
+            onRemoveSkillReference = onRemoveSkillReference,
             onEditMessage = onEditMessage,
             onCancelMessageEdit = onCancelMessageEdit,
             onDeleteMessage = onDeleteMessage,
@@ -415,7 +449,14 @@ internal fun AgentChatBody(
             onRemoveReference = onRemoveReference,
             onRefreshToolAccess = onRefreshToolAccess,
             onToggleTool = onToggleTool,
+            onAttachSkillReference = onAttachSkillReference,
+            onAttachMcpReference = onAttachMcpReference,
             modifier = modifier,
+        )
+        // 测速失败详情挂在页面层：底部输入栏在卡片输入态会收起，挂在它里面会跟着消失。
+        ModelTestDetailDialog(
+            detail = modelTestDetail,
+            onDismiss = onDismissTestDetail,
         )
     }
 }
@@ -437,11 +478,13 @@ private fun AgentChatScaffold(
     reasoningEffort: ReasoningEffort,
     availableReasoningEfforts: List<ReasoningEffort>,
     planMode: Boolean = false,
-    planSteps: List<io.github.mangi.eta.ui.model.PlanStepUi> = emptyList(),
+    /** 计划清单：不给默认值——漏传会直接编译失败，而不是静默让面板永远不显示。 */
+    planSteps: List<io.github.mangi.eta.ui.model.PlanStepUi>,
     onPlanModeChange: (Boolean) -> Unit = {},
-    onClearPlan: () -> Unit = {},
+    onClearPlan: () -> Unit,
     pendingImages: List<PendingImageUi>,
     pendingFileReferences: List<PendingFileReferenceUi>,
+    pendingSkillRefs: List<SkillReferenceUi> = emptyList(),
     queuedMessages: List<QueuedMessageUi>,
     inputSyncVersion: Int,
     messageEdit: MessageEditUiState?,
@@ -458,6 +501,12 @@ private fun AgentChatScaffold(
     onCompactContext: () -> Unit,
     canCompactContext: Boolean,
     onModelSelected: (String) -> Unit,
+    onTestModel: (AgentModelOptionUi) -> Unit = {},
+    modelTestStates: Map<String, ModelTestState> = emptyMap(),
+    onShowTestDetail: (AgentModelOptionUi) -> Unit = {},
+    onExpertSelectionChanged: () -> Unit = {},
+    /** 外部（专家中心）改过召唤状态时递增，让输入栏图标重读。 */
+    expertRefreshToken: Int = 0,
     onStop: () -> Unit,
     isPaused: Boolean = false,
     onPause: () -> Unit = {},
@@ -468,6 +517,7 @@ private fun AgentChatScaffold(
     onAttachFolder: (String) -> Unit,
     onAttachFilePath: (String) -> Unit,
     onRemoveFileReference: (String) -> Unit,
+    onRemoveSkillReference: (String) -> Unit = {},
     onEditMessage: (String) -> Unit,
     onCancelMessageEdit: () -> Unit,
     onDeleteMessage: (String) -> Unit,
@@ -505,6 +555,8 @@ private fun AgentChatScaffold(
     onRemoveReference: (String) -> Unit,
     onRefreshToolAccess: () -> Unit,
     onToggleTool: (ToolToggleItem, Boolean) -> Unit,
+    onAttachSkillReference: (skillId: String, name: String) -> Unit = { _, _ -> },
+    onAttachMcpReference: (serverId: String, name: String) -> Unit = { _, _ -> },
     modifier: Modifier = Modifier,
 ) {
     val surfaceColor = MiuixTheme.colorScheme.surface
@@ -547,6 +599,7 @@ private fun AgentChatScaffold(
                 onClearPlan = onClearPlan,
                 pendingImages = pendingImages,
                 pendingFileReferences = pendingFileReferences,
+            pendingSkillRefs = pendingSkillRefs,
                 queuedMessages = queuedMessages,
                 inputSyncVersion = inputSyncVersion,
                 messageEdit = messageEdit,
@@ -560,6 +613,11 @@ private fun AgentChatScaffold(
                 onCompactContext = onCompactContext,
                 canCompactContext = canCompactContext,
                 onModelSelected = onModelSelected,
+                onTestModel = onTestModel,
+                modelTestStates = modelTestStates,
+                onShowTestDetail = onShowTestDetail,
+                onExpertSelectionChanged = onExpertSelectionChanged,
+                expertRefreshToken = expertRefreshToken,
                 onStop = onStop,
             isPaused = isPaused,
             onPause = onPause,
@@ -570,6 +628,7 @@ private fun AgentChatScaffold(
                 onAttachFolder = onAttachFolder,
                 onAttachFilePath = onAttachFilePath,
                 onRemoveFileReference = onRemoveFileReference,
+            onRemoveSkillReference = onRemoveSkillReference,
                 onCancelMessageEdit = onCancelMessageEdit,
                 onOpenNavigator = onOpenNavigator,
                 commands = commands,
@@ -590,60 +649,67 @@ private fun AgentChatScaffold(
                 onRemoveReference = onRemoveReference,
                 onRefreshToolAccess = onRefreshToolAccess,
                 onToggleTool = onToggleTool,
+                onAttachSkillReference = onAttachSkillReference,
+                onAttachMcpReference = onAttachMcpReference,
             )
         },
     ) { innerPadding ->
         val bottomPadding = innerPadding.calculateBottomPadding()
-        Column(modifier = Modifier.fillMaxSize()) {
-            if (resumableRun != null) {
-                AgentResumableRunBanner(
-                    onResume = onResumeInterruptedRun,
-                    onDismiss = onDismissInterruptedRun,
-                    summary = resumableRun.summary,
-                )
-            }
-            if (!hasMessages) {
-                EmptyChatState(
-                    showSuggestions = showEmptySuggestions,
-                    onSuggestionClick = onSuggestionClick,
-                    modelReady = modelPickerState.hasUsableModel,
-                    onOpenModelProviders = onOpenModelProviders,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .weight(1f)
-                        .padding(bottom = bottomPadding),
-                )
-            } else {
-                AgentConversationMessages(
-                    visibleMessages = visibleMessages,
-                    scrollState = scrollState,
-                    isStreaming = isStreaming,
-                    bottomInset = bottomPadding,
-                    conversationKey = draftKey.orEmpty(),
-                    onSubmit = onSubmit,
-                    onCardEditingChanged = { cardInputActive = it },
-                    cardEditing = cardInputActive,
-                    keepBottomAnchored = keepBottomAnchored,
-                    onBottomAnchorChanged = onBottomAnchorChanged,
-                    onSuggestionClick = onSuggestionClick,
-                    onRunTraceClick = onRunTraceClick,
-                    onOpenBrowser = onOpenBrowser,
-                    onOpenConversation = onOpenConversation,
-                    onEditMessage = onEditMessage,
-                    onDeleteMessage = onDeleteMessage,
-                    onRegenerateMessage = onRegenerateMessage,
-                    onSelectReplyCandidate = onSelectReplyCandidate,
-                    onForkMessage = onForkMessage,
-                    messageActionsEnabled = !isStreaming && messageEdit == null,
-                    editTargetMessageId = messageEdit?.targetMessageId,
-                    currentBrowserMessageId = currentBrowserMessageId,
-                    searchJump = searchJump,
-                    onSearchJumpConsumed = onSearchJumpConsumed,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .weight(1f)
-                        .then(if (frostEnabled) Modifier.layerBackdrop(messageBackdrop) else Modifier),
-                )
+        // 整体用 Box：消息内容按原样占满。
+        // 任务待办面板不再浮在这里，它移到了 bottomBar 里、输入框的正上方
+        // （见 AgentChatBottomBar）：浮层会压住消息区，位置也不对。
+        Box(modifier = Modifier.fillMaxSize()) {
+            Column(modifier = Modifier.fillMaxSize()) {
+                if (resumableRun != null) {
+                    AgentResumableRunBanner(
+                        onResume = onResumeInterruptedRun,
+                        onDismiss = onDismissInterruptedRun,
+                        summary = resumableRun.summary,
+                    )
+                }
+                if (!hasMessages) {
+                    EmptyChatState(
+                        showSuggestions = showEmptySuggestions,
+                        onSuggestionClick = onSuggestionClick,
+                        modelReady = modelPickerState.hasUsableModel,
+                        onOpenModelProviders = onOpenModelProviders,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .weight(1f)
+                            .padding(bottom = bottomPadding),
+                    )
+                } else {
+                    AgentConversationMessages(
+                        visibleMessages = visibleMessages,
+                        scrollState = scrollState,
+                        isStreaming = isStreaming,
+                        bottomInset = bottomPadding,
+                        conversationKey = draftKey.orEmpty(),
+                        onSubmit = onSubmit,
+                        onCardEditingChanged = { cardInputActive = it },
+                        cardEditing = cardInputActive,
+                        keepBottomAnchored = keepBottomAnchored,
+                        onBottomAnchorChanged = onBottomAnchorChanged,
+                        onSuggestionClick = onSuggestionClick,
+                        onRunTraceClick = onRunTraceClick,
+                        onOpenBrowser = onOpenBrowser,
+                        onOpenConversation = onOpenConversation,
+                        onEditMessage = onEditMessage,
+                        onDeleteMessage = onDeleteMessage,
+                        onRegenerateMessage = onRegenerateMessage,
+                        onSelectReplyCandidate = onSelectReplyCandidate,
+                        onForkMessage = onForkMessage,
+                        messageActionsEnabled = !isStreaming && messageEdit == null,
+                        editTargetMessageId = messageEdit?.targetMessageId,
+                        currentBrowserMessageId = currentBrowserMessageId,
+                        searchJump = searchJump,
+                        onSearchJumpConsumed = onSearchJumpConsumed,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .weight(1f)
+                            .then(if (frostEnabled) Modifier.layerBackdrop(messageBackdrop) else Modifier),
+                    )
+                }
             }
         }
     }
@@ -701,7 +767,24 @@ internal fun AgentConversationMessages(
     }
     // 流式消息的渲染会话按 id 提升到列表层持有：item 滚出视口被 LazyColumn 销毁后，
     // 滑回时复用同一解析会话与打字机进度，避免整段内容重新解析并重放显现动画。
-    val streamingMarkdownStates = remember { mutableStateMapOf<String, StreamingMarkdownState>() }
+    val streamingMarkdownStates = remember { StreamingMarkdownStateCache() }
+    // 回收边界：条目自身挂载期间由 attachContent 保护；思考行没有条目级记账点，
+    // 因此把仍在消息列表里的思考消息一并保留。切会话、编辑/删除、历史裁剪掉的
+    // 流式会话在这里被收走，并把终态文档交给有界静态缓存。
+    val retainedStreamingStateIds = remember(visibleMessages) {
+        buildSet {
+            visibleMessages.forEach { message ->
+                when (message) {
+                    is AgentMessageUi -> if (message.isStreaming) add(message.id)
+                    is ThinkingMessageUi -> add(message.id)
+                    else -> Unit
+                }
+            }
+        }
+    }
+    LaunchedEffect(retainedStreamingStateIds) {
+        streamingMarkdownStates.discardUnused(retainedStreamingStateIds)
+    }
     // 审批卡：AI 被拦下来的一步。挂在列表末尾跟消息一起滚，不另占浮层。
     val pendingApprovals by AgentConfirmGuard.pendings.collectAsState()
     val confirmContext = LocalContext.current
@@ -753,7 +836,7 @@ internal fun AgentConversationMessages(
     val isTailRendering by remember {
         derivedStateOf {
             currentTailMessage?.let { message ->
-                streamingMarkdownStates[message.id]?.let { state ->
+                streamingMarkdownStates.states[message.id]?.let { state ->
                     state.revealedContent != message.content
                 }
             } == true
@@ -967,13 +1050,10 @@ internal fun AgentConversationMessages(
                         ChatMessageItem(
                             message = message,
                             assistantOverlay = assistantOverlay,
-                            retainedStreamingState = (message as? AgentMessageUi)
-                                ?.takeIf { it.isStreaming || streamingMarkdownStates.containsKey(it.id) }
-                                ?.let { agentMessage ->
-                                    streamingMarkdownStates.getOrPut(agentMessage.id) {
-                                        StreamingMarkdownState()
-                                    }
-                                },
+                            retainedStreamingState = rememberRetainedStreamingState(
+                                cache = streamingMarkdownStates,
+                                message = message,
+                            ),
                             onSuggestionClick = onSuggestionClick,
                             onRunTraceClick = onRunTraceClick,
                             onOpenBrowser = onOpenBrowser,
@@ -998,9 +1078,7 @@ internal fun AgentConversationMessages(
                     is AgentTimelineEntry.WorkProcess -> {
                         entry.messages.forEach { message ->
                             if (message is ThinkingMessageUi && message.isStreaming) {
-                                streamingMarkdownStates.getOrPut(message.id) {
-                                    StreamingMarkdownState()
-                                }
+                                streamingMarkdownStates.getOrCreate(message.id)
                             }
                         }
                         AgentWorkProcess(
@@ -1010,17 +1088,19 @@ internal fun AgentConversationMessages(
                             assistantOverlay = assistantOverlay,
                             onOpenBrowser = onOpenBrowser,
                             currentBrowserMessageId = currentBrowserMessageId,
-                            retainedStreamingStates = streamingMarkdownStates,
+                            retainedStreamingStates = streamingMarkdownStates.states,
                             modifier = entryModifier,
                         )
                     }
                 }
             }
-            pendingApprovals.firstOrNull {
+            // 本会话的待答卡：审批卡与提问卡可能同时存在（模型提问时恰好也有一步待批），
+            // 两张都要显示，不能用 firstOrNull 让其中一张被另一张挡住。
+            pendingApprovals.filter {
                 // 过期卡不能再挂出来：点了没反应、也不会自己消失（2026-11-08 审核发现）。
                 !it.expired() && (it.conversationKey.isBlank() || it.conversationKey == conversationKey)
-            }?.let { approval ->
-                item(key = "approval-card") {
+            }.forEach { approval ->
+                item(key = "approval-card-${approval.token}") {
                     AgentApprovalCard(
                         approval = AgentApprovalUi(
                             token = approval.token,
@@ -1312,11 +1392,13 @@ private fun AgentChatBottomBar(
     reasoningEffort: ReasoningEffort,
     availableReasoningEfforts: List<ReasoningEffort>,
     planMode: Boolean = false,
-    planSteps: List<io.github.mangi.eta.ui.model.PlanStepUi> = emptyList(),
+    /** 计划清单：不给默认值——漏传会直接编译失败，而不是静默让面板永远不显示。 */
+    planSteps: List<io.github.mangi.eta.ui.model.PlanStepUi>,
     onPlanModeChange: (Boolean) -> Unit = {},
-    onClearPlan: () -> Unit = {},
+    onClearPlan: () -> Unit,
     pendingImages: List<PendingImageUi>,
     pendingFileReferences: List<PendingFileReferenceUi>,
+    pendingSkillRefs: List<SkillReferenceUi> = emptyList(),
     queuedMessages: List<QueuedMessageUi>,
     inputSyncVersion: Int,
     messageEdit: MessageEditUiState?,
@@ -1330,6 +1412,12 @@ private fun AgentChatBottomBar(
     onCompactContext: () -> Unit,
     canCompactContext: Boolean,
     onModelSelected: (String) -> Unit,
+    onTestModel: (AgentModelOptionUi) -> Unit = {},
+    modelTestStates: Map<String, ModelTestState> = emptyMap(),
+    onShowTestDetail: (AgentModelOptionUi) -> Unit = {},
+    onExpertSelectionChanged: () -> Unit = {},
+    /** 外部（专家中心）改过召唤状态时递增，让输入栏图标重读。 */
+    expertRefreshToken: Int = 0,
     onStop: () -> Unit,
     isPaused: Boolean = false,
     onPause: () -> Unit = {},
@@ -1340,6 +1428,7 @@ private fun AgentChatBottomBar(
     onAttachFolder: (String) -> Unit,
     onAttachFilePath: (String) -> Unit,
     onRemoveFileReference: (String) -> Unit,
+    onRemoveSkillReference: (String) -> Unit = {},
     onCancelMessageEdit: () -> Unit,
     onOpenNavigator: () -> Unit = {},
     commands: List<AgentCommand> = emptyList(),
@@ -1362,6 +1451,8 @@ private fun AgentChatBottomBar(
     onRemoveReference: (String) -> Unit,
     onRefreshToolAccess: () -> Unit,
     onToggleTool: (ToolToggleItem, Boolean) -> Unit,
+    onAttachSkillReference: (skillId: String, name: String) -> Unit = { _, _ -> },
+    onAttachMcpReference: (serverId: String, name: String) -> Unit = { _, _ -> },
 ) {
     Column(
         modifier = Modifier
@@ -1450,12 +1541,20 @@ private fun AgentChatBottomBar(
                 }
             }
             ChatNavigatorHandle(onOpen = onOpenNavigator)
+            // 任务待办面板：贴在输入框正上方（同一列内、输入栏之上）。
+            //
+            // 为什么不再浮在会话顶部：浮层会把消息区压掉一大块，标题行常年压在内容上，
+            // 展开后更是一片遮挡；而且「计划」这类信息本来就属于输入区的一部分，
+            // 停在输入框上方才是它该在的位置（2026-11-20 用户反馈）。
+            //
+            // 为什么能放回 bottomBar：面板自带高度上限 + 内部滚动，展开态不会把槽位撑爆；
+            // 面板里的手势被 nestedScroll 锁在自己身上，不会再带着消息列表一起滚。
             AgentPlanPanel(
                 steps = planSteps,
                 isRunning = isStreaming,
                 expandedKey = draftKey,
                 onClear = onClearPlan,
-                modifier = Modifier.padding(bottom = 8.dp),
+                modifier = Modifier.padding(bottom = 6.dp),
             )
             AgentChatInputBar(
                 input = input,
@@ -1472,6 +1571,7 @@ private fun AgentChatBottomBar(
                 onPlanModeChange = onPlanModeChange,
                 pendingImages = pendingImages,
                 pendingFileReferences = pendingFileReferences,
+            pendingSkillRefs = pendingSkillRefs,
                 queuedMessages = queuedMessages,
                 inputSyncVersion = inputSyncVersion,
                 isEditingMessage = messageEdit != null,
@@ -1487,6 +1587,11 @@ private fun AgentChatBottomBar(
                 onCompactContext = onCompactContext,
                 canCompactContext = canCompactContext,
                 onModelSelected = onModelSelected,
+                onTestModel = onTestModel,
+                modelTestStates = modelTestStates,
+                onShowTestDetail = onShowTestDetail,
+                onExpertSelectionChanged = onExpertSelectionChanged,
+                expertRefreshToken = expertRefreshToken,
                 onStop = onStop,
             isPaused = isPaused,
             onPause = onPause,
@@ -1497,6 +1602,7 @@ private fun AgentChatBottomBar(
                 onAttachFolder = onAttachFolder,
                 onAttachFilePath = onAttachFilePath,
                 onRemoveFileReference = onRemoveFileReference,
+            onRemoveSkillReference = onRemoveSkillReference,
                 onCancelMessageEdit = onCancelMessageEdit,
                 commands = commands,
                 pinnedPalette = commandPalette,
@@ -1512,10 +1618,78 @@ private fun AgentChatBottomBar(
                 onRemoveReference = onRemoveReference,
                 onRefreshToolAccess = onRefreshToolAccess,
                 onToggleTool = onToggleTool,
+                onAttachSkillReference = onAttachSkillReference,
+                onAttachMcpReference = onAttachMcpReference,
                 modifier = Modifier.fillMaxWidth(),
             )
         }
     }
+
+}
+
+@Composable
+private fun ModelTestDetailDialog(detail: ModelTestDetail?, onDismiss: () -> Unit) {
+    if (detail == null) return
+    val result = detail.result
+    val summary = buildString {
+        // 失败时手上一分耗时都没有，写「总计 0ms」等于报假数据。
+        val totalMs = if (result.latencyMs > 0) result.latencyMs else result.timings.totalMs
+        if (totalMs > 0) {
+            append("总计 ").append(totalMs).append("ms")
+            append(" · 连接 ").append(result.timings.connectMs).append("ms")
+            append(" · 发送 ").append(result.timings.sendMs).append("ms")
+            append(" · 处理 ").append(result.timings.processMs).append("ms")
+            append(" · 下载 ").append(result.timings.downloadMs).append("ms")
+            if (result.timings.connectionReused) append(" · 复用连接")
+        }
+        if (result.responseCode != 0 && !result.success) {
+            append("\n\nHTTP ").append(result.responseCode)
+        }
+        if (result.message.isNotBlank()) {
+            if (isNotEmpty()) append("\n\n")
+            append(result.message)
+        }
+        if (result.errorDetail.isNotBlank()) {
+            if (isNotEmpty()) append("\n\n")
+            append(result.errorDetail.take(500))
+        }
+        if (result.replyText.isNotBlank()) {
+            if (isNotEmpty()) append("\n\n")
+            append("回复：").append(result.replyText.take(200))
+        }
+    }
+    EtaWindowDialog(
+        show = true,
+        title = "${detail.modelName} · ${if (result.success) "测速通过" else "测速失败"}",
+        summary = summary,
+        onDismissRequest = onDismiss,
+    ) {
+        MiuixDialogActions(
+            confirmText = "关闭",
+            onCancel = {},
+            onConfirm = onDismiss,
+        )
+    }
+}
+
+/**
+ * 列表层持有的流式会话跟着条目挂载/卸载记账：条目还在组合里就不会被回收，
+ * 滚出视口后才交给 [StreamingMarkdownStateCache.discardUnused] 收走，
+ * 滑回时静态渲染，不会重放打字机。
+ */
+@Composable
+private fun rememberRetainedStreamingState(
+    cache: StreamingMarkdownStateCache,
+    message: AgentChatMessageUi,
+): StreamingMarkdownState? {
+    val agentMessage = message as? AgentMessageUi ?: return null
+    if (!agentMessage.isStreaming && !cache.states.containsKey(agentMessage.id)) return null
+    val state = cache.getOrCreate(agentMessage.id)
+    DisposableEffect(state) {
+        state.attachContent()
+        onDispose { state.detachContent() }
+    }
+    return state
 }
 
 private val ChatBottomFrostHeight = 24.dp
@@ -1528,6 +1702,16 @@ private const val BOTTOM_FOLLOW_MIN_STEP_PX = 0.5f
 private const val BOTTOM_FOLLOW_SNAP_DISTANCE_PX = 0.75f
 /** 搜索命中高亮保持时长。 */
 private const val SEARCH_HIGHLIGHT_DURATION_MS = 2400L
+
+/** @ 引用面板只列尾部这么多条消息。 */
+private const val MessageReferenceCandidateLimit = 80
+/** 预览只压前 200 字的空白，够看出是哪一句。 */
+private const val MessageReferencePreviewSourceChars = 200
+private const val MessageReferencePreviewChars = 60
+/** @ 检索用的正文窗口。 */
+private const val MessageReferenceSearchChars = 1_000
+/** 空白压缩正则只编译一次，不随每条消息重建。 */
+private val MessageReferenceWhitespace = Regex("\\s+")
 
 internal fun resolveKeepBottomAnchored(
     current: Boolean,

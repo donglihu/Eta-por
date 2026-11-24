@@ -75,6 +75,9 @@ import top.yukonga.miuix.kmp.basic.ButtonDefaults
 import top.yukonga.miuix.kmp.basic.Icon
 import top.yukonga.miuix.kmp.basic.IconButton
 import top.yukonga.miuix.kmp.basic.InfiniteProgressIndicator
+import kotlin.math.roundToInt
+import top.yukonga.miuix.kmp.basic.Slider
+import top.yukonga.miuix.kmp.basic.SliderDefaults
 import top.yukonga.miuix.kmp.basic.Text
 import top.yukonga.miuix.kmp.squircle.squircleSurface
 import top.yukonga.miuix.kmp.theme.MiuixTheme
@@ -261,9 +264,96 @@ private fun MemorySettingsGroup(
             onCheckedChange = { onAction(AgentMemoryAction.ToggleAutoCompact(it)) },
         )
         EtaPreferenceDivider(hasLeading = false)
+        var coreBudgetDraft by remember(state.coreBudgetChars) {
+            mutableStateOf(state.coreBudgetChars.toFloat())
+        }
         EtaPreference(
-            title = stringResource(R.string.ui_core_memory_injection_budget_48b5d5),
-            summary = stringResource(R.string.memory_budget_summary, formatNumber(state.coreBudgetChars)),
+            title = stringResource(R.string.memory_core_budget_title),
+            summary = stringResource(
+                R.string.memory_core_budget_summary,
+                formatNumber(state.coreBudgetChars),
+                stringResource(
+                    if (state.coreBudgetOverride > 0) R.string.memory_budget_custom
+                    else R.string.memory_budget_auto,
+                ),
+            ),
+            endActions = {
+                Text(
+                    text = formatNumber(coreBudgetDraft.roundToInt()),
+                    fontSize = MiuixTheme.textStyles.body2.fontSize,
+                    color = MiuixTheme.colorScheme.onSurfaceVariantActions,
+                )
+            },
+            bottomAction = {
+                Slider(
+                    value = coreBudgetDraft.coerceIn(4_000f, 16_000f),
+                    onValueChange = { coreBudgetDraft = it },
+                    modifier = Modifier.fillMaxWidth(),
+                    valueRange = 4_000f..16_000f,
+                    onValueChangeFinished = {
+                        val rounded = (coreBudgetDraft / 1_000f).roundToInt() * 1_000
+                        onAction(AgentMemoryAction.SetCoreBudget(rounded))
+                    },
+                    showKeyPoints = true,
+                    keyPoints = listOf(4_000f, 8_000f, 16_000f),
+                    magnetThreshold = 0.01f,
+                    hapticEffect = SliderDefaults.SliderHapticEffect.Step,
+                )
+            },
+        )
+        EtaPreferenceDivider(hasLeading = false)
+        var headingBudgetDraft by remember(state.headingBudgetChars) {
+            mutableStateOf(state.headingBudgetChars.toFloat())
+        }
+        EtaPreference(
+            title = stringResource(R.string.memory_heading_budget_title),
+            summary = stringResource(
+                R.string.memory_heading_budget_summary,
+                formatNumber(state.headingBudgetChars),
+                stringResource(
+                    if (state.headingBudgetOverride > 0) R.string.memory_budget_custom
+                    else R.string.memory_budget_auto,
+                ),
+            ),
+            endActions = {
+                Text(
+                    text = formatNumber(headingBudgetDraft.roundToInt()),
+                    fontSize = MiuixTheme.textStyles.body2.fontSize,
+                    color = MiuixTheme.colorScheme.onSurfaceVariantActions,
+                )
+            },
+            bottomAction = {
+                Slider(
+                    value = headingBudgetDraft.coerceIn(500f, 4_000f),
+                    onValueChange = { headingBudgetDraft = it },
+                    modifier = Modifier.fillMaxWidth(),
+                    valueRange = 500f..4_000f,
+                    onValueChangeFinished = {
+                        val rounded = (headingBudgetDraft / 100f).roundToInt() * 100
+                        onAction(AgentMemoryAction.SetHeadingBudget(rounded))
+                    },
+                    showKeyPoints = true,
+                    keyPoints = listOf(500f, 1_500f, 4_000f),
+                    magnetThreshold = 0.01f,
+                    hapticEffect = SliderDefaults.SliderHapticEffect.Step,
+                )
+            },
+        )
+        EtaPreferenceDivider(hasLeading = false)
+        EtaActionPreference(
+            title = stringResource(R.string.memory_budget_reset_title),
+            summary = stringResource(
+                R.string.memory_budget_reset_summary,
+                formatNumber(8_000),
+                formatNumber(1_500),
+            ),
+            onClick = { onAction(AgentMemoryAction.ResetBudgets) },
+        )
+        EtaPreferenceDivider(hasLeading = true)
+        EtaActionPreference(
+            title = stringResource(R.string.memory_backup_title),
+            summary = state.backupSummary ?: stringResource(R.string.memory_backup_summary_never),
+            onClick = { onAction(AgentMemoryAction.BackupNow) },
         )
     }
 }

@@ -100,6 +100,8 @@ internal object SettingsDataStore {
     private val MEMORY_ENABLED = booleanPreferencesKey("memory_enabled")
     private val AUTO_MEMORY_ENABLED = booleanPreferencesKey("auto_memory_enabled")
     private val MEMORY_AUTO_COMPACT_ENABLED = booleanPreferencesKey("memory_auto_compact_enabled")
+    private val MEMORY_CORE_BUDGET_CHARS = intPreferencesKey("memory_core_budget_chars")
+    private val MEMORY_HEADING_BUDGET_CHARS = intPreferencesKey("memory_heading_budget_chars")
     private val AUTO_SKILLS_ENABLED = booleanPreferencesKey("auto_skills_enabled")
     private val VIRTUAL_SCREEN_ENABLED = booleanPreferencesKey("virtual_screen_enabled")
     private val VIRTUAL_SCREEN_OFF_ENABLED = booleanPreferencesKey("virtual_screen_off_enabled")
@@ -115,6 +117,8 @@ internal object SettingsDataStore {
     private val VIRTUAL_SCREEN_FLOAT_POS_X = intPreferencesKey("virtual_screen_float_pos_x")
     private val VIRTUAL_SCREEN_FLOAT_POS_Y = intPreferencesKey("virtual_screen_float_pos_y")
     private val AUTO_BACKUP_ENABLED = booleanPreferencesKey("auto_backup_enabled")
+    /** 可选后台保活开关：默认关闭，只有用户主动打开才常驻前台服务。 */
+    private val KEEPALIVE_ENABLED = booleanPreferencesKey("keepalive_enabled")
     private val OVERLAY_FLUID_PINNED = booleanPreferencesKey("overlay_fluid_pinned")
     /** 流体云降级：通知不再申请持续提升，退化为普通通知。 */
     private val OVERLAY_FLUID_DOWNGRADE = booleanPreferencesKey("overlay_fluid_downgrade")
@@ -133,8 +137,17 @@ internal object SettingsDataStore {
     private val AUTO_BACKUP_LAST_ERROR = stringPreferencesKey("auto_backup_last_error")
     private val AUTO_BACKUP_LAST_ERROR_AT = longPreferencesKey("auto_backup_last_error_at")
     private val AUTO_BACKUP_DIRECTORY = stringPreferencesKey("auto_backup_directory")
+    /** SAF 授权的备份文件夹（tree URI），优先级高于手输路径。 */
+    private val AUTO_BACKUP_TREE_URI = stringPreferencesKey("auto_backup_tree_uri")
+    private val AUTO_BACKUP_TREE_LABEL = stringPreferencesKey("auto_backup_tree_label")
     /** 自动备份格式：json / full（全量压缩包）。 */
     private val AUTO_BACKUP_FORMAT = stringPreferencesKey("auto_backup_format")
+    /** 全量备份时连同 Linux 容器一起打包。 */
+    private val AUTO_BACKUP_INCLUDE_LINUX = booleanPreferencesKey("auto_backup_include_linux")
+    /** 工具调用审查档位：read_only / strict / standard / smart / auto。 */
+    private val TOOL_REVIEW_MODE = stringPreferencesKey("tool_review_mode")
+    /** 智能档决策模型 ID：空串跟随主对话模型。 */
+    private val TOOL_REVIEW_DECISION_MODEL_ID = stringPreferencesKey("tool_review_decision_model_id")
     private val DIAG_PATROL_ENABLED = booleanPreferencesKey("diag_patrol_enabled")
     private val DIAG_PATROL_INTERVAL = intPreferencesKey("diag_patrol_interval_minutes")
     private val DIAG_PATROL_KEEP = intPreferencesKey("diag_patrol_keep_count")
@@ -167,13 +180,45 @@ internal object SettingsDataStore {
     @Volatile
     private var autoBackupDirectoryCache: String = ""
 
+    /** SAF 授权目录的进程内缓存：非挂起调用判断「有没有授权文件夹」用。 */
+    @Volatile
+    private var autoBackupTreeUriCache: String = ""
+
+    /**
+     * 工具调用审查档位的进程内缓存。
+     *
+     * 工具执行链是同步的（`ToolExecutor.execute`），每次调用都 `runBlocking { settings() }`
+     * 等于每个工具多一次 DataStore 读盘 + 协程调度。这里与 [MemoryBudgetPolicy] 同一口径：
+     * 设置流每次发射时同步进来，运行期只读这份缓存，零 IO。
+     */
+    @Volatile
+    private var toolReviewModeCache: String = "standard"
+
+    /** 应用上下文：仅用于解析应用专属目录，避免在无 Context 的调用点猜路径。 */
+    @Volatile
+    private var appContext: Context? = null
+
     fun cachedAutoBackupDirectory(): String = autoBackupDirectoryCache
+
+    fun cachedAutoBackupTreeUri(): String = autoBackupTreeUriCache
+
+    /**
+     * 工具调用审查档位的同步读取入口：工具执行链在同步上下文里，不能挂起。
+     *
+     * 缓存由 [settingsFlow] 每次发射时刷新，冷启动第一次读取前返回缺省 `standard`
+     * （与 `Settings.toolReviewMode` 的缺省值一致，不会因为「还没读到」而放宽成 auto）。
+     */
+    fun cachedToolReviewMode(): String = toolReviewModeCache
 
     fun init(context: Context) {
         if (!::dataStore.isInitialized) {
+            appContext = context.applicationContext
             dataStore = context.applicationContext.dataStore
         }
     }
+
+    /** 应用上下文：给备份目录解析等非挂起调用用（不持有 Activity，避免泄漏）。 */
+    fun appContextOrNull(): Context? = appContext
 
     fun settingsFlow(): Flow<Settings> {
         ensureInitialized()
@@ -186,7 +231,18 @@ internal object SettingsDataStore {
                 }
             }
             .map { preferences ->
-                preferences.toSettings().also { autoBackupDirectoryCache = it.autoBackupDirectory }
+                preferences.toSettings().also { settings ->
+                    autoBackupDirectoryCache = settings.autoBackupDirectory
+                    autoBackupTreeUriCache = settings.autoBackupTreeUri
+                    // 工具调用审查档位同样缓存到进程内：工具执行链同步读，不能每次都落盘。
+                    toolReviewModeCache = io.github.mangi.eta.agent.tool.ToolReviewMode
+                        .normalized(settings.toolReviewMode)
+                    // 预算滑杆值随设置一起同步到注入侧缓存，运行期读取零 IO。
+                    io.github.mangi.eta.agent.memory.MemoryBudgetPolicy.apply(
+                        settings.memoryCoreBudgetChars,
+                        settings.memoryHeadingBudgetChars,
+                    )
+                }
             }
     }
 
@@ -225,14 +281,25 @@ internal object SettingsDataStore {
 
     suspend fun updateSettings(transform: (Settings) -> Settings) {
         ensureInitialized()
+        // 预算缓存必须在这里同步，不能只靠 settingsFlow() 的 map：
+        // 收集者不在时 map 不会执行，注入侧会一直用旧预算，
+        // 表现是「设置里改了数字，实际注入还是老值」。
         dataStore.edit { prefs ->
             val current = prefs.toSettings()
             val updated = transform(current)
+            io.github.mangi.eta.agent.memory.MemoryBudgetPolicy.apply(
+                updated.memoryCoreBudgetChars,
+                updated.memoryHeadingBudgetChars,
+            )
             prefs.putOrRemove(SELECTED_PROVIDER_ID, updated.selectedProviderId)
             prefs.putOrRemove(SELECTED_MODEL_ID, updated.selectedModelId)
             prefs[MEMORY_ENABLED] = updated.memoryEnabled
             prefs[AUTO_MEMORY_ENABLED] = updated.autoMemoryEnabled
             prefs[MEMORY_AUTO_COMPACT_ENABLED] = updated.memoryAutoCompactEnabled
+            prefs[MEMORY_CORE_BUDGET_CHARS] = io.github.mangi.eta.agent.memory.MemoryBudgetPolicy
+                .normalizeCore(updated.memoryCoreBudgetChars)
+            prefs[MEMORY_HEADING_BUDGET_CHARS] = io.github.mangi.eta.agent.memory.MemoryBudgetPolicy
+                .normalizeHeading(updated.memoryHeadingBudgetChars)
             prefs[AUTO_SKILLS_ENABLED] = updated.autoSkillsEnabled
             prefs[VIRTUAL_SCREEN_ENABLED] = updated.virtualScreenEnabled
             prefs[VIRTUAL_SCREEN_OFF_ENABLED] = updated.virtualScreenOffEnabled
@@ -247,6 +314,7 @@ internal object SettingsDataStore {
             prefs[VIRTUAL_SCREEN_FLOAT_POS_X] = updated.virtualScreenFloatWindowPosX
             prefs[VIRTUAL_SCREEN_FLOAT_POS_Y] = updated.virtualScreenFloatWindowPosY
             prefs[AUTO_BACKUP_ENABLED] = updated.autoBackupEnabled
+            prefs[KEEPALIVE_ENABLED] = updated.keepaliveEnabled
             prefs[OVERLAY_FLUID_PINNED] = updated.overlayFluidPinned
             prefs[OVERLAY_FLUID_DOWNGRADE] = updated.overlayFluidDowngrade
             prefs[SEEN_TOUR_PACKS] = speechJson.encodeToString(updated.seenTourPacks)
@@ -260,7 +328,12 @@ internal object SettingsDataStore {
             // 备份的运行态（上次时间 / 指纹 / 文件名 / 失败原因）只由 setAutoBackupState 单独写，
             // 这里不再回写：设置页的快照通常早于本次备份完成，回写会把刚跑完的状态又冲成旧值。
             prefs.putOrRemove(AUTO_BACKUP_DIRECTORY, updated.autoBackupDirectory)
+            prefs.putOrRemove(AUTO_BACKUP_TREE_URI, updated.autoBackupTreeUri)
+            prefs.putOrRemove(AUTO_BACKUP_TREE_LABEL, updated.autoBackupTreeLabel)
             prefs[AUTO_BACKUP_FORMAT] = io.github.mangi.eta.data.model.AutoBackupFormat.normalize(updated.autoBackupFormat)
+            prefs[AUTO_BACKUP_INCLUDE_LINUX] = updated.autoBackupIncludeLinux
+            prefs[TOOL_REVIEW_MODE] = io.github.mangi.eta.agent.tool.ToolReviewMode.normalized(updated.toolReviewMode)
+            prefs.putOrRemove(TOOL_REVIEW_DECISION_MODEL_ID, updated.toolReviewDecisionModelId)
             prefs[DIAG_PATROL_ENABLED] = updated.diagPatrolEnabled
             prefs[DIAG_PATROL_INTERVAL] = io.github.mangi.eta.core.DiagnosticsPatrolInterval
                 .normalize(updated.diagPatrolIntervalMinutes)
@@ -273,6 +346,21 @@ internal object SettingsDataStore {
             prefs.remove(stringPreferencesKey("vivo_atomic_scene"))
             prefs.putAppearance(updated.appearance.normalized())
         }
+    }
+
+    /** 保活开关的独立流：设置页只订阅这一位，不必跟着整份 Settings 重绘。 */
+    fun keepaliveEnabledFlow(): Flow<Boolean> {
+        ensureInitialized()
+        return dataStore.data
+            .catch { cause ->
+                if (cause is IOException) emit(emptyPreferences()) else throw cause
+            }
+            .map { prefs -> prefs[KEEPALIVE_ENABLED] ?: false }
+    }
+
+    suspend fun setKeepaliveEnabled(enabled: Boolean) {
+        ensureInitialized()
+        dataStore.edit { prefs -> prefs[KEEPALIVE_ENABLED] = enabled }
     }
 
     suspend fun autoBackupLastAt(): Long = settings().autoBackupLastAt
@@ -391,6 +479,28 @@ internal object SettingsDataStore {
         updateSettings { it.copy(memoryAutoCompactEnabled = enabled) }
     }
 
+    /** 自定义核心记忆注入预算；0 表示恢复自动。写入后立即同步注入侧缓存。 */
+    suspend fun setMemoryCoreBudgetChars(chars: Int) {
+        updateSettings {
+            it.copy(
+                memoryCoreBudgetChars =
+                io.github.mangi.eta.agent.memory.MemoryBudgetPolicy.normalizeCore(chars),
+            )
+        }
+        settings()
+    }
+
+    /** 自定义标题索引注入预算；0 表示恢复自动。 */
+    suspend fun setMemoryHeadingBudgetChars(chars: Int) {
+        updateSettings {
+            it.copy(
+                memoryHeadingBudgetChars =
+                io.github.mangi.eta.agent.memory.MemoryBudgetPolicy.normalizeHeading(chars),
+            )
+        }
+        settings()
+    }
+
     suspend fun setMemoryEnabled(enabled: Boolean) {
         updateSettings { it.copy(memoryEnabled = enabled) }
     }
@@ -433,6 +543,8 @@ internal object SettingsDataStore {
         memoryEnabled = this[MEMORY_ENABLED] ?: true,
         autoMemoryEnabled = this[AUTO_MEMORY_ENABLED] ?: true,
         memoryAutoCompactEnabled = this[MEMORY_AUTO_COMPACT_ENABLED] ?: true,
+        memoryCoreBudgetChars = this[MEMORY_CORE_BUDGET_CHARS] ?: 0,
+        memoryHeadingBudgetChars = this[MEMORY_HEADING_BUDGET_CHARS] ?: 0,
         autoSkillsEnabled = this[AUTO_SKILLS_ENABLED] ?: true,
         virtualScreenEnabled = this[VIRTUAL_SCREEN_ENABLED] ?: false,
         virtualScreenOffEnabled = this[VIRTUAL_SCREEN_OFF_ENABLED] ?: false,
@@ -447,6 +559,7 @@ internal object SettingsDataStore {
         virtualScreenFloatWindowPosX = this[VIRTUAL_SCREEN_FLOAT_POS_X] ?: 16,
         virtualScreenFloatWindowPosY = this[VIRTUAL_SCREEN_FLOAT_POS_Y] ?: 120,
         autoBackupEnabled = this[AUTO_BACKUP_ENABLED] ?: false,
+        keepaliveEnabled = this[KEEPALIVE_ENABLED] ?: false,
         overlayFluidPinned = this[OVERLAY_FLUID_PINNED] ?: false,
         overlayFluidDowngrade = this[OVERLAY_FLUID_DOWNGRADE] ?: false,
         seenTourPacks = this[SEEN_TOUR_PACKS]?.let { raw ->
@@ -468,9 +581,16 @@ internal object SettingsDataStore {
         autoBackupLastError = this[AUTO_BACKUP_LAST_ERROR].orEmpty(),
         autoBackupLastErrorAt = this[AUTO_BACKUP_LAST_ERROR_AT] ?: 0L,
         autoBackupDirectory = this[AUTO_BACKUP_DIRECTORY].orEmpty(),
+        autoBackupTreeUri = this[AUTO_BACKUP_TREE_URI].orEmpty(),
+        autoBackupTreeLabel = this[AUTO_BACKUP_TREE_LABEL].orEmpty(),
         autoBackupFormat = io.github.mangi.eta.data.model.AutoBackupFormat.normalize(
             this[AUTO_BACKUP_FORMAT].orEmpty(),
         ),
+        autoBackupIncludeLinux = this[AUTO_BACKUP_INCLUDE_LINUX] ?: false,
+        toolReviewMode = io.github.mangi.eta.agent.tool.ToolReviewMode.normalized(
+            this[TOOL_REVIEW_MODE],
+        ),
+        toolReviewDecisionModelId = this[TOOL_REVIEW_DECISION_MODEL_ID].orEmpty(),
         diagPatrolEnabled = this[DIAG_PATROL_ENABLED] ?: false,
         diagPatrolIntervalMinutes = io.github.mangi.eta.core.DiagnosticsPatrolInterval.normalize(
             this[DIAG_PATROL_INTERVAL] ?: io.github.mangi.eta.core.DiagnosticsPatrolInterval.DEFAULT_MINUTES,

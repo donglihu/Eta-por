@@ -11,9 +11,19 @@ class AgentMemoryContextBuilderTest {
     fun coreBudgetTracksWindowWithSafeUnknownFallback() {
         assertEquals(8_000, AgentMemoryContextBuilder.coreBudgetChars(null))
         assertEquals(8_000, AgentMemoryContextBuilder.coreBudgetChars(128_000))
-        assertEquals(16_000, AgentMemoryContextBuilder.coreBudgetChars(256_000))
-        assertEquals(32_000, AgentMemoryContextBuilder.coreBudgetChars(1_000_000))
+        assertEquals(8_000, AgentMemoryContextBuilder.coreBudgetChars(256_000))
+        assertEquals(8_000, AgentMemoryContextBuilder.coreBudgetChars(1_000_000))
         assertEquals(4_000, AgentMemoryContextBuilder.coreBudgetChars(16_000))
+    }
+
+    @Test
+    fun customSliderBudgetWinsOverWindowAndZeroMeansAuto() {
+        // 滑杆自定义值优先，0 回落到自动上限 8,000。
+        assertEquals(12_000, AgentMemoryContextBuilder.coreBudgetChars(1_000_000, 12_000))
+        assertEquals(4_000, AgentMemoryContextBuilder.coreBudgetChars(1_000_000, 1))
+        assertEquals(16_000, AgentMemoryContextBuilder.coreBudgetChars(1_000_000, 99_000))
+        assertEquals(2_000, AgentMemoryContextBuilder.headingBudgetChars(2_000))
+        assertEquals(1_500, AgentMemoryContextBuilder.headingBudgetChars(0))
     }
 
     @Test

@@ -321,7 +321,16 @@ internal object VirtualScreenSession {
                 current.owner,
                 JSONObject().put("action", "lifecycle")
                     .put("idleTimeoutMinutes", settings.virtualScreenIdleTimeoutMinutes)
-                    .put("activeRun", current.viewer.value.activeRunId != null)
+                    /*
+                     * 有人看着这块屏（浮窗展开／贴边折叠／接管页）就算「在用」。
+                     *
+                     * 真机踩到：任务结束保留浮窗后，App 只按 activeRunId 判活，于是 helper 收到
+                     * activeRun=false，20 分钟空闲阈值一到就被自己 SIGKILL（vscr.log：
+                     * 22:58:01 保留浮窗 → 23:18:02 Killed → exitCode=137），用户留在屏上的浮窗
+                     * 瞬间只剩一个带图标的气泡壳，看着像「只剩胶囊」。
+                     * 浮窗还在 = 用户随时可能点进去，不能按空闲回收。
+                     */
+                    .put("activeRun", current.viewer.value.activeRunId != null || watchProfile != null)
                     .put("mainScreenLocked", mainScreenLocked(current.context))
                     .put("frameIntervalMs", interval)
                     .put("jpegQuality", quality)
@@ -412,7 +421,45 @@ internal object VirtualScreenSession {
                     sessions.remove(owner)
                     stale.close()
                 }
-                require(sessions[owner] == null) { "DISPLAY_ALREADY_ACTIVE" }
+                /*
+                 * 已经有活着的屏就复用，不再硬失败。
+                 *
+                 * 真机复现两次（vscr.log 11-18 07:38:09、11-19 12:45:49 `create 失败 DISPLAY_ALREADY_ACTIVE`）：
+                 * 上一轮任务刚结束、浮窗还留着，下一条消息的 UI 工具照样会走「无屏则建屏」，
+                 * 结果 `require(sessions[owner] == null)` 直接把它判死，用户看到的就是「灵屏启动失败」。
+                 * 复用口径与新建一致：绑 run 租约、切焦点、把这块屏回传给调用方。
+                 */
+                aliveSession(owner)?.let { existing ->
+                    val reused = existing.viewer.value.display
+                    if (reused != null) {
+                        VscrDiag.line(
+                            "create 复用现有灵屏 displayId=" + existing.displayId +
+                                " owner=" + owner.take(8) + " runId=" + runId,
+                        )
+                        if (runId != null) {
+                            existing.runLease.acquire(runId)
+                            existing.viewer.update { it.beginRun(runId) }
+                        }
+                        focus(existing)
+                        publish(existing)
+                        VirtualScreenWakeLock.sync(context, settings.virtualScreenKeepScreenOn)
+                        updateIdleTimeout(owner)
+                        return@synchronized AgentModelClient.ToolResult(
+                            JSONObject().put("ok", true)
+                                .put("displayId", existing.displayId)
+                                .put("width", reused.width).put("height", reused.height)
+                                .put("density", reused.density)
+                                .put("captureWidth", reused.captureWidth)
+                                .put("captureHeight", reused.captureHeight)
+                                .put("independentFocus", true)
+                                .put("reused", true)
+                                .toString()
+                        )
+                    }
+                    // 屏活着但 display 还没就绪（create 正在收尾）：关掉重来，避免卡在两不管状态。
+                    sessions.remove(owner)
+                    existing.close()
+                }
                 if (!hasMemoryForNewSession()) {
                     VscrDiag.line("灵屏 内存不足，拒绝建屏 现有=" + sessions.size)
                     error("INSUFFICIENT_MEMORY")
@@ -506,7 +553,7 @@ internal object VirtualScreenSession {
                             .put("frameIntervalMs", READ_SCREEN_INTERVAL_MS)
                             .put("jpegQuality", READ_SCREEN_QUALITY)
                             .put("watchMode", watchProfile != null)
-                            .put("activeRun", runId != null)
+                            .put("activeRun", runId != null || watchProfile != null)
                             .put("allowScreenOff", allowOff)
                             .put("mainScreenLocked", mainScreenLocked(context)).toString()
                     ); input.newLine(); input.flush()
@@ -610,8 +657,22 @@ internal object VirtualScreenSession {
         } catch (error: Exception) {
             VscrDiag.line("execute 失败 action=" + args.optString("action") + " 原因=" + error.message)
             sessions[owner]?.let { current ->
-                if (current.closed.get() || !current.process.isAlive ||
-                    error.message in setOf("ROOT_REQUIRED", "VIRTUAL_SCREEN_DISABLED", "SCREEN_OFF_PERMISSION_REQUIRED")) {
+                /*
+                 * 哪些错误要连屏一起销毁：
+                 *  - 进程没了／已被关闭：屏确实不存在了；
+                 *  - ROOT_REQUIRED／VIRTUAL_SCREEN_DISABLED：配置或授权变了，留着也没用；
+                 *  - DISPLAY_GONE／ROOT_DISPLAY_DISCONNECTED：helper 那边 display 已经没了。
+                 *
+                 * SCREEN_OFF_PERMISSION_REQUIRED 不在其中：它只是「主屏现在熄着」的瞬时状态，
+                 * 屏本身是好的。早前把它当致命错误直接 close()，于是熄屏一次就整块灵屏报废，
+                 * 用户侧表现就是「灵屏经常失败、要重新开」。
+                 */
+                val fatal = current.closed.get() || !current.process.isAlive ||
+                    error.message in setOf(
+                        "ROOT_REQUIRED", "VIRTUAL_SCREEN_DISABLED",
+                        "DISPLAY_GONE", "ROOT_DISPLAY_DISCONNECTED",
+                    )
+                if (fatal) {
                     current.close()
                     sessions.remove(owner)
                 }
@@ -624,7 +685,11 @@ internal object VirtualScreenSession {
                 )
                     .put(
                         "message",
-                        "灵屏操作未执行；不会回退到主屏。请确认 Root、灵屏开关和设备接口。"
+                        if (error.message == "SCREEN_OFF_PERMISSION_REQUIRED") {
+                            "主屏熄屏或锁屏中，这个动作需要屏幕亮着；亮屏后再试一次（灵屏没有被关闭）。"
+                        } else {
+                            "灵屏操作未执行；不会回退到主屏。请确认 Root、灵屏开关和设备接口。"
+                        }
                     ).toString()
             )
         }

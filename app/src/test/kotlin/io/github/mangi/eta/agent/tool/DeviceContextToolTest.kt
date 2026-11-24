@@ -40,7 +40,7 @@ class DeviceContextToolTest {
     }
 
     @Test
-    fun keepsTimeAvailableWhenLocationIsUnavailable() {
+    fun keepsTimeAvailableWithoutAnyLocationFieldWhenLocationIsUnavailable() {
         val result = JSONObject(
             DeviceContextTool.current(
                 clock = Clock.fixed(
@@ -53,9 +53,9 @@ class DeviceContextToolTest {
 
         assertEquals("2026-01-01T05:45:00+05:45", result.getString("datetime"))
         assertEquals("Asia/Kathmandu", result.getString("timezone"))
-        result.getJSONObject("location").run {
-            assertEquals("permission_required", getString("status"))
-            assertFalse(has("latitude"))
-        }
+        // 问时间不该带出「位置未授权」：读不到位置就整块省略，位置状态由
+        // get_current_location 单独负责。
+        assertEquals(3, result.length())
+        assertFalse(result.has("location"))
     }
 }

@@ -17,6 +17,8 @@ internal object AgentRuntimePolicy {
         val deviceSensitiveReadTools: Boolean = false,
         val deviceSensitiveActionTools: Boolean = false,
         val autoCompaction: Boolean = Prefs.Keys.BOOLEAN_DEFAULTS.getValue(Prefs.Keys.AGENT_AUTO_COMPACTION_ENABLED),
+        /** 运行时允许的自动压缩阈值（0 = 未授权/不允许）；与布尔开关一起构成授权。 */
+        val autoCompactionTriggerPercent: Int = 0,
         val subagentTools: Boolean = Prefs.Keys.BOOLEAN_DEFAULTS.getValue(Prefs.Keys.AGENT_SUBAGENT_ENABLED),
     )
 
@@ -30,6 +32,7 @@ internal object AgentRuntimePolicy {
             deviceSensitiveActionTools =
                 preferences.allowed(Prefs.Keys.AGENT_DEVICE_SENSITIVE_ACTION_TOOLS),
             autoCompaction = preferences.allowed(Prefs.Keys.AGENT_AUTO_COMPACTION_ENABLED),
+            autoCompactionTriggerPercent = preferences.allowedAutoCompactionPercent(),
             subagentTools = preferences.allowed(Prefs.Keys.AGENT_SUBAGENT_ENABLED),
         )
 
@@ -51,6 +54,15 @@ internal object AgentRuntimePolicy {
             thinkingEnabled = thinkingEnabled,
             reasoningEffort = effectiveEffort,
             autoCompactionEnabled = config.autoCompactionEnabled && permissions.autoCompaction,
+            autoCompactionTriggerPercent = if (config.autoCompactionEnabled && permissions.autoCompaction) {
+                // 入口进程提交的阈值不能越过运行时授权：两边都给了正数就取小，只有一边给就听那一边。
+                val authorized = permissions.autoCompactionTriggerPercent
+                if (config.autoCompactionTriggerPercent > 0 && authorized > 0) {
+                    minOf(config.autoCompactionTriggerPercent, authorized)
+                } else {
+                    config.autoCompactionTriggerPercent
+                }
+            } else 0,
             subagentTools = config.subagentTools && permissions.subagentTools,
         )
         if (thinkingEnabled) return constrained
@@ -67,6 +79,24 @@ internal object AgentRuntimePolicy {
         if (this == null) return false
         val default = Prefs.Keys.BOOLEAN_DEFAULTS[key] ?: false
         return runCatching { getBoolean(key, default) }.getOrDefault(false)
+    }
+
+    /**
+     * 读取运行时可授权的自动压缩阈值（0 = 不允许）。
+     *
+     * 读失败一律按 0 处理（fail closed）：远程 preferences 不可用时不能默认替用户打开自动压缩。
+     * 没有新阈值键的存量配置按旧布尔开关折算，避免升级后静默改变行为；
+     * 读到旧档位（60/70/85/95）时吸附到当前合法档位，UI 与运行时口径保持一致。
+     */
+    private fun SharedPreferences?.allowedAutoCompactionPercent(): Int {
+        if (this == null) return 0
+        return runCatching {
+            if (contains(Prefs.Keys.AGENT_AUTO_COMPACTION_TRIGGER_PERCENT)) {
+                getInt(Prefs.Keys.AGENT_AUTO_COMPACTION_TRIGGER_PERCENT, 0)
+            } else if (getBoolean(Prefs.Keys.AGENT_AUTO_COMPACTION_ENABLED, false)) {
+                Prefs.Keys.AUTO_COMPACTION_TRIGGER_PERCENT_DEFAULT
+            } else 0
+        }.getOrDefault(0).let(Prefs::normalizeAutoCompactionPercent)
     }
 
     private fun stripThinkingOverrides(raw: String): String {

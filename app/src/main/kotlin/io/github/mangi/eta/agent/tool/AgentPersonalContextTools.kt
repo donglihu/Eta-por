@@ -114,7 +114,6 @@ internal class AgentPersonalContextTools(private val context: Context) {
             "LOCATION_UNAVAILABLE",
             when (result.status) {
                 "permission_required" -> "请先授予位置权限"
-                "background_permission_required" -> "请将位置权限设为始终允许"
                 "location_disabled" -> "系统定位服务已关闭"
                 else -> "系统没有可用的最近位置"
             },

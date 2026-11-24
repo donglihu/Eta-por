@@ -36,6 +36,7 @@ import io.github.mangi.eta.agent.device.ScrollEvidenceContract
 import io.github.mangi.eta.agent.device.ScrollMovementSource
 import io.github.mangi.eta.agent.device.RootScrollMotionContract
 import io.github.mangi.eta.core.AndroidAgentLogger
+import io.github.mangi.eta.core.safeLogType
 import java.util.ArrayDeque
 import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.CountDownLatch
@@ -869,7 +870,10 @@ class AgentAccessibilityService : AccessibilityService() {
             } else {
                 NodeActionResult.failure("ACTION_FAILED", "输入节点拒绝粘贴动作")
             }
-        } catch (_: Throwable) {
+        } catch (t: Throwable) {
+            AndroidAgentLogger.warnThrottled("a11y_paste_action_failed") {
+                "Accessibility paste action failed: type=${t.safeLogType()}"
+            }
             NodeActionResult.outcomeUnknown()
         }
         val restored = restoreClipboardIfStillOwned(
@@ -1125,7 +1129,10 @@ class AgentAccessibilityService : AccessibilityService() {
                                 }
                             }
                             if (!retained && !sw.isRecycled) sw.recycle()
-                        } catch (_: Exception) {
+                        } catch (t: Exception) {
+                            AndroidAgentLogger.warnThrottled("a11y_window_screenshot_failed") {
+                                "Window screenshot failed: type=${t.safeLogType()}"
+                            }
                             synchronized(lock) {
                                 if (acceptingResults.get()) {
                                     failures[window.id] = ERROR_TAKE_SCREENSHOT_INTERNAL_ERROR
@@ -1247,7 +1254,10 @@ class AgentAccessibilityService : AccessibilityService() {
                 }
             }
             output
-        } catch (_: Exception) {
+        } catch (t: Exception) {
+            AndroidAgentLogger.warnThrottled("a11y_merge_screenshots_failed") {
+                "Accessibility screenshot merge failed: type=${t.safeLogType()}"
+            }
             merged?.takeUnless(Bitmap::isRecycled)?.recycle()
             null
         }
@@ -1881,8 +1891,11 @@ class AgentAccessibilityService : AccessibilityService() {
                     },
                     GESTURE_CALLBACK_HANDLER,
                 )
-            } catch (_: Throwable) {
+            } catch (t: Throwable) {
                 // Binder 事务可能已经送达；异常不能证明手势未执行，禁止 Root 重放。
+                AndroidAgentLogger.warnThrottled("a11y_gesture_dispatch_unknown") {
+                    "Gesture dispatch outcome unknown: type=${t.safeLogType()}"
+                }
                 outcome.set(GestureDispatch.OUTCOME_UNKNOWN)
                 gate.finish()
                 latch.countDown()
@@ -1941,8 +1954,11 @@ class AgentAccessibilityService : AccessibilityService() {
         if (Looper.myLooper() == Looper.getMainLooper()) {
             return try {
                 MainThreadCallResult.Completed(block())
-            } catch (_: Throwable) {
+            } catch (t: Throwable) {
                 // 框架调用抛错时无法证明副作用没有发生，禁止调用方回退重放。
+                AndroidAgentLogger.warnThrottled("a11y_main_thread_call_unknown") {
+                    "Main-thread call outcome unknown: type=${t.safeLogType()}"
+                }
                 MainThreadCallResult.OUTCOME_UNKNOWN
             }
         }
@@ -1954,7 +1970,10 @@ class AgentAccessibilityService : AccessibilityService() {
             if (gate.tryStart()) {
                 try {
                     value = block()
-                } catch (_: Throwable) {
+                } catch (t: Throwable) {
+                    AndroidAgentLogger.warnThrottled("a11y_main_thread_post_failed") {
+                        "Posted main-thread call failed: type=${t.safeLogType()}"
+                    }
                     failed = true
                 } finally {
                     gate.finish()

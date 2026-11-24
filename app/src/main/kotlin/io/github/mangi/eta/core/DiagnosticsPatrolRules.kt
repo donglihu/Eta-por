@@ -17,7 +17,7 @@ import org.json.JSONObject
 internal object DiagnosticsPatrolRules {
 
     /** 规则文件：纯文本 JSON，可手动编辑，不参与报告滚动清理。 */
-    const val FILE_PATH = "/storage/emulated/0/ai共享文件夹/诊断包备份/自定义检测.json"
+    const val FILE_PATH = SharedStorage.DIAGNOSTICS_RULES_FILE
 
     private const val TAG = "DiagnosticsPatrolRules"
     private const val MAX_RULE_FILES = 200
@@ -96,7 +96,7 @@ internal object DiagnosticsPatrolRules {
 
     fun save(rules: List<Rule>): Boolean = runCatching {
         val f = file()
-        f.parentFile?.let { if (!it.isDirectory) it.mkdirs() }
+        f.parentFile?.let { SharedStorage.ensureDirectory(it) }
         val array = JSONArray()
         rules.forEach { rule ->
             array.put(

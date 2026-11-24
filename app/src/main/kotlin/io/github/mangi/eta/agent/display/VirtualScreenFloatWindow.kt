@@ -127,8 +127,12 @@ internal object VirtualScreenFloatWindow {
     private var tiltHoldSince = 0L
     private var tiltLandscape = false
     private var lastFrameId = 0L
+    /** 连续拉帧失败次数：只用于限流留痕，不影响出帧逻辑。 */
+    private var frameFailStreak = 0
     private var frameJob: Job? = null
     private var observeJob: Job? = null
+    /** 浮窗兜底看护；只在 init() 里启动一次。 */
+    private var orphanWatchJob: Job? = null
     private var cachedSettings: Settings? = null
 
     private var collapsed = false
@@ -279,6 +283,9 @@ internal object VirtualScreenFloatWindow {
             AgentLiveCoordinator.attach(store)
             scope.launch { store.effects.collect { handleEffect(it) } }
         }
+        // 兜底看护必须真的启动：helper 被系统回收／OOM／SIGKILL 之后，
+        // 浮窗会停在一帧定格画面或只剩气泡壳，没有这个轮询就永远不会自己收起来。
+        startOrphanWatch()
         observeJob = scope.launch {
             combine(SettingsDataStore.settingsFlow(), VirtualScreenSession.state) { s, v -> s to v }
                 .collect { (settings, vsState) ->
@@ -567,15 +574,32 @@ internal object VirtualScreenFloatWindow {
         return@withContext try {
             val result = VirtualScreenSession.observeForViewer(context ?: return@withContext null, lastFrameId)
             val json = JSONObject(result.content)
-            if (!json.optBoolean("ok")) return@withContext null
+            if (!json.optBoolean("ok")) {
+                // 早前这里默默 return null，浮窗就停在一帧定格画面上，
+                // 用户只看到「有窗口没画面」，日志里也什么都查不到。失败必须留痕。
+                noteFrameFailure(json.optString("code").ifBlank { "OBSERVE_FAILED" })
+                return@withContext null
+            }
             val encoded = result.images.firstOrNull()?.reference?.substringAfter("base64,")
                 ?: return@withContext null
             val bytes = Base64.decode(encoded, Base64.DEFAULT)
             val bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, BitmapFactory.Options().apply {
                 inPreferredConfig = Bitmap.Config.RGB_565
             }) ?: return@withContext null
+            frameFailStreak = 0
             Frame(bitmap, json.optLong("frameId"))
-        } catch (_: Exception) { null }
+        } catch (error: Exception) {
+            noteFrameFailure(error.javaClass.simpleName + ":" + error.message)
+            null
+        }
+    }
+
+    /** 连续拉帧失败计数与限流留痕：只在前几次和每 40 次记一条，避免 25fps 刷爆日志。 */
+    private fun noteFrameFailure(reason: String) {
+        frameFailStreak += 1
+        if (frameFailStreak == 3 || frameFailStreak % 40 == 0) {
+            VscrDiag.line("拉帧失败 连续=" + frameFailStreak + " 原因=" + reason.take(120))
+        }
     }
 
     private data class Frame(val bitmap: Bitmap, val id: Long)
@@ -1305,19 +1329,39 @@ internal object VirtualScreenFloatWindow {
     }
 
     /**
-     * 兜底看护：会话已经不存在，但浮窗还在屏幕上（定格最后一帧）时强制收起。
+     * 兜底看护：会话已经不存在，但浮窗还在屏幕上（定格最后一帧，或只剩气泡壳）时强制收起。
      * 这类状态机漏更新从外部看不出来，只能靠周期校验兜住。
+     *
+     * 幂等：init() 只调一次，重复调用不会叠出第二个轮询。
      */
     private fun startOrphanWatch() {
-        scope.launch {
+        if (orphanWatchJob?.isActive == true) return
+        orphanWatchJob = scope.launch {
             while (true) {
                 delay(2000)
                 val showing = rootView != null
                 if (!showing) continue
                 if (takeoverFull) continue
-                if (!VirtualScreenSession.isActive()) {
-                    VscrDiag.line("浮窗兜底 会话已结束，收起浮窗")
-                    hide()
+                // 两种都要收：helper 进程没了（isActive=false），
+                // 或者会话还在但 display 已被清空（状态机漏更新，画面其实已经没了）。
+                val sessionGone = !VirtualScreenSession.isActive()
+                val displayGone = VirtualScreenSession.state.value.display == null
+                if (!sessionGone && !displayGone) continue
+                VscrDiag.line(
+                    "浮窗兜底 会话已结束，收起浮窗 sessionGone=" + sessionGone + " displayGone=" + displayGone,
+                )
+                dismissedSessionId = null
+                hide()
+                // 收起之后必须给一句能看懂的反馈：否则用户只看到浮窗「自己消失了」，
+                // 不知道该重新发起一次操作就会重建灵屏。
+                runCatching {
+                    context?.let { ctx ->
+                        android.widget.Toast.makeText(
+                            ctx,
+                            ctx.getString(R.string.virtual_screen_ended_rebuild_hint),
+                            android.widget.Toast.LENGTH_LONG,
+                        ).show()
+                    }
                 }
             }
         }
@@ -1545,6 +1589,27 @@ internal object VirtualScreenFloatWindow {
 
     private fun expand() {
         val p = lp ?: return
+        /*
+         * 会话已经没了（helper 被回收／空闲超时／异常退出）时，展开只会得到一块没有画面的壳，
+         * 用户点的就是这个「胶囊」：看起来在、点开还是空的。直接收起并明确提示要重建。
+         */
+        val live = VirtualScreenSession.state.value.display
+        if (live == null || !VirtualScreenSession.isActive(live.owner)) {
+            VscrDiag.line("气泡展开 会话已结束，收起并提示重建 display=" + (live != null))
+            collapsed = false
+            dismissedSessionId = null
+            hide()
+            runCatching {
+                context?.let { ctx ->
+                    android.widget.Toast.makeText(
+                        ctx,
+                        ctx.getString(R.string.virtual_screen_ended_rebuild_hint),
+                        android.widget.Toast.LENGTH_LONG,
+                    ).show()
+                }
+            }
+            return
+        }
         rootView?.removeCallbacks(sinkRunnable)
         sinked = false
         collapsed = false

@@ -226,6 +226,22 @@ internal interface RuntimeRunDao : ChunkedTextDao {
         insertInFlightEvent(event)
         touchInFlightRun(event.runId, updatedAt)
     }
+
+    /**
+     * FK 竞态恢复：remove（deleteInFlightRun）与 append 并发时，父行可能恰在事件插入前被删，
+     * 导致 insert 触发 FOREIGN KEY constraint failed。这里把「补写父行 + 追加事件」合并为单事务，
+     * 保证要么父行与事件同时可见、要么都不写，消除 append/remove 之间的窗口。
+     */
+    @Transaction
+    suspend fun recoverAppendInFlightEvent(
+        seed: RuntimeInFlightRunEntity,
+        event: RuntimeInFlightEventEntity,
+        updatedAt: Long,
+    ) {
+        upsertInFlightRun(seed)
+        insertInFlightEvent(event)
+        touchInFlightRun(event.runId, updatedAt)
+    }
 }
 
 internal data class RuntimeArchiveRunWithEventsSeed(

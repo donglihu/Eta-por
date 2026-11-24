@@ -290,7 +290,8 @@ private fun String.toSafeResultLogFields(): String = buildString {
     }
 }
 
-private fun String.extractResultCode(): String? {
+/** 从结果摘要里取 `code=` 字段值；供事件日志与 perf 打点共用。 */
+internal fun String.extractResultCode(): String? {
     val fieldStart = when {
         startsWith(RESULT_CODE_MARKER) -> 0
         else -> RESULT_FIELD_SEPARATORS

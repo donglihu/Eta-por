@@ -21,12 +21,29 @@ internal data class SharedFolderMount(
 internal object SharedFolderMounts {
     const val PREFS_KEY = "linux_shared_mounts"
     const val MAX_MOUNTS = 16
-    const val LINUX_MOUNTS_ROOT = "/workspace/mounts"
+
+    /** guest 里的 workspace 根；chroot 后端由宿主 [HOST_WORKSPACE_ROOT] bind 得到。 */
+    const val LINUX_WORKSPACE_ROOT = "/workspace"
+    const val MOUNTS_DIR_NAME = "mounts"
+    const val LINUX_MOUNTS_ROOT = "$LINUX_WORKSPACE_ROOT/$MOUNTS_DIR_NAME"
     const val ANDROID_MOUNTS_ROOT = "/data/local/tmp/eta/mounts"
+
+    /**
+     * chroot 后端绑定到 rootfs `/workspace` 的宿主目录（与 [TerminalRuntime.ROOT_WORKSPACE_PATH] 同源）。
+     *
+     * workspace 内的共享源不能 bind 到 `/workspace/mounts/<name>`：那是 `mount --bind /a /a/b` 的自嵌套，
+     * 内核会给出递归视图；这类源改走符号链接，见 [workspaceLinkTarget]。
+     */
+    val HOST_WORKSPACE_ROOT: String = TerminalRuntime.ROOT_WORKSPACE_PATH
 
     private val NAME_PATTERN = Regex("[A-Za-z0-9._-]{1,48}")
 
-    /** 挂载源禁区：系统关键树、workspace 自身（环境里本就完整可见）与 /。 */
+    /**
+     * 挂载源禁区：系统关键树与 /。
+     *
+     * workspace（[HOST_WORKSPACE_ROOT]）本身与其子目录曾经也在这里，但它已经在环境里完整可见，
+     * 用户仍需要 `/workspace/mounts/<name>` 这类稳定挂载点给脚本统一引用，因此改为放行并走符号链接。
+     */
     private val FORBIDDEN_ROOTS = listOf(
         "/",
         "/proc",
@@ -36,7 +53,6 @@ internal object SharedFolderMounts {
         "/vendor",
         "/apex",
         "/product",
-        "/data/local/tmp/eta",
     )
 
     enum class SourceError {
@@ -91,6 +107,37 @@ internal object SharedFolderMounts {
         }
         if (existing.any { it.sourcePath == normalized }) return SourceError.DUPLICATE
         return null
+    }
+
+    /**
+     * workspace 内的共享源用符号链接接入，返回链接目标（guest 绝对路径）；不在 workspace 内返回 null（仍走 bind）。
+     *
+     * workspace 根映射成 `/workspace`，子目录映射成 `/workspace/<相对路径>`。
+     * 判断按整段前缀比较，`/data/local/tmp/eta2` 这类形近目录不算 workspace 内。
+     */
+    fun workspaceLinkTarget(
+        sourcePath: String,
+        workspaceRoot: String = HOST_WORKSPACE_ROOT,
+    ): String? {
+        val normalized = normalizeSourcePath(sourcePath) ?: return null
+        val root = normalizeSourcePath(workspaceRoot) ?: return null
+        if (normalized == root) return LINUX_WORKSPACE_ROOT
+        if (!normalized.startsWith("$root/")) return null
+        return "$LINUX_WORKSPACE_ROOT/${normalized.removePrefix("$root/")}"
+    }
+
+    /**
+     * 链接目标是否落进 mounts 根内部，从而形成回绕。
+     *
+     * 例：源 `/data/local/tmp/eta/mounts/MT2` 的链接目标是 `/workspace/mounts/MT2`，
+     * 而链接本身被创建在 `/workspace/mounts/<name>` 内，遍历会绕圈。
+     */
+    fun linkTargetLoopsBack(
+        linkTarget: String?,
+        mountsRoot: String = LINUX_MOUNTS_ROOT,
+    ): Boolean {
+        val target = linkTarget ?: return false
+        return target == mountsRoot || target.startsWith("$mountsRoot/")
     }
 
     fun validateName(name: String, existing: List<SharedFolderMount>): NameError? {

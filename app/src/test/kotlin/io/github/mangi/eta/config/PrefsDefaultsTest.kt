@@ -38,6 +38,26 @@ class PrefsDefaultsTest {
     }
 
     @Test
+    fun autoCompactionThresholdSnapsToCurrentChoices() {
+        // 档位改版后旧值必须吸附到最近的合法档位，不能让 UI 下拉选不中、也不能静默变成关闭。
+        assertEquals(listOf(0, 20, 30, 40, 50, 80, 90), Prefs.Keys.AUTO_COMPACTION_TRIGGER_PERCENT_CHOICES)
+        assertEquals(80, Prefs.Keys.AUTO_COMPACTION_TRIGGER_PERCENT_DEFAULT)
+        assertEquals(90, Prefs.Keys.AUTO_COMPACTION_TRIGGER_PERCENT_MAX)
+        assertEquals(0, Prefs.normalizeAutoCompactionPercent(0))
+        assertEquals(0, Prefs.normalizeAutoCompactionPercent(-5))
+        assertEquals(20, Prefs.normalizeAutoCompactionPercent(5))
+        assertEquals(20, Prefs.normalizeAutoCompactionPercent(20))
+        assertEquals(20, Prefs.normalizeAutoCompactionPercent(25))
+        assertEquals(40, Prefs.normalizeAutoCompactionPercent(40))
+        // 旧档位 60/70/85/95 吸附到新档位，不落到 0。
+        assertEquals(50, Prefs.normalizeAutoCompactionPercent(60))
+        assertEquals(80, Prefs.normalizeAutoCompactionPercent(70))
+        assertEquals(80, Prefs.normalizeAutoCompactionPercent(85))
+        assertEquals(90, Prefs.normalizeAutoCompactionPercent(95))
+        assertEquals(90, Prefs.normalizeAutoCompactionPercent(100))
+    }
+
+    @Test
     fun localAgentKeysMatchRuntimeOwnedSettings() {
         assertEquals(
             setOf(

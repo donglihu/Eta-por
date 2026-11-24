@@ -4,6 +4,8 @@ import android.content.Context
 import androidx.room.withTransaction
 import io.github.mangi.eta.agent.model.AgentConversationCodec
 import io.github.mangi.eta.agent.model.AgentModelClient
+import io.github.mangi.eta.agent.model.ConversationTitlePolicy
+import io.github.mangi.eta.agent.media.AgentChatImageStore
 import io.github.mangi.eta.agent.roleplay.RoleplayBinding
 import io.github.mangi.eta.agent.roleplay.RoleplayMessageState
 import io.github.mangi.eta.data.db.ConversationCategoryEntity
@@ -203,7 +205,7 @@ internal object AgentConversationStore {
                             while (prefix < minOf(oldMessages.size, state.messages.size)) {
                                 val before = oldMessages[prefix]
                                 val after = state.messages[prefix]
-                                if (before != after && before.toEntityOrNull(id, prefix) != after.toEntityOrNull(id, prefix)) break
+                                if (before != after && before.toEntityOrNull(id, prefix, appContext) != after.toEntityOrNull(id, prefix, appContext)) break
                                 prefix++
                             }
                             if (old == null || prefix != oldMessages.size || prefix != state.messages.size) {
@@ -211,7 +213,7 @@ internal object AgentConversationStore {
                                 dao.deleteMessagesFrom(id, prefix)
                                 for (index in prefix until state.messages.size) {
                                     phase = "encode_message"
-                                    val row = state.messages[index].toEntityOrNull(id, index) ?: continue
+                                    val row = state.messages[index].toEntityOrNull(id, index, appContext, materializeImages = true) ?: continue
                                     phase = "write_message"
                                     dao.insertMessages(listOf(row))
                                 }
@@ -277,7 +279,7 @@ internal object AgentConversationStore {
 
         conversations.forEach { conversation ->
             if (conversation.id in fullyLoadedIds) {
-                states[conversation.id] = buildLoadedState(dao, conversation, unaligned)
+                states[conversation.id] = buildLoadedState(context, dao, conversation, unaligned)
             } else {
                 states[conversation.id] = buildPlaceholderState(conversation)
                 partiallyLoaded += conversation.id
@@ -287,6 +289,8 @@ internal object AgentConversationStore {
             if (conversation.pinned) pinned[conversation.id] = true
             conversation.categoryId?.let { cid -> categoryIds[conversation.id] = cid }
         }
+
+        repairInjectedTitles(dao, conversations, titles)
 
         return Snapshot(
             selectedConversationId = selected,
@@ -302,15 +306,69 @@ internal object AgentConversationStore {
         )
     }
 
+    /**
+     * 旧库脏标题自愈：把历史里已经落成 `<skill_command id="pua"` 这类注入块残片的标题重算一次。
+     *
+     * 为什么必须做：本轮只修好了「新消息怎么命名」，而真机上脏标题已经写进 `conversations.title`，
+     * 列表每次启动都从库里读回来，不修就永远显示那串标签。这里按首条用户消息重算并回写，
+     * 只改标题、不动 `updated_at`，避免修一次标题就让整个会话列表顺序乱掉。
+     *
+     * 重算不出内容（比如首条消息只有技能块、没有任务描述）时保留原样，宁可留着旧标题也不写空。
+     */
+    private suspend fun repairInjectedTitles(
+        dao: ConversationDao,
+        conversations: List<ConversationMetadata>,
+        titles: MutableMap<String, String>,
+    ) {
+        val dirty = conversations.filter { conversation ->
+            ConversationTitlePolicy.looksLikeInjectedTitle(
+                conversation.title.takeUnless { it == LEGACY_UNNAMED_TITLE }.orEmpty(),
+            )
+        }
+        if (dirty.isEmpty()) return
+        val repaired = runCatching {
+            val rows = dao.firstUserMessages(dirty.map { it.id })
+            val contents = rows.associate { row ->
+                row.conversationId to dao.restoreText(
+                    "conversation_messages", row.id, "content", row.content,
+                )
+            }
+            dirty.mapNotNull { conversation ->
+                val content = contents[conversation.id] ?: return@mapNotNull null
+                val title = ConversationTitlePolicy.fromMessage(content)
+                title.takeIf(String::isNotBlank)?.let { conversation.id to it }
+            }
+        }.getOrElse { failure ->
+            AndroidAgentLogger.warn(
+                "Conversation title repair skipped: type=${failure.safeLogType()}",
+            )
+            emptyList()
+        }
+        if (repaired.isEmpty()) return
+        runCatching {
+            // 逐条回写：标题自愈不是关键路径，单条失败不影响其它会话，也不需要显式事务。
+            repaired.forEach { (id, title) ->
+                dao.updateConversationTitleOnly(id, title)
+                titles[id] = title
+            }
+        }.onFailure { failure ->
+            // 回写失败不能影响启动：内存里已经改好，下次启动再试一次即可。
+            AndroidAgentLogger.warn(
+                "Conversation title repair write failed: type=${failure.safeLogType()}",
+            )
+        }
+    }
+
     /** 把一个会话的消息与上下文完整读进内存；口径与原启动加载完全一致。 */
     suspend fun loadConversation(context: Context, conversationId: String): AgentChatHomeUiState? =
         withContext(Dispatchers.IO) {
             val dao = EtaDatabase.get(context.applicationContext).conversationDao()
             val conversation = dao.conversation(conversationId) ?: return@withContext null
-            buildLoadedState(dao, conversation, mutableSetOf())
+            buildLoadedState(context.applicationContext, dao, conversation, mutableSetOf())
         }
 
     private suspend fun buildLoadedState(
+        appContext: Context,
         dao: ConversationDao,
         conversation: ConversationMetadata,
         unaligned: MutableSet<String>,
@@ -324,7 +382,7 @@ internal object AgentConversationStore {
                 offset += page.size
             }
         }
-        val restored = messages.mapNotNull { it.toMessageOrNull() }
+        val restored = restoreMessagesWithImageMigration(appContext, dao, conversation.id, messages)
         if (restored.size != messages.size || messages.withIndex().any { (index, row) -> row.sortIndex != index }) {
             unaligned += conversation.id
         }
@@ -341,7 +399,7 @@ internal object AgentConversationStore {
             messages = restored,
             history = AgentConversationCodec.decodeTranscript(checkpoint?.historyJson)
                 .ifEmpty {
-                    messages.toLegacyHistory()
+                    restored.toLegacyHistory()
                 },
             appliedRuntimeRunIds = conversation.appliedRuntimeRunIdsJson.toStringList(),
             input = "",
@@ -356,6 +414,54 @@ internal object AgentConversationStore {
                 if (repaired.history != original.history || repaired.journal != original.journal) unaligned += conversation.id
             }
         }.let(RoleplayConversationReducer::decorate)
+    }
+
+    /**
+     * 还原消息并顺带做图片落盘迁移（11-22 OOM 修复）。
+     *
+     * 旧库里 `images_json` 是 base64 data URL，还原进内存就是几十 MB 的常驻字符串。
+     * 这里选「按需读取时落盘一次再转路径」：还原时把 data URL 写成文件、
+     * 当场回写数据库（storeText 会清掉旧分块），内存里只留路径。
+     * 单条迁移失败不影响其它消息，失败的那条保留原 data URL（行为同旧版）。
+     */
+    private suspend fun restoreMessagesWithImageMigration(
+        appContext: Context,
+        dao: ConversationDao,
+        conversationId: String,
+        messages: List<ConversationMessageEntity>,
+    ): List<AgentChatMessageUi> {
+        val migratedJsonById = mutableMapOf<String, String>()
+        val restored = messages.mapNotNull { entity ->
+            if (entity.type != TYPE_USER) return@mapNotNull entity.toMessageOrNull()
+            val references = entity.imagesJson.toStringList()
+            if (references.isEmpty() || references.all(AgentChatImageStore::isPathReference)) {
+                return@mapNotNull entity.toMessageOrNull()
+            }
+            val migrated = AgentChatImageStore.persistImages(appContext, references)
+            if (migrated == references) return@mapNotNull entity.toMessageOrNull()
+            migratedJsonById[entity.id] = migrated.toJsonArrayString()
+            UserMessageUi(
+                id = entity.id,
+                content = entity.content,
+                images = migrated,
+                isEdited = entity.isEdited,
+                createdAt = entity.createdAt,
+            )
+        }
+        if (migratedJsonById.isEmpty()) return restored
+        runCatching {
+            migratedJsonById.forEach { (messageId, imagesJson) ->
+                dao.setMessageImages(messageId, dao.storeText("conversation_messages", messageId, "images", imagesJson))
+            }
+        }.onFailure { failure ->
+            // 回写失败只影响「下次加载再迁一次」，内存里已经是路径，不阻断会话加载。
+            AndroidAgentLogger.error(
+                "Conversation image migration write failed: conversation=$conversationId " +
+                    "count=${migratedJsonById.size} type=${failure.safeLogType()}",
+                failure,
+            )
+        }
+        return restored
     }
 
     /** 未加载会话的占位状态：只有元数据，messages / journal / history 为空，列表摘要靠 previews。 */
@@ -387,6 +493,9 @@ internal object AgentConversationStore {
     private fun AgentChatMessageUi.toEntityOrNull(
         conversationId: String,
         sortIndex: Int,
+        appContext: Context? = null,
+        /** 对比用：只在真正写库时落盘图片，前后对比不产生文件 I/O。 */
+        materializeImages: Boolean = false,
     ): ConversationMessageEntity? =
         when (this) {
             is UserMessageUi -> ConversationMessageEntity(
@@ -395,7 +504,10 @@ internal object AgentConversationStore {
                 sortIndex = sortIndex,
                 type = TYPE_USER,
                 content = content,
-                imagesJson = images.toJsonArrayString(),
+                imagesJson = when {
+                    !materializeImages || appContext == null -> images.toJsonArrayString()
+                    else -> AgentChatImageStore.persistImages(appContext, images).toJsonArrayString()
+                },
                 isEdited = isEdited,
                 createdAt = createdAt,
             )
@@ -466,6 +578,8 @@ internal object AgentConversationStore {
                 argumentsSummary = argumentsSummary,
                 resultSummary = resultSummary,
                 imageCount = imageCount,
+                // 只持久化运行中的起点：它是「切会话不归零」的唯一跨状态来源。
+                toolStartedAt = startedAtMillis,
             )
 
             is ToolSummaryMessageUi -> ConversationMessageEntity(
@@ -554,6 +668,7 @@ internal object AgentConversationStore {
                 command = content.takeIf(String::isNotBlank),
                 resultSummary = resultSummary,
                 imageCount = imageCount,
+                startedAtMillis = toolStartedAt,
             )
 
             TYPE_TOOL_SUMMARY -> ToolSummaryMessageUi(
@@ -586,14 +701,18 @@ internal object AgentConversationStore {
             }
         }.getOrDefault(emptyList())
 
-    private fun List<ConversationMessageEntity>.toLegacyHistory(): List<AgentModelClient.ConversationMessage> =
+    /**
+     * 无 checkpoint 的旧会话兜底历史：从迁移后的消息（图片为路径引用）生成，
+     * 不再碰原始 entity —— 否则旧库 base64 会经这条链再进一次堆（11-22 OOM 修复）。
+     */
+    private fun List<AgentChatMessageUi>.toLegacyHistory(): List<AgentModelClient.ConversationMessage> =
         mapNotNull { message ->
-            when (message.type) {
-                TYPE_USER -> AgentModelClient.ConversationMessage(
+            when (message) {
+                is UserMessageUi -> AgentModelClient.ConversationMessage(
                     role = "user",
                     content = message.content,
                 )
-                TYPE_ASSISTANT -> message.content
+                is AgentMessageUi -> message.content
                     .takeIf { it.isNotBlank() }
                     ?.let { content ->
                         AgentModelClient.ConversationMessage(

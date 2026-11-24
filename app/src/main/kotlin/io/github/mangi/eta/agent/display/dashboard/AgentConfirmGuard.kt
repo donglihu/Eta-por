@@ -239,6 +239,37 @@ internal object AgentConfirmGuard {
     }
 
     /**
+     * 严格档审查：非只读工具一律先问，不做风险判定（用户选择了「严格」就默认全部可疑）。
+     *
+     * 与 [inspectTool] 的区别：后者按 [ConfirmRiskDetector] 的规则只拦高风险；
+     * 这里跳过判定，只要工具会改状态就弹卡。
+     */
+    fun requestReview(
+        context: Context?,
+        toolName: String,
+        args: org.json.JSONObject,
+        runId: String = "",
+    ): ConfirmDraft? {
+        val target = when (toolName) {
+            "terminal", "terminal_job", "terminal_daemon" -> args.optString("command").take(40)
+            else -> args.optString("path").take(40)
+        }
+        return register(
+            context = context,
+            draft = ConfirmDraft(
+                risk = ConfirmRisk.IRREVERSIBLE,
+                title = "确认执行 $toolName",
+                fields = listOf(ConfirmField("工具", toolName)),
+            ),
+            target = target,
+            action = toolName,
+            runId = runId,
+            toolName = toolName,
+            toolArgs = args.toString().take(MAX_TOOL_ARGS),
+        )
+    }
+
+    /**
      * 非 GUI 工具（terminal / write_file …）的拦截入口。
      *
      * 与 GUI 共用同一张卡、同一套 grant 与回灌，只是判定换成
@@ -265,6 +296,31 @@ internal object AgentConfirmGuard {
             toolArgs = args.toString().take(MAX_TOOL_ARGS),
         )
     }
+
+    /**
+     * 直接登记一份已经判好的草稿。
+     *
+     * 供工具调用审查档位（严格档 / 智能档）使用：这两档的判定结论已经在策略层产生了，
+     * 再跑一遍 [inspectTool] 会得到不同结果（严格档本就没有规则依据），
+     * 所以这里提供「拿着草稿直接挂卡」的入口，与 [register] 同一套宽限期 / 去重 / 落卡逻辑。
+     */
+    fun registerDraft(
+        context: Context?,
+        draft: ConfirmDraft,
+        target: String?,
+        action: String,
+        runId: String = "",
+        toolName: String = "",
+        toolArgs: String = "",
+    ): ConfirmDraft? = register(
+        context = context,
+        draft = draft,
+        target = target,
+        action = action,
+        runId = runId,
+        toolName = toolName,
+        toolArgs = toolArgs.take(MAX_TOOL_ARGS),
+    )
 
     /** GUI 与非 GUI 共用的登记路径：宽限期、去重、落卡、通知、暂停。 */
     private fun register(
@@ -388,6 +444,14 @@ internal object AgentConfirmGuard {
         resume(context)
         AndroidAgentLogger.info("Confirm chose token=$token option=$optionId")
         EtaTrace.log("confirm.choose", "option=$optionId title=${current.title.take(40)}")
+        // 打点：这张卡从挂出到用户裁决等了多久——「会话几分钟不动」很多时候就是在等这一步。
+        val waited = System.currentTimeMillis() - current.createdAt
+        EtaTrace.log(
+            "perf.confirm.wait",
+            "option=$optionId source=${current.source} risk=${current.risk} " +
+                "tool=${current.toolName.ifBlank { "-" }} " +
+                "waited_ms=$waited",
+        )
         return reply
     }
 
@@ -497,9 +561,14 @@ internal object AgentConfirmGuard {
         allowMultiple: Boolean = false,
         runId: String = "",
     ): String {
-        // 一次只留一张卡：直接覆盖会让上一问凭空消失，用户还没答就丢了。
+        // 一次只留一张**提问**卡：直接覆盖会让上一问凭空消失，用户还没答就丢了。
+        // 但审批卡（资金 / 隐私 / 不可撤销）不算占用：它和「向用户提问」是两件事，
+        // 之前只要有任何待答卡就返回 PROMPT_PENDING，导致模型在有待审批时永远问不出问题，
+        // 用户只看到审批弹窗、看不到带选项的提问（实测踩到）。
         val owner = conversationOfRun(runId).ifBlank { currentConversation }
-        val existing = mutablePendings.value.firstOrNull { it.conversationKey == owner && !it.expired() }
+        val existing = mutablePendings.value.firstOrNull {
+            it.conversationKey == owner && !it.expired() && it.source == PendingApproval.SOURCE_ASK
+        }
         if (existing != null) {
             return JSONObject()
                 .put("ok", false)

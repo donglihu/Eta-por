@@ -7,12 +7,14 @@ import io.github.mangi.eta.agent.runtime.AgentRunController
 import io.github.mangi.eta.agent.runtime.AgentTokenUsage
 import io.github.mangi.eta.agent.roleplay.RoleplayRunContext
 import io.github.mangi.eta.agent.subagent.AgentSubagentToolCatalog
+import io.github.mangi.eta.core.EtaTrace
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.supervisorScope
 import org.json.JSONArray
+import org.json.JSONException
 import org.json.JSONObject
 
 /**
@@ -36,6 +38,11 @@ internal class AgentLoop(
     private val remoteToolNames: Set<String> = emptySet(),
     private val modelRetry: AgentModelRetry = AgentModelRetry(),
     private val sessionId: String = java.util.UUID.randomUUID().toString(),
+    /**
+     * 并发闸门的会话键：同一对话的工具实例串行、跨对话按资源并行。
+     * 默认沿用 [sessionId]（构造点不必逐个改），跨对话场景由上层显式传入。
+     */
+    private val conversationKey: String = sessionId,
     private val transcript: JSONArray = JSONArray(),
     private val systemCount: Int = 0,
     private val operationId: String = sessionId,
@@ -43,6 +50,11 @@ internal class AgentLoop(
     private val onTranscript: (List<AgentModelClient.ConversationMessage>) -> Unit = {},
     private val purpose: ProviderRequestPurpose = ProviderRequestPurpose.CHAT,
     private val roleplayContext: RoleplayRunContext? = null,
+    /**
+     * 超长工具结果的落盘钩子：返回全文的绝对路径；返回 null 表示本次未落盘（截断说明里就不给路径）。
+     * 钩子自己负责「失败可见」（日志或错误码），循环不吞异常。
+     */
+    private val spillToolResult: ((toolName: String, toolCallId: String, content: String) -> String?)? = null,
     initialSupplementIndex: Int = 0,
     /** 用户补充指令被注入成新的一轮时回调：Plan 模式据此重新武装闸门并清空上一轮清单。 */
     private val onUserTurnAppended: (() -> Unit)? = null,
@@ -240,7 +252,12 @@ internal class AgentLoop(
                 val outcomes = executeToolBatch(round, toolCalls, providerResponse.stopReason)
                 publishToolDuration(round, (SystemClock.elapsedRealtime() - batchStartedAt).coerceAtLeast(0))
                 outcomes.forEach { outcome ->
-                    appendMessage(AgentConversationCodec.toolResultMessage(outcome.call, outcome.result))
+                    appendMessage(
+                        AgentConversationCodec.toolResultMessage(
+                            outcome.call,
+                            boundedToolResult(outcome),
+                        ),
+                    )
                 }
                 publishTranscript()
                 appendToolImages(round, outcomes)
@@ -488,10 +505,60 @@ internal class AgentLoop(
             )
         )
 
-        val result = try {
-            // 并发会话共用一块屏幕和一个终端环境：需要独占的工具在这里全局排队。
-            AgentToolGate.withGate(toolCall.name) { toolExecutor.execute(roundCall) }
+        // 参数解析不许静默降级：坏 JSON 会让域键退化（FS 变 workspace、SCREEN 变 main），
+        // 等于把「串行」悄悄降成「不串行」，所以直接在调用前拒掉，让模型看到 INVALID_TOOL_ARGUMENTS。
+        val rawArguments = roundCall.argumentsJson
+        val args = if (rawArguments.isBlank()) {
+            JSONObject()
+        } else {
+            try {
+                JSONObject(rawArguments)
+            } catch (error: JSONException) {
+                EtaTrace.log("perf.tool.args_invalid", "name=${roundCall.name} err=${error.message}")
+                return rejectedToolOutcome(
+                    round = round,
+                    toolCall = roundCall,
+                    code = "INVALID_TOOL_ARGUMENTS",
+                    message = "工具参数不是合法 JSON：${error.message}",
+                )
+            }
+        }
 
+        val result = try {
+            // 并发会话共用一块屏幕、一条终端、一套系统设置：按资源域排队，而不是一把全局锁。
+            // 关闭开关（AgentResourceGate.enabled = false）时退回旧的全局锁，行为与改动前一致。
+            AgentResourceGate.dispatch(
+                toolName = roundCall.name,
+                args = args,
+                conversationKey = conversationKey,
+                action = args.optString("action"),
+                isCancelled = { runController.isCancelled },
+            ) {
+                toolExecutor.execute(roundCall)
+            }
+        } catch (busy: AgentResourceGate.GateTimeout) {
+            AgentModelClient.ToolResult(
+                content = JSONObject()
+                    .put("ok", false)
+                    .put("code", "RESOURCE_BUSY")
+                    .put(
+                        "message",
+                        "资源 ${busy.slotKey} 被 ${busy.holder ?: "其它会话"} 占用，本轮未执行；可稍后重试",
+                    )
+                    .put("retry_after_ms", 2_000)
+                    .toString(),
+            )
+        } catch (reentrant: AgentResourceGate.GateReentrant) {
+            AgentModelClient.ToolResult(
+                content = JSONObject()
+                    .put("ok", false)
+                    .put("code", "RESOURCE_REENTRANT")
+                    .put("message", "域 ${reentrant.slotKey} 内重复申请，已拒绝")
+                    .toString(),
+            )
+        } catch (cancelled: AgentResourceGate.GateCancelled) {
+            runController.throwIfCancelled()
+            throw cancelled
         } catch (throwable: Exception) {
             runController.throwIfCancelled()
             AgentModelClient.ToolResult(
@@ -555,6 +622,28 @@ internal class AgentLoop(
                 command = result.command,
             )
         )
+    }
+
+    /**
+     * 工具结果进入会话前的统一收口。
+     *
+     * 超长结果先尝试落盘（拿不到路径也照样截断），再按 [AgentToolResultBudget] 保留头尾。
+     * 会话里只留截断后的一份文本，避免同一份几万字符在 messages / transcript / checkpoint /
+     * 子代理历史里各存一份。
+     */
+    private fun boundedToolResult(outcome: ToolOutcome): AgentModelClient.ToolResult {
+        val original = outcome.result
+        if (original.content.length <= AgentToolResultBudget.MAX_CHARS) return original
+        val spillPath = spillToolResult
+            ?.takeIf { original.content.length >= AgentToolResultBudget.SPILL_MIN_CHARS }
+            ?.invoke(outcome.call.name, outcome.call.id, original.content)
+        val bounded = AgentToolResultBudget.bounded(outcome.call.name, original.content, spillPath)
+        EtaTrace.log(
+            "tool.result.truncated",
+            "name=${outcome.call.name} original=${original.content.length} " +
+                "kept=${bounded.length} spill=${spillPath ?: "none"}",
+        )
+        return original.copy(content = bounded)
     }
 
     private fun appendToolImages(

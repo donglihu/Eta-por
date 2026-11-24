@@ -25,9 +25,12 @@ class AgentDeviceResultFormatterTest {
 
     @Test
     fun unavailableLocationDoesNotHideValidTimeOrInventCoordinates() {
+        // get_current_context 现在读不到位置就不带 location 字段，历史记录里仍可能存有旧格式。
+        assertEquals("2026-10-28 08:30 -05:00", AgentDeviceResultFormatter.summarize(
+            "get_current_context", JSONObject("""{"datetime":"2026-10-28T08:30:00-05:00"}"""),
+        ))
         val statuses = mapOf(
             "permission_required" to "位置未授权",
-            "background_permission_required" to "后台位置未授权",
             "location_disabled" to "系统定位已关闭",
             "unavailable" to "暂无最近位置",
         )

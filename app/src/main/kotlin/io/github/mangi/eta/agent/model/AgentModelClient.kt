@@ -2,6 +2,8 @@ package io.github.mangi.eta.agent.model
 
 import io.github.mangi.eta.agent.prompt.AgentToolPolicyStore
 import io.github.mangi.eta.agent.prompt.PromptCustomizationStore
+import io.github.mangi.eta.agent.prompt.PromptJailbreakStore
+import io.github.mangi.eta.agent.expert.ExpertStore
 import io.github.mangi.eta.agent.runtime.AgentEvent
 import io.github.mangi.eta.agent.runtime.AgentRunController
 import io.github.mangi.eta.agent.memory.AgentMemoryContext
@@ -11,6 +13,7 @@ import io.github.mangi.eta.config.Prefs
 import io.github.mangi.eta.agent.tool.AgentToolCapabilities
 import io.github.mangi.eta.agent.tool.AgentToolRequirements
 import io.github.mangi.eta.agent.tool.PlanModePolicy
+import io.github.mangi.eta.core.StableLogType
 import io.github.mangi.eta.data.model.AnthropicProviderSetting
 import io.github.mangi.eta.data.model.CustomBody
 import io.github.mangi.eta.data.model.CustomHeader
@@ -56,6 +59,7 @@ internal object AgentModelClient {
                     thinkingEnabled = effort.enablesReasoning,
                     reasoningEffort = effort,
                     autoCompactionEnabled = Prefs.isEnabled(Prefs.Keys.AGENT_AUTO_COMPACTION_ENABLED),
+                    autoCompactionTriggerPercent = Prefs.autoCompactionTriggerPercent(),
                     subagentTools = Prefs.isEnabled(Prefs.Keys.AGENT_SUBAGENT_ENABLED),
                 )
             }
@@ -75,6 +79,7 @@ internal object AgentModelClient {
             modelDisplayName = "GPT-5.5",
             systemPrompt = BuiltinProviders.DEFAULT_SYSTEM_PROMPT,
             autoCompactionEnabled = Prefs.isEnabled(Prefs.Keys.AGENT_AUTO_COMPACTION_ENABLED),
+            autoCompactionTriggerPercent = Prefs.autoCompactionTriggerPercent(),
             subagentTools = Prefs.isEnabled(Prefs.Keys.AGENT_SUBAGENT_ENABLED),
             terminalTools = Prefs.isEnabled(Prefs.Keys.AGENT_TERMINAL_TOOLS),
             browserTools = Prefs.isEnabled(Prefs.Keys.AGENT_BROWSER_TOOLS),
@@ -102,6 +107,8 @@ internal object AgentModelClient {
         executionContext: TerminalExecutionContext? = null,
         capabilitiesProvider: () -> AgentToolCapabilities = { AgentToolCapabilities(rootAvailable = false) },
         sessionId: String = java.util.UUID.randomUUID().toString(),
+        /** 并发闸门的会话键：默认沿用 sessionId；跨对话入口传对话 id，让同对话的工具串行。 */
+        conversationKey: String = sessionId,
         compactOnly: Boolean = false,
         operationId: String = sessionId,
         initialUserMessageId: String = "user-$operationId",
@@ -113,6 +120,8 @@ internal object AgentModelClient {
         onContextSnapshot: (AgentContextSnapshot) -> Unit = {},
         onTranscript: (List<ConversationMessage>) -> Unit = {},
         restrictedToolNames: Set<String>? = null,
+        /** 超长工具结果的落盘钩子；返回全文绝对路径，null 表示不落盘。 */
+        toolResultSpill: ((toolName: String, toolCallId: String, content: String) -> String?)? = null,
         /** `update_plan` 是否可用：只有主会话的计划面板算数，子代理与复盘不得覆盖它。 */
         planToolsEnabled: Boolean = true,
         onEvent: (AgentEvent) -> Unit = {}
@@ -120,6 +129,8 @@ internal object AgentModelClient {
         config.validate()
         // 自定义提示词与工具白名单是正式配置：每次 run 开始读一次，避免轮内改动让前缀反复失效。
         val customization = PromptCustomizationStore.load()
+        val jailbreak = PromptJailbreakStore.load()
+        val activeExpert = ExpertStore.active()
         val toolPolicy = AgentToolPolicyStore.load()
         val initialCapabilities = capabilitiesProvider()
         val messages = AgentPromptBuilder.buildInitialMessages(
@@ -136,6 +147,8 @@ internal object AgentModelClient {
             virtualScreenFallbackEnabled = initialCapabilities.virtualScreenFallbackEnabled,
             customization = customization,
             planMode = initialCapabilities.planMode,
+            jailbreak = jailbreak,
+            expert = activeExpert,
         )
         if (rewriteReply) {
             messages.put(messages.length() - 1, AgentConversationCodec.userTextMessage(
@@ -154,7 +167,7 @@ internal object AgentModelClient {
         val transcript = JSONArray()
         // 旧 history 中的无效消息可能在组装时被跳过，系统边界不能由 history 条数倒推。
         val systemCount = AgentPromptBuilder.buildSystemMessages(
-            config, skillContext, memoryContext, initialCapabilities.rootAvailable, roleplayContext, executionContext, initialCapabilities.virtualScreenEnabled, initialCapabilities.virtualScreenFallbackEnabled, customization, initialCapabilities.planMode,
+            config, skillContext, memoryContext, initialCapabilities.rootAvailable, roleplayContext, executionContext, initialCapabilities.virtualScreenEnabled, initialCapabilities.virtualScreenFallbackEnabled, customization, initialCapabilities.planMode, jailbreak, activeExpert,
         ).length()
         // MCP 工具只在 run 开始时压一次：每轮重复解析这 190KB JSON 纯属浪费。
         val remoteToolNames = (0 until additionalTools.length()).mapNotNull { index ->
@@ -189,7 +202,10 @@ internal object AgentModelClient {
             // 子代理用 toolFilter 在父工具目录上裁剪；主运行不传，走原样。
             // 不做 plan 阶段的目录过滤：原生只读边界已下放到审批闸门 + 提示词，
             // 目录少一个工具并不等于拦住写入，反而让 Runtime 与界面的模型见过的工具不一致。
-            return toolFilter?.invoke(built) ?: built
+            val filtered = toolFilter?.invoke(built) ?: built
+            // 专家工具集：白名单为空表示继承全量，黑名单优先；声明与执行用同一个函数，
+            // 避免「目录里没了但真调用还能跑」的两套口径。
+            return activeExpert?.let { expert -> expertFilterTools(expert, filtered) } ?: filtered
         }
         val tools = toolsFor(initialCapabilities)
         // 只在请求侧丢最老轮次：数据库与界面一条不删；系统提示、记忆与当前输入永不裁。
@@ -223,7 +239,7 @@ internal object AgentModelClient {
                 capabilities.virtualScreenEnabled != promptVirtualScreenEnabled ||
                 capabilities.virtualScreenFallbackEnabled != promptVirtualScreenFallbackEnabled) {
                 val systemMessages = AgentPromptBuilder.buildSystemMessages(
-                    config, skillContext, memoryContext, capabilities.rootAvailable, roleplayContext, executionContext, capabilities.virtualScreenEnabled, capabilities.virtualScreenFallbackEnabled, customization, capabilities.planMode,
+                    config, skillContext, memoryContext, capabilities.rootAvailable, roleplayContext, executionContext, capabilities.virtualScreenEnabled, capabilities.virtualScreenFallbackEnabled, customization, capabilities.planMode, jailbreak, activeExpert,
                 )
                 for (index in 0 until systemMessages.length()) {
                     messages.put(index, systemMessages.getJSONObject(index))
@@ -248,11 +264,18 @@ internal object AgentModelClient {
         // 它不裁剪工具目录——工具照常声明，只是把「先计划」从口头约定变成确定性行为。
         val planGateActive = initialCapabilities.planMode && planToolsEnabled && !rewriteReply && !compactOnly
         val planGate = io.github.mangi.eta.agent.tool.PlanGate(active = planGateActive)
-        // 运行中用户补发指令＝新的一轮：清空上一轮清单并重新武装闸门。
+        // 运行中用户补发指令＝新的一轮：重新武装闸门。
         // 以前闸门一个 run 只武装一次，第二轮起的插话都会绕过「先计划」直接动手，
         // 表现就是「开着 Plan 模式，多轮对话后不生效」。
+        //
+        // 2026-11-20 用户反馈「任务待办列表没有显示」：这里原来还会下发
+        // AgentEvent.PlanUpdated("") 把面板清空——执行阶段每插一句话，
+        // 用户正在看的执行清单就被抹掉，模型不重新交清单就一直空着。
+        // 闸门重新武装是安全语义（副作用工具仍要等新清单），保留；
+        // 清 UI 是纯装饰，删掉：面板上的旧清单等新一轮 update_plan 自然替换，
+        // 新 run 的清空仍由 launchConversationRun 的 planSteps = emptyList() 负责。
         fun armPlanForNewUserTurn() {
-            if (planGate.armForNewUserTurn()) onEvent(AgentEvent.PlanUpdated(""))
+            planGate.armForNewUserTurn()
         }
         val loop = AgentLoop(
             transcript = transcript,
@@ -261,16 +284,26 @@ internal object AgentModelClient {
             onContextSnapshot = if (rewriteReply) ({ _ -> }) else onContextSnapshot,
             onTranscript = onTranscript,
             sessionId = sessionId,
+            conversationKey = conversationKey,
             config = config,
             messages = messages,
             tools = tools,
             provider = provider,
             toolExecutor = ToolExecutor { call ->
                 if (call.name == PlanModePolicy.PLAN_TOOL_NAME) {
+                    // 两道门：① 子代理/复盘不得覆盖主会话面板；② 本 run 压根没开计划模式。
+                    // ② 是 2026-11-22 补的：工具目录已经不再声明 update_plan，但模型可能凭历史
+                    // 记忆或 MCP 同名工具硬调，这里必须同样拒绝，否则非计划会话仍会冒出计划面板。
                     if (!planToolsEnabled) {
                         ToolResult(
                             JSONObject().put("ok", false).put("code", "PLAN_TOOL_DISABLED")
                                 .put("message", "计划清单只由主会话维护，本次调用未生效。").toString(),
+                        )
+                    } else if (!initialCapabilities.planMode) {
+                        ToolResult(
+                            JSONObject().put("ok", false).put("code", "PLAN_MODE_OFF")
+                                .put("message", "本次运行未启用计划模式，${PlanModePolicy.PLAN_TOOL_NAME} 未执行；" +
+                                    "直接按用户要求推进任务，不要输出计划清单，也不要用文字代替清单。").toString(),
                         )
                     } else {
                         val published = publishPlan(call, onEvent)
@@ -287,6 +320,9 @@ internal object AgentModelClient {
                             .put("code", PlanModePolicy.CODE_PLAN_REQUIRED_FIRST)
                             .put("message", PlanModePolicy.planRequiredFirstMessage(call.name)).toString(),
                     )
+                } else if (activeExpert != null && !activeExpert.toolAllowed(call.name)) {
+                    ToolResult(JSONObject().put("ok", false).put("code", "TOOL_NOT_ALLOWED_BY_EXPERT")
+                        .put("message", "该工具不在当前专家的工具集内，未执行；要放宽请改专家定义或取消召唤").toString())
                 } else if (!toolPolicy.allows(call.name)) {
                     ToolResult(JSONObject().put("ok", false).put("code", "TOOL_NOT_ALLOWED_BY_POLICY")
                         .put("message", "该工具不在本次工具白名单中，未执行").toString())
@@ -313,6 +349,7 @@ internal object AgentModelClient {
             roleplayContext = roleplayContext,
             initialSupplementIndex = initialSupplementIndex,
             onUserTurnAppended = ::armPlanForNewUserTurn,
+            spillToolResult = toolResultSpill,
             remoteToolNames = remoteToolNames,
             toolsForRound = ::toolsForRound,
         )
@@ -343,6 +380,26 @@ internal object AgentModelClient {
     }
 
     private fun toolName(tool: JSONObject): String? = tool.optJSONObject("function")?.optString("name")
+
+    /**
+     * 专家工具集过滤。
+     *
+     * 白名单非空（且不只是 `*`）时只保留白名单；黑名单永远优先。
+     * 与执行侧的 [io.github.mangi.eta.agent.expert.Expert.toolAllowed] 共用同一语义。
+     */
+    private fun expertFilterTools(
+        expert: io.github.mangi.eta.agent.expert.Expert,
+        tools: JSONArray,
+    ): JSONArray {
+        if (!expert.restrictsTools && expert.disallowedTools.isEmpty()) return tools
+        return JSONArray().also { kept ->
+            for (index in 0 until tools.length()) {
+                val schema = tools.optJSONObject(index) ?: continue
+                val name = schema.optJSONObject("function")?.optString("name").orEmpty()
+                if (expert.toolAllowed(name)) kept.put(schema)
+            }
+        }
+    }
 
     /**
      * `update_plan` 的执行体：只做校验、归一与广播，不落库。
@@ -466,6 +523,8 @@ internal object AgentModelClient {
         val customHeaders: List<CustomHeader> = emptyList(),
         val customBody: List<CustomBody> = emptyList(),
         val autoCompactionEnabled: Boolean = Prefs.Keys.BOOLEAN_DEFAULTS.getValue(Prefs.Keys.AGENT_AUTO_COMPACTION_ENABLED),
+        /** 自动压缩触发阈值（窗口占用百分比，0 = 关闭）；手动压缩不受它影响。 */
+        val autoCompactionTriggerPercent: Int = Prefs.autoCompactionTriggerPercent(),
         val subagentTools: Boolean = Prefs.Keys.BOOLEAN_DEFAULTS.getValue(Prefs.Keys.AGENT_SUBAGENT_ENABLED),
         val authMode: String = ProviderAuthModes.API_KEY,
     ) {
@@ -485,6 +544,19 @@ internal object AgentModelClient {
         /** 未知窗口不阻断对话：只关闭依赖窗口的自动压缩，手动压缩与服务商溢出错误照常可用。 */
         val knownContextWindow: Int?
             get() = contextWindow?.takeIf { it > 0 }
+
+        /**
+         * 自动压缩实际触发比例（0.0 = 不自动压缩）。
+         *
+         * 阈值为唯一事实源：1..95 才换算成比例，0 就是关闭。
+         * 不再「0 时按布尔开关兜回 85%」——那会让用户选「关闭」后被老默认值偷偷压一次；
+         * 存量配置的迁移在 [Prefs.autoCompactionTriggerPercent] 里一次做完（旧 true→85、旧 false→0）。
+         * 布尔开关仍是运行时授权位：它关着就不压，哪怕阈值给了正数。
+         */
+        val autoCompactionTriggerRatio: Double
+            get() = if (autoCompactionEnabled && autoCompactionTriggerPercent in 1..Prefs.Keys.AUTO_COMPACTION_TRIGGER_PERCENT_MAX) {
+                autoCompactionTriggerPercent / 100.0
+            } else 0.0
     }
 
     @Serializable
@@ -552,4 +624,8 @@ internal class AgentModelExecutionException(
     val reasoningContent: String,
     val transcript: List<AgentModelClient.ConversationMessage>,
     val contextSnapshot: AgentContextSnapshot? = null,
-) : RuntimeException(cause.message ?: cause.javaClass.simpleName, cause)
+) : RuntimeException(cause.message ?: cause.javaClass.simpleName, cause), StableLogType {
+
+    /** R8 会重命名类名，日志类型走固定 token，避免线上出现 `type=sp`。 */
+    override val stableLogType: String get() = "AgentModelExecutionException"
+}

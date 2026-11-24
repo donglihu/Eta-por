@@ -10,7 +10,8 @@ import org.json.JSONObject
 /** 工具摘要面向用户展示，不包含敏感参数；终端命令通过独立字段提供给用户核对。 */
 internal class AgentTraceFormatter {
     fun summarizeArguments(toolCall: AgentModelClient.ToolCall): String =
-        when (toolCall.name) {
+        if (toolCall.name.startsWith(MCP_TOOL_PREFIX)) summarizeMcpArguments(toolCall.name)
+        else when (toolCall.name) {
             BROWSER_TOOL_NAME -> summarizeBrowserArguments(toolCall.argumentsJson)
             "web_search" -> "搜索网页"
             "fetch_url" -> summarizeFetchArguments(toolCall.argumentsJson)
@@ -69,7 +70,12 @@ internal class AgentTraceFormatter {
                     ?: io.github.mangi.eta.agent.context.PersonalSearchTools.searches.firstOrNull { it.name == toolCall.name }?.title
                     ?: when (toolCall.name) { "search_notes" -> "查询便签"; "search_system_memories" -> "查询系统记忆"; "read_personal_item" -> "读取检索详情"; "summarize_bills" -> "汇总账单"; else -> null }
                 when {
-                    label == null -> "准备执行"
+                    // 兜底不再吞掉工具名：未知工具显示它自己的名字，只有名字为空才说「准备执行」。
+                    // 之前 MCP 动态工具（mcp_<server>_<tool>_<digest>）全部落到这里，用户只看到
+                    // 「正在处理 · 第 N 步 · 准备执行」，分不清工具到底在做什么。
+                    // 名字同样按 MAX_MCP_TOOL_CHARS 截断：vendor 自带的工具名可以很长，未截断
+                    // 会把折叠行撑开，和 MCP 分支的展示宽度不一致。
+                    label == null -> toolCall.name.take(MAX_MCP_TOOL_CHARS).ifBlank { "准备执行" }
                     toolCall.name.startsWith("search_") ->
                         summarizeQueryArguments(label, toolCall.argumentsJson)
                     else -> label
@@ -672,7 +678,23 @@ internal class AgentTraceFormatter {
         else -> "Android"
     }
 
+    /**
+     * MCP 工具名是运行期动态生成的 `mcp_<server 前 8 位>_<工具名>_<8 位摘要>`。
+     * 这里只还原出工具名展示给用户，不带服务器标识与摘要。
+     */
+    private fun summarizeMcpArguments(modelName: String): String {
+        val core = modelName.removePrefix(MCP_TOOL_PREFIX)
+        val withoutDigest = core.substringBeforeLast('_', core)
+        val toolName = withoutDigest.substringAfter('_', withoutDigest)
+            .replace('_', ' ')
+            .trim()
+            .take(MAX_MCP_TOOL_CHARS)
+        return if (toolName.isBlank()) "调用 MCP 工具" else "调用 MCP 工具 · $toolName"
+    }
+
     private companion object {
+        private const val MCP_TOOL_PREFIX = "mcp_"
+        private const val MAX_MCP_TOOL_CHARS = 24
         const val BROWSER_TOOL_NAME = "browser_use"
         const val MAX_DISPLAY_COMMAND_CHARS = 4_000
         const val MAX_QUERY_SUMMARY_CHARS = 30

@@ -8,7 +8,7 @@ import androidx.room.RoomDatabase
 import androidx.room.migration.Migration
 
 /** 结构版本的唯一来源：@Database 与自检页共用，文案里不再写字面量。 */
-internal const val ETA_DB_SCHEMA_VERSION = 35
+internal const val ETA_DB_SCHEMA_VERSION = 36
 
 @Database(
     entities = [
@@ -87,6 +87,7 @@ internal abstract class EtaDatabase : RoomDatabase() {
                         MIGRATION_32_33,
                         MIGRATION_33_34,
                         MIGRATION_34_35,
+                        MIGRATION_35_36,
                     )
                     .addCallback(object : Callback() {
                         override fun onCreate(db: androidx.sqlite.db.SupportSQLiteDatabase) { createTextChunkCleanup(db) }
@@ -265,6 +266,17 @@ internal abstract class EtaDatabase : RoomDatabase() {
         internal val MIGRATION_34_35 = Migration(34, 35) { database ->
             database.addColumnIfMissing("conversations", "plan_mode", "INTEGER NOT NULL DEFAULT 0")
             database.addColumnIfMissing("conversations", "plan_steps_json", "TEXT NOT NULL DEFAULT ''")
+        }
+
+        /**
+         * 36：工具运行计时起点。
+         *
+         * 只加一列，旧消息为 NULL —— 界面按「没有起点」处理，不显示已用时，也不回填假时间。
+         * 走 [addColumnIfMissing]，两条来源路径（装机版 35 起、旧库一次跳多级）都能落库，
+         * 重跑不会撞 `duplicate column`。
+         */
+        internal val MIGRATION_35_36 = Migration(35, 36) { database ->
+            database.addColumnIfMissing("conversation_messages", "tool_started_at", "INTEGER")
         }
 
         /** 只在列不存在时 ALTER，供 [MIGRATION_32_33] 合并两条来源路径。 */

@@ -12,6 +12,7 @@ import io.github.mangi.eta.ui.model.ToolActivityStatusUi
 import io.github.mangi.eta.ui.model.UserMessageUi
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -617,5 +618,100 @@ class AgentRunMessageProjectorTest {
         assertEquals("上下文压缩已中断", interruptedNotice.detail)
         assertFalse(interruptedNotice.running)
         assertEquals(base + completed, projector.finishContextCompaction(runId, base + completed, "上下文压缩已中断"))
+    }
+
+    /**
+     * 运行计时起点必须写在消息里：切会话时消息会从库里读回来，只有字段跟着消息走，
+     * 回来时才不会从 0 重新计时。计时本体走单调钟，墙钟只做落库与纪元判断。
+     */
+    @Test
+    fun runningToolStartIsCarriedByTheMessageAndClearedOnFinish() {
+        val wallClock = 1_700_000_000_000L
+        val projector = AgentRunMessageProjector(
+            nowWallClockMillis = { wallClock },
+            nowElapsedRealtime = { 1_000L },
+        )
+        val runId = "run-stopwatch"
+        val started = projector.startTool(
+            runId,
+            AgentEvent.ToolStarted(
+                round = 1,
+                toolCallId = "call_1",
+                name = "terminal",
+                argsPreview = "执行命令 · Android",
+            ),
+            emptyList(),
+        )
+        val running = started.filterIsInstance<ToolActivityMessageUi>().single()
+        assertEquals(wallClock, running.startedAtMillis)
+        assertEquals(wallClock, ToolRunStopwatch.wallSince(running.id))
+
+        val finished = projector.finishTool(
+            runId,
+            AgentEvent.ToolFinished(
+                round = 1,
+                toolCallId = "call_1",
+                name = "terminal",
+                resultSummary = "ok=true",
+                imageCount = 0,
+                imageBytes = 0,
+            ),
+            started,
+        )
+        val done = finished.filterIsInstance<ToolActivityMessageUi>().single()
+        assertNull(done.startedAtMillis)
+        assertNull(ToolRunStopwatch.wallSince(done.id))
+    }
+
+    /**
+     * 进程内兜底：本进程写入的起点被沿用且不回退；上个进程留下的旧起点不采信
+     * （允许从 0 重新开始，而不是算出一个越变越大的假耗时）。
+     *
+     * 两个时钟都显式注入：单测跑在纯 JVM 上，`SystemClock` 未实现，不能靠默认参数取时间。
+     */
+    @Test
+    fun stopwatchKeepsFirstStartAndRejectsStalePersistedValue() {
+        val id = "run-stopwatch-keep"
+        val staleId = "run-stopwatch-stale"
+        val convertedId = "run-stopwatch-converted"
+        ToolRunStopwatch.clear(id)
+        ToolRunStopwatch.clear(staleId)
+        ToolRunStopwatch.clear(convertedId)
+        val nowWall = System.currentTimeMillis()
+        val nowElapsed = 5_000L
+        try {
+            // 落库起点等于现在 → 单调起点就是现在，已用 0。
+            assertEquals(nowElapsed, ToolRunStopwatch.resolveElapsedStart(id, nowWall, nowWall, nowElapsed))
+            // 之后无论传什么、问几次，起点都不再变化（putIfAbsent 幂等）。
+            assertEquals(nowElapsed, ToolRunStopwatch.resolveElapsedStart(id, nowWall + 120_000L, nowWall, nowElapsed))
+            assertEquals(nowElapsed, ToolRunStopwatch.resolveElapsedStart(id, null, nowWall, nowElapsed))
+            assertEquals(nowWall, ToolRunStopwatch.wallSince(id))
+
+            // 已用时间取单调差：与墙钟怎么跳无关，时钟回拨也只归零不出负数。
+            assertEquals(0L, ToolRunStopwatch.elapsedSince(id, nowElapsed))
+            assertEquals(3_000L, ToolRunStopwatch.elapsedSince(id, nowElapsed + 3_000L))
+            assertEquals(0L, ToolRunStopwatch.elapsedSince(id, nowElapsed - 3_000L))
+
+            // 本进程内落库的墙钟起点按「已经过去多久」换算成单调起点，不把计时清零：
+            // 起点写在纪元后 10 秒，现在（墙钟）是 40 秒后，于是单调起点比现在早 30 秒。
+            val persistedInProcess = ToolRunStopwatch.processStartedAtMillis + 10_000L
+            val converted = ToolRunStopwatch.resolveElapsedStart(
+                convertedId,
+                persistedInProcess,
+                persistedInProcess + 30_000L,
+                60_000L,
+            )
+            assertEquals(60_000L - 30_000L, converted)
+            assertEquals(30_000L, ToolRunStopwatch.elapsedSince(convertedId, 60_000L))
+
+            // 上个进程留下的起点（早于进程纪元）不采信，从 0 重新开始。
+            val stale = ToolRunStopwatch.resolveElapsedStart(staleId, 1L, nowWall, nowElapsed)
+            assertEquals(nowElapsed, stale)
+            assertTrue(ToolRunStopwatch.wallSince(staleId)!! >= nowWall - 5_000L)
+        } finally {
+            ToolRunStopwatch.clear(id)
+            ToolRunStopwatch.clear(staleId)
+            ToolRunStopwatch.clear(convertedId)
+        }
     }
 }

@@ -112,9 +112,9 @@ class MainActivity : ComponentActivity() {
     /**
      * 每次回到前台顺带做一次「到期检查」。
      *
-     * 自动备份的闹钟在国产 ROM 上可能被省电策略推迟甚至清掉；只靠 Application.onCreate 又只在
+     * 自动备份与巡检的闹钟在国产 ROM 上都可能被省电策略推迟甚至清掉；只靠 Application.onCreate 又只在
      * 进程第一次启动时跑一次，应用常驻后台后就再没有第二次机会。这里做带节流的前台补偿：
-     * 到点没备份的，用户一打开 Eta 就补上，已经备份过的会被周期判断直接跳过。
+     * 到点没备份/没巡检的，用户一打开 Eta 就补上，已经做过的会被周期判断直接跳过。
      */
     override fun onResume() {
         super.onResume()
@@ -124,6 +124,9 @@ class MainActivity : ComponentActivity() {
         lifecycleScope.launch(Dispatchers.IO) {
             runCatching { AutoBackupAlarm.refresh(applicationContext) }
             runCatching { AutoBackupRunner.maybeRun(applicationContext) }
+            // 巡检同一套前台补偿：重排闹钟并补一次到期检查（闹钟可能已被系统清掉）。
+            runCatching { io.github.mangi.eta.core.DiagnosticsPatrolAlarm.refresh(applicationContext) }
+            runCatching { io.github.mangi.eta.core.DiagnosticsPatrol.maybeRun(applicationContext) }
         }
     }
 

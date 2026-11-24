@@ -1,11 +1,15 @@
 package io.github.mangi.eta.data.repository
 
 import android.content.Context
+import android.net.Uri
+import android.system.Os
+import android.system.OsConstants
 import io.github.mangi.eta.core.AndroidAgentLogger
 import io.github.mangi.eta.core.safeLogType
 import java.io.File
 import java.io.InputStream
 import java.io.OutputStream
+import java.io.RandomAccessFile
 import java.util.zip.ZipEntry
 import java.util.zip.ZipInputStream
 import java.util.zip.ZipOutputStream
@@ -43,6 +47,12 @@ internal object EtaFullBackupArchive {
     private const val MANIFEST_ENTRY = "manifest.json"
     private const val PRIVATE_DIR = "private"
 
+    /** zip 目录结束标记「PK\x05\x06」按小端读出的 32 位值。 */
+    private const val EOCD_SIGNATURE = 0x0605_4B50
+
+    /** EOCD 固定 22 字节，末尾还可能跟最多 65535 字节注释。 */
+    private const val MAX_TAIL_BYTES = 66_000
+
     /** 顶层只收这三类，其余（app_*、code_cache、cache 等）不进包。 */
     private val includeTop = listOf("databases", "shared_prefs", "files")
 
@@ -58,7 +68,134 @@ internal object EtaFullBackupArchive {
 
     fun isFullBackup(name: String): Boolean = name.endsWith(FULL_SUFFIX, ignoreCase = true)
 
-    private fun excluded(name: String): Boolean = excludedRelative.any { name == it || name.startsWith("$it/") }
+    /** 全量包结构校验结果；[entries] 为 zip 中央目录里的条目数。 */
+    data class EtaFullBackupCheck(
+        val ok: Boolean,
+        val entries: Int,
+        val bytes: Long,
+        val reason: String = "",
+    )
+
+    /** 校验磁盘上的包（自动备份的 `.part` 与已有归档）。不整包读回，只读尾部。 */
+    fun verify(file: File): EtaFullBackupCheck {
+        if (!file.isFile) return EtaFullBackupCheck(false, 0, 0L, "文件不存在")
+        val size = file.length()
+        val tailSize = minOf(size, MAX_TAIL_BYTES.toLong()).toInt()
+        if (tailSize < 22) {
+            return EtaFullBackupCheck(false, 0, size, "体积 " + size + "B，不是完整的 zip")
+        }
+        val tail = ByteArray(tailSize)
+        return runCatching {
+            RandomAccessFile(file, "r").use { raf ->
+                raf.seek(size - tailSize)
+                raf.readFully(tail)
+            }
+            analyzeTail(tail, size - tailSize, size, "全量包")
+        }.getOrElse {
+            EtaFullBackupCheck(false, 0, size, "读取失败：" + it.safeLogType())
+        }
+    }
+
+    /**
+     * 校验刚写进 SAF 文档的包。
+     *
+     * 走 [Os.lseek] 定位文件末尾直接读 64KB 尾巴，避免为了校验把几 GB 的包再复制一份。
+     * 目标位置不支持随机读取时无法确认完整性，按失败返回，交给调用方提示。
+     */
+    fun verify(context: Context, uri: Uri): EtaFullBackupCheck {
+        val descriptor = runCatching { context.contentResolver.openFileDescriptor(uri, "r") }
+            .getOrNull() ?: return EtaFullBackupCheck(false, 0, 0L, "无法重新打开刚写入的文件，无法校验完整性")
+        return descriptor.use { pfd ->
+            runCatching {
+                val fd = pfd.fileDescriptor
+                val size = Os.lseek(fd, 0L, OsConstants.SEEK_END)
+                val tailSize = minOf(size, MAX_TAIL_BYTES.toLong()).toInt()
+                if (tailSize < 22) {
+                    return@runCatching EtaFullBackupCheck(false, 0, size, "体积 " + size + "B，不是完整的 zip")
+                }
+                val tail = ByteArray(tailSize)
+                Os.lseek(fd, size - tailSize, OsConstants.SEEK_SET)
+                var read = 0
+                while (read < tailSize) {
+                    val count = Os.read(fd, tail, read, tailSize - read)
+                    if (count <= 0) break
+                    read += count
+                }
+                if (read < tailSize) {
+                    EtaFullBackupCheck(false, 0, size, "回读失败：只读到 " + read + "B，期望 " + tailSize + "B")
+                } else {
+                    analyzeTail(tail, size - tailSize, size, "导出的全量包")
+                }
+            }.getOrElse {
+                EtaFullBackupCheck(
+                    false,
+                    0,
+                    0L,
+                    "该位置不支持随机读取，无法校验完整性：" + it.safeLogType(),
+                )
+            }
+        }
+    }
+
+    /** 从尾部字节里找 EOCD，解析中央目录位置与条目数，判断包是否被截断。 */
+    private fun analyzeTail(
+        tail: ByteArray,
+        tailStart: Long,
+        totalSize: Long,
+        label: String,
+    ): EtaFullBackupCheck {
+        var eocd = -1
+        var index = tail.size - 22
+        while (index >= 0) {
+            if (le32(tail, index) == EOCD_SIGNATURE) {
+                eocd = index
+                break
+            }
+            index--
+        }
+        if (eocd < 0) {
+            return EtaFullBackupCheck(
+                false,
+                0,
+                totalSize,
+                label + " 末尾没有目录结束标记 PK\\x05\\x06，文件被截断",
+            )
+        }
+        val entries = le16(tail, eocd + 10)
+        val centralSize = le32(tail, eocd + 12).toLong() and 0xFFFF_FFFFL
+        val centralOffset = le32(tail, eocd + 16).toLong() and 0xFFFF_FFFFL
+        val commentLength = le16(tail, eocd + 20)
+        val eocdAbsolute = tailStart + eocd
+        if (eocdAbsolute + 22 + commentLength > totalSize) {
+            return EtaFullBackupCheck(false, entries, totalSize, label + " 目录结束标记不完整，文件被截断")
+        }
+        if (entries <= 0) {
+            return EtaFullBackupCheck(false, entries, totalSize, label + " 内没有任何条目")
+        }
+        if (centralOffset + centralSize > eocdAbsolute) {
+            return EtaFullBackupCheck(
+                false,
+                entries,
+                totalSize,
+                label + " 中央目录越界（offset=" + centralOffset + " size=" + centralSize + "）",
+            )
+        }
+        return EtaFullBackupCheck(true, entries, totalSize)
+    }
+
+    private fun le16(buffer: ByteArray, offset: Int): Int =
+        (buffer[offset].toInt() and 0xFF) or ((buffer[offset + 1].toInt() and 0xFF) shl 8)
+
+    private fun le32(buffer: ByteArray, offset: Int): Int =
+        le16(buffer, offset) or (le16(buffer, offset + 2) shl 16)
+
+    /** [includeLinuxEnvironment] 为 true 时不再排除 terminal / terminal-user，把 Linux 容器一起打包。 */
+    private fun excluded(name: String, includeLinuxEnvironment: Boolean): Boolean {
+        if (includeLinuxEnvironment) {
+            return name == "files/restore-staging" || name.startsWith("files/restore-staging/")
+        }
+        return excludedRelative.any { name == it || name.startsWith("$it/") }
+    }
 
     /**
      * 导出全量包。
@@ -68,6 +205,7 @@ internal object EtaFullBackupArchive {
     suspend fun export(
         context: Context,
         output: OutputStream,
+        includeLinuxEnvironment: Boolean = false,
         onPhase: (String) -> Unit = {},
     ): EtaFullBackupSummary = withContext(Dispatchers.IO) {
         val appContext = context.applicationContext
@@ -88,12 +226,12 @@ internal object EtaFullBackupArchive {
                 val root = File(dataDir, top)
                 if (!root.isDirectory) return@forEach
                 val files = root.walkTopDown()
-                    .onEnter { dir -> !excluded(dir.relativeTo(dataDir).invariantSeparatorsPath) }
+                    .onEnter { dir -> !excluded(dir.relativeTo(dataDir).invariantSeparatorsPath, includeLinuxEnvironment) }
                     .filter { it.isFile }
                 for (file in files) {
                     currentCoroutineContext().ensureActive()
                     val relative = file.relativeTo(dataDir).invariantSeparatorsPath
-                    if (excluded(relative)) continue
+                    if (excluded(relative, includeLinuxEnvironment)) continue
                     try {
                         zip.putNextEntry(ZipEntry("$PRIVATE_DIR/$relative").apply { time = file.lastModified() })
                         file.inputStream().use { input ->
@@ -151,6 +289,7 @@ internal object EtaFullBackupArchive {
     suspend fun stage(
         context: Context,
         input: InputStream,
+        includeLinuxEnvironment: Boolean = false,
         onPhase: (String) -> Unit = {},
     ): EtaFullBackupSummary = withContext(Dispatchers.IO) {
         val appContext = context.applicationContext
@@ -179,7 +318,7 @@ internal object EtaFullBackupArchive {
                     zip.closeEntry()
                     continue
                 }
-                if (excluded(relative)) {
+                if (excluded(relative, includeLinuxEnvironment)) {
                     zip.closeEntry()
                     continue
                 }

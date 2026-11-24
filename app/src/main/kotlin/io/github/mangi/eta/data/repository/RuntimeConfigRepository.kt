@@ -17,6 +17,7 @@ import io.github.mangi.eta.data.model.ConversationTitleSettings
 import io.github.mangi.eta.data.model.ReasoningEffort
 import io.github.mangi.eta.data.model.SubagentSettings
 import io.github.mangi.eta.data.model.enabledModel
+import io.github.mangi.eta.data.model.enabledModelByApiId
 import io.github.mangi.eta.data.model.runtimeProviderType
 import io.github.mangi.eta.data.model.selectedOrFirstModel
 import io.github.mangi.eta.data.provider.GeminiModelCapabilities
@@ -105,6 +106,7 @@ internal object RuntimeConfigRepository {
             subagentTools = false,
             hostedWebSearchEnabled = false,
             autoCompactionEnabled = false,
+            autoCompactionTriggerPercent = 0,
             supportsSearchSuggestions = false,
             thinkingEnabled = effort.enablesReasoning,
             reasoningEffort = effort,
@@ -117,6 +119,39 @@ internal object RuntimeConfigRepository {
      * 指定了独立子模型且该模型仍处于启用状态时优先使用子模型，否则平滑回退到主模型；
      * 工具开关继承父请求，并强制关闭 `subagentTools` 防止递归派发。
      */
+    /**
+     * 专家指定的模型覆盖。专家只填了 provider/model 时换掉模型本体，
+     * 工具开关、压缩策略等仍沿用本次会话的主配置——专家是「换谁作答」，不是「改设备权限」。
+     */
+    suspend fun expertRuntimeConfig(
+        primaryConfig: AgentModelClient.ModelConfig,
+        providerId: String,
+        modelId: String,
+    ): AgentModelClient.ModelConfig {
+        if (providerId.isBlank() || modelId.isBlank()) return primaryConfig
+        val resolved = runCatching {
+            ProviderRepository.ensureBuiltInsMerged()
+            val all = ProviderRepository.allProviders()
+            val provider = all.firstOrNull { it.id == providerId } ?: return@runCatching null
+            // 专家里填的可能是内部模型 id（uuid），也可能是对外 modelId（如 cn:hy3），两种都认；
+            // 但必须落在专家指定的那个服务商下，不能拿别家的同名模型顶上。
+            val model = provider.models.firstOrNull { it.id == modelId && it.isEnabled }
+                ?: provider.models.firstOrNull { it.modelId == modelId && it.isEnabled }
+                ?: return@runCatching null
+            buildRuntimeConfig(provider, model)
+        }.getOrNull() ?: return primaryConfig
+        return resolved.copy(
+            terminalTools = primaryConfig.terminalTools,
+            browserTools = primaryConfig.browserTools,
+            deviceDirectTools = primaryConfig.deviceDirectTools,
+            deviceSensitiveReadTools = primaryConfig.deviceSensitiveReadTools,
+            deviceSensitiveActionTools = primaryConfig.deviceSensitiveActionTools,
+            subagentTools = primaryConfig.subagentTools,
+            autoCompactionEnabled = primaryConfig.autoCompactionEnabled,
+            autoCompactionTriggerPercent = primaryConfig.autoCompactionTriggerPercent,
+        )
+    }
+
     suspend fun subagentRuntimeConfig(
         primaryConfig: AgentModelClient.ModelConfig,
         overrideModelId: String? = null,
@@ -157,6 +192,7 @@ internal object RuntimeConfigRepository {
             thinkingEnabled = effort.enablesReasoning,
             reasoningEffort = effort,
             autoCompactionEnabled = primaryConfig.autoCompactionEnabled,
+            autoCompactionTriggerPercent = primaryConfig.autoCompactionTriggerPercent,
             supportsSearchSuggestions = false,
         )
     }
@@ -278,6 +314,7 @@ internal object RuntimeConfigRepository {
             modelDisplayName = model.displayName.trim(),
             contextWindow = model.effectiveContextWindow,
             autoCompactionEnabled = Prefs.isEnabled(Prefs.Keys.AGENT_AUTO_COMPACTION_ENABLED),
+            autoCompactionTriggerPercent = Prefs.autoCompactionTriggerPercent(),
             subagentTools = Prefs.isEnabled(Prefs.Keys.AGENT_SUBAGENT_ENABLED),
             systemPrompt = systemPrompt,
             anthropicVersion = (provider as? AnthropicProviderSetting)?.anthropicVersion

@@ -2,10 +2,16 @@ package io.github.mangi.eta.data.repository
 
 import android.content.Context
 import android.util.AtomicFile
+import io.github.mangi.eta.agent.memory.AgentMemoryContextBuilder
+import io.github.mangi.eta.core.AndroidAgentLogger
+import io.github.mangi.eta.core.safeLogType
 import io.github.mangi.eta.data.datastore.SettingsDataStore
 import java.io.File
 import java.io.IOException
 import java.security.MessageDigest
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -61,6 +67,51 @@ internal class AgentMemoryException(
 ) : IllegalStateException(message, cause)
 
 /** 单一 MEMORY.md 的有界、原子文件存储。 */
+internal interface MemoryFileStore {
+    val baseFile: File
+    fun readBytes(): ByteArray
+    fun writeBytes(bytes: ByteArray)
+}
+
+/** 生产实现：沿用 Android AtomicFile（写临时文件 + 原子替换 + 备份文件）。 */
+private class AtomicMemoryFileStore(file: File) : MemoryFileStore {
+    private val delegate = AtomicFile(file)
+
+    override val baseFile: File get() = delegate.baseFile
+
+    override fun readBytes(): ByteArray = delegate.openRead().use { it.readBytes() }
+
+    override fun writeBytes(bytes: ByteArray) {
+        val output = delegate.startWrite()
+        try {
+            output.write(bytes)
+            delegate.finishWrite(output)
+        } catch (throwable: Throwable) {
+            delegate.failWrite(output)
+            throw throwable
+        }
+    }
+}
+
+/**
+ * 纯 JVM 实现：给单测用。
+ * Robolectric 在 arm64 上没有 native 运行时（用例会被 assume 跳过），
+ * 存储层如果硬绑 AtomicFile，写入闸门这段逻辑就永远验证不到。
+ */
+internal class PlainMemoryFileStore(override val baseFile: File) : MemoryFileStore {
+    override fun readBytes(): ByteArray = baseFile.readBytes()
+
+    override fun writeBytes(bytes: ByteArray) {
+        val parent = baseFile.parentFile
+        if (parent != null && !parent.isDirectory) parent.mkdirs()
+        val temp = File(parent, baseFile.name + ".tmp")
+        temp.writeBytes(bytes)
+        if (!temp.renameTo(baseFile)) {
+            baseFile.writeBytes(bytes)
+            temp.delete()
+        }
+    }
+}
 private data class CompactCandidate(
     val position: Int,
     val start: Int,
@@ -71,10 +122,13 @@ private data class CompactCandidate(
 
 internal class AgentMemoryStore(
     rootDir: File,
+    fileFactory: (File) -> MemoryFileStore = ::AtomicMemoryFileStore,
 ) {
     private val memoryDir = File(rootDir, DIRECTORY_NAME)
-    private val atomicFile = AtomicFile(File(memoryDir, FILE_NAME))
-    private val archiveAtomicFile = AtomicFile(File(memoryDir, ARCHIVE_FILE_NAME))
+    private val atomicFile = fileFactory(File(memoryDir, FILE_NAME))
+    private val archiveAtomicFile = fileFactory(File(memoryDir, ARCHIVE_FILE_NAME))
+    /** 非核心笔记：写在这里不占核心注入预算，也不会被注入到系统提示。 */
+    private val notesAtomicFile = fileFactory(File(memoryDir, NOTES_FILE_NAME))
     private val lock = Any()
 
     fun snapshot(): AgentMemorySnapshot = synchronized(lock) {
@@ -98,7 +152,10 @@ internal class AgentMemoryStore(
         }
     }
 
-    fun mutate(mutation: AgentMemoryMutation): AgentMemoryWriteResult = synchronized(lock) {
+    fun mutate(
+        mutation: AgentMemoryMutation,
+        coreBudgetChars: Int = 0,
+    ): AgentMemoryWriteResult = synchronized(lock) {
         val current = snapshotLocked()
         if (mutation.revision != current.revision) {
             return@synchronized AgentMemoryWriteResult.Conflict(current)
@@ -109,12 +166,39 @@ internal class AgentMemoryStore(
             is AgentMemoryMutation.Clear -> ""
         }
         val compacted = maybeCompact(updated)
+        enforceCoreBudget(current.content, compacted, coreBudgetChars)
         writeLocked(compacted)
         AgentMemoryWriteResult.Success(snapshotOf(compacted))
     }
 
-    fun replaceAll(content: String): AgentMemorySnapshot = synchronized(lock) {
+    /**
+     * 写入侧的预算闸门：核心段写超预算就拦下来。
+     *
+     * 两条必须同时成立才算违规：写之后超过预算，且这次写入是在**变大**。
+     * 后者保证「已经超标的文件」仍然能被修剪回预算内，不会被永久锁死。
+     */
+    private fun enforceCoreBudget(before: String, after: String, budgetChars: Int) {
+        if (budgetChars <= 0) return
+        // 量的是「实际进注入的那段」：核心段 + 钉住章节。
+        // 只量核心段会漏掉「往 ⛔／硬约束 段追加」这条绕过路径。
+        val afterChars = AgentMemoryCoreSection.injectedChars(after)
+        if (afterChars <= budgetChars) return
+        val beforeChars = AgentMemoryCoreSection.injectedChars(before)
+        if (afterChars <= beforeChars) return
+        throw AgentMemoryException(
+            code = "MEMORY_BUDGET_EXCEEDED",
+            message = "核心记忆将变成 $afterChars 字符，超过注入预算 $budgetChars 字符（当前 $beforeChars）。" +
+                "MEMORY.md 只留长期约束与稳定事实；项目进展、日志式结论改走 scope=notes 写入 NOTES.md，" +
+                "或先用 replace_range 把过期细节删掉再写。",
+        )
+    }
+
+    fun replaceAll(
+        content: String,
+        coreBudgetChars: Int = 0,
+    ): AgentMemorySnapshot = synchronized(lock) {
         val compacted = maybeCompact(content)
+        enforceCoreBudget(snapshotLocked().content, compacted, coreBudgetChars)
         writeLocked(compacted)
         snapshotOf(compacted)
     }
@@ -160,20 +244,9 @@ internal class AgentMemoryStore(
                 message = "无法创建记忆目录",
             )
         }
-        val output = try {
-            archiveAtomicFile.startWrite()
-        } catch (throwable: IOException) {
-            throw AgentMemoryException(
-                code = "MEMORY_WRITE_FAILED",
-                message = "无法开始写入记忆冷区文件",
-                cause = throwable,
-            )
-        }
         try {
-            output.write(bytes)
-            archiveAtomicFile.finishWrite(output)
+            archiveAtomicFile.writeBytes(bytes)
         } catch (throwable: Throwable) {
-            archiveAtomicFile.failWrite(output)
             throw AgentMemoryException(
                 code = "MEMORY_WRITE_FAILED",
                 message = "无法保存记忆冷区文件",
@@ -187,7 +260,7 @@ internal class AgentMemoryStore(
         val file = archiveAtomicFile.baseFile
         if (!file.exists()) return ""
         return try {
-            archiveAtomicFile.openRead().use { it.readBytes().toString(Charsets.UTF_8) }
+            archiveAtomicFile.readBytes().toString(Charsets.UTF_8)
         } catch (throwable: IOException) {
             throw AgentMemoryException(
                 code = "MEMORY_READ_FAILED",
@@ -201,7 +274,7 @@ internal class AgentMemoryStore(
         val file = atomicFile.baseFile
         if (!file.exists()) return snapshotOf("")
         val bytes = try {
-            atomicFile.openRead().use { it.readBytes() }
+            atomicFile.readBytes()
         } catch (throwable: IOException) {
             throw AgentMemoryException(
                 code = "MEMORY_READ_FAILED",
@@ -227,26 +300,20 @@ internal class AgentMemoryStore(
                 message = "记忆文件不能超过 1 MiB UTF-8 字节",
             )
         }
+        writeAtomic(atomicFile, bytes)
+    }
+
+    /** 原子写：MEMORY.md 与 NOTES.md 共用同一条落盘路径，失败一律抛可见异常。 */
+    private fun writeAtomic(file: MemoryFileStore, bytes: ByteArray) {
         if (!memoryDir.exists() && !memoryDir.mkdirs() && !memoryDir.isDirectory) {
             throw AgentMemoryException(
                 code = "MEMORY_WRITE_FAILED",
                 message = "无法创建记忆目录",
             )
         }
-        val output = try {
-            atomicFile.startWrite()
-        } catch (throwable: IOException) {
-            throw AgentMemoryException(
-                code = "MEMORY_WRITE_FAILED",
-                message = "无法开始写入记忆文件",
-                cause = throwable,
-            )
-        }
         try {
-            output.write(bytes)
-            atomicFile.finishWrite(output)
+            file.writeBytes(bytes)
         } catch (throwable: Throwable) {
-            atomicFile.failWrite(output)
             throw AgentMemoryException(
                 code = "MEMORY_WRITE_FAILED",
                 message = "无法保存记忆文件",
@@ -282,6 +349,70 @@ internal class AgentMemoryStore(
         if (content.isEmpty()) return snapshot.content
         if (snapshot.content.isEmpty()) return content
         return snapshot.content.trimEnd('\n') + "\n" + content
+    }
+
+    /** 记忆目录本身，供自动备份镜像使用。 */
+    fun memoryDirectory(): File = memoryDir
+
+    /**
+     * 非核心内容通道：追加到 NOTES.md。
+     *
+     * 之前所有内容都往 MEMORY.md 里塞，核心段被项目进展、日志式结论撑爆，注入预算只能截断，
+     * 结果「预算 8,000 但文件照写」。现在非核心内容有独立文件：不参与注入，也不挤占核心段。
+     */
+    fun appendNote(content: String, now: Long = System.currentTimeMillis()): AgentMemorySnapshot =
+        synchronized(lock) {
+            val text = content.trim()
+            if (text.isEmpty()) return@synchronized notesSnapshotLocked()
+            val current = notesSnapshotLocked()
+            val stamp = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.US).format(Date(now))
+            val appended = buildString {
+                if (current.content.isNotBlank()) {
+                    append(current.content.trimEnd('\n'))
+                    append("\n\n")
+                }
+                append("## ").append(stamp).append('\n').append(text).append('\n')
+            }
+            val bytes = appended.toByteArray(Charsets.UTF_8)
+            if (bytes.size > MAX_NOTE_BYTES) {
+                throw AgentMemoryException(
+                    code = "MEMORY_NOTES_TOO_LARGE",
+                    message = "NOTES.md 超过 " + (MAX_NOTE_BYTES / 1024) + " KiB；请先清理，或把内容迁到知识库文件",
+                )
+            }
+            writeAtomic(notesAtomicFile, bytes)
+            snapshotOf(appended, bytes)
+        }
+
+    fun notesSnapshot(): AgentMemorySnapshot = synchronized(lock) { notesSnapshotLocked() }
+
+    fun readNotes(
+        query: String? = null,
+        startLine: Int = DEFAULT_START_LINE,
+        maxChars: Int = DEFAULT_READ_CHARS,
+    ): AgentMemoryReadResult = synchronized(lock) {
+        val snapshot = notesSnapshotLocked()
+        val boundedChars = maxChars.coerceIn(MIN_READ_CHARS, MAX_READ_CHARS)
+        if (query.isNullOrBlank()) {
+            page(snapshot, startLine, boundedChars)
+        } else {
+            search(snapshot, query.trim(), boundedChars, archive = false)
+        }
+    }
+
+    private fun notesSnapshotLocked(): AgentMemorySnapshot {
+        val file = notesAtomicFile.baseFile
+        if (!file.exists()) return snapshotOf("")
+        val bytes = try {
+            notesAtomicFile.readBytes()
+        } catch (throwable: IOException) {
+            throw AgentMemoryException(
+                code = "MEMORY_READ_FAILED",
+                message = "无法读取 NOTES.md",
+                cause = throwable,
+            )
+        }
+        return snapshotOf(bytes.toString(Charsets.UTF_8), bytes)
     }
 
     @Volatile
@@ -577,6 +708,9 @@ internal class AgentMemoryStore(
         const val MAX_WRITE_CONTENT_CHARS = 3_500
         private const val DIRECTORY_NAME = "memory"
         private const val FILE_NAME = "MEMORY.md"
+        /** 非核心内容（项目进展、日志式结论、待办）落 NOTES.md：不参与注入，也不挤占核心段。 */
+        const val NOTES_FILE_NAME = "NOTES.md"
+        const val MAX_NOTE_BYTES = 256 * 1024
         private const val DEFAULT_START_LINE = 1
         private const val SEARCH_CONTEXT_LINES = 1
     }
@@ -586,10 +720,15 @@ internal object AgentMemoryRepository {
     @Volatile
     private lateinit var store: AgentMemoryStore
 
+    /** 应用上下文：只在启动时拿一次，供记忆镜像备份解析候选目录。 */
+    @Volatile
+    private var appContext: Context? = null
+
     private val autoCompactScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     fun init(context: Context) {
         if (!::store.isInitialized) {
+            appContext = context.applicationContext
             store = AgentMemoryStore(context.applicationContext.filesDir)
             autoCompactScope.launch {
                 repeat(3) {
@@ -608,6 +747,8 @@ internal object AgentMemoryRepository {
                 val enabled = runCatching { SettingsDataStore.settings().memoryAutoCompactEnabled }.getOrDefault(true)
                 store.setAutoCompactEnabled(enabled)
                 runCatching { store.compactOnStartup() }
+                // 启动时也镜像一份：上次写入后进程被杀、或用户手工改过文件，都能立刻拿到回滚点。
+                mirrorBackup()
             }
         }
     }
@@ -635,12 +776,71 @@ internal object AgentMemoryRepository {
 
     fun mutate(mutation: AgentMemoryMutation): AgentMemoryWriteResult {
         ensureInitialized()
-        return store.mutate(mutation)
+        val result = store.mutate(mutation, coreBudgetChars())
+        if (result is AgentMemoryWriteResult.Success) mirrorBackup()
+        return result
     }
 
     fun replaceAll(content: String): AgentMemorySnapshot {
         ensureInitialized()
-        return store.replaceAll(content)
+        val snapshot = store.replaceAll(content, coreBudgetChars())
+        mirrorBackup()
+        return snapshot
+    }
+
+    /**
+     * 备份恢复专用：用户显式恢复自己的记忆，不受注入预算闸门限制。
+     *
+     * 闸门防的是「Agent 一路追加把核心段撑爆」，不是防用户把自己的数据装回来；
+     * 恢复路径如果也拦，旧备份只要超过当前预算就永远装不回去，回滚等于失效。
+     */
+    fun restoreAll(content: String): AgentMemorySnapshot {
+        ensureInitialized()
+        val snapshot = store.replaceAll(content, coreBudgetChars = 0)
+        mirrorBackup()
+        return snapshot
+    }
+
+    /** 非核心内容通道：写入 NOTES.md，不参与核心注入预算。 */
+    fun appendNote(content: String): AgentMemorySnapshot {
+        ensureInitialized()
+        return store.appendNote(content)
+    }
+
+    fun notesSnapshot(): AgentMemorySnapshot {
+        ensureInitialized()
+        return store.notesSnapshot()
+    }
+
+    fun readNotes(
+        query: String? = null,
+        startLine: Int = 1,
+        maxChars: Int = AgentMemoryStore.DEFAULT_READ_CHARS,
+    ): AgentMemoryReadResult {
+        ensureInitialized()
+        return store.readNotes(query, startLine, maxChars)
+    }
+
+    /** 当前生效的核心注入预算：与提示词注入侧共用同一函数，滑杆值优先，0 表示按窗口自动。 */
+    fun coreBudgetChars(): Int = AgentMemoryContextBuilder.coreBudgetChars(null)
+
+    fun memoryBackupStatus(): AgentMemoryBackup.Status? = AgentMemoryBackup.last
+
+    /** 手动触发一次镜像备份；记忆页与启动兜底共用。 */
+    fun backupNow(): AgentMemoryBackup.Status? {
+        ensureInitialized()
+        return mirrorBackup()
+    }
+
+    private fun mirrorBackup(): AgentMemoryBackup.Status? {
+        val context = appContext ?: return null
+        return runCatching { AgentMemoryBackup.mirror(store.memoryDirectory(), context) }
+            .onFailure { failure ->
+                AndroidAgentLogger.warnThrottled("memory_backup_crashed") {
+                    "Memory mirror crashed: type=${failure.safeLogType()}"
+                }
+            }
+            .getOrNull()
     }
 
     fun archiveSnapshot(): AgentMemorySnapshot {

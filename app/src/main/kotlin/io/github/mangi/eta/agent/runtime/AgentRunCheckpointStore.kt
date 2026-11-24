@@ -16,6 +16,9 @@ import kotlinx.coroutines.runBlocking
  * 三者用途独立；配置和密钥不落盘，敏感工具原始数据由会话 codec 过滤。
  */
 internal object AgentRunCheckpointStore {
+    /** 单次检查点写入超过这个时长才记一行；实测正常在 1 位数毫秒。 */
+    private const val SLOW_APPEND_MS = 150L
+
     /** 每个 run 的父行副本：并发路径把父行清掉时用它补写，避免在途事件外键失败。 */
     private val seededRuns =
         java.util.concurrent.ConcurrentHashMap<String, RuntimeInFlightRunEntity>()
@@ -58,8 +61,16 @@ internal object AgentRunCheckpointStore {
             "ckpt.start",
             "runId=$runId operation=${request.operation}",
         )
+        val startedAt = android.os.SystemClock.elapsedRealtime()
         runBlocking(Dispatchers.IO) {
             EtaDatabase.get(context.applicationContext).runtimeRunDao().replaceInFlightRun(entity)
+        }
+        val spent = android.os.SystemClock.elapsedRealtime() - startedAt
+        if (spent >= SLOW_APPEND_MS) {
+            io.github.mangi.eta.core.EtaTrace.log(
+                "perf.ckpt.slow_start",
+                "runId=$runId ms=$spent",
+            )
         }
         return true
     }
@@ -78,19 +89,42 @@ internal object AgentRunCheckpointStore {
             sortIndex = sortIndex,
             eventJson = AgentEventJsonCodec.encode(durableEvent),
         )
+        val writeStartedAt = android.os.SystemClock.elapsedRealtime()
         try {
             runBlocking(Dispatchers.IO) { dao.appendInFlightEvent(row, now) }
         } catch (constraint: android.database.sqlite.SQLiteConstraintException) {
             // 并发会话下父行可能被其它路径清掉；外键失败会让失败现场整条丢失，
-            // 这里先把父行补回来（不动已写入的事件），再写一次。
+            // 这里用单事务「补写父行 + 追加事件」，避免 upsert 与 append 之间再次被
+            // remove 竞态切开。seededRuns 副本若已被 remove 清掉，先确认 DB 里是否
+            // 还有父行：有就直接重试，确实没有才抛。
             io.github.mangi.eta.core.EtaTrace.log(
                 "ckpt.recover",
                 "runId=$runId sortIndex=$sortIndex 父行缺失已补写：${constraint.message}",
             )
-            val seed = seededRuns[runId] ?: throw constraint
-            runBlocking(Dispatchers.IO) {
-                dao.upsertInFlightRun(seed)
-                dao.appendInFlightEvent(row, now)
+            val seed = seededRuns[runId]
+            if (seed != null) {
+                runBlocking(Dispatchers.IO) {
+                    dao.recoverAppendInFlightEvent(seed, row, now)
+                }
+            } else {
+                val parentStillPresent = runBlocking(Dispatchers.IO) {
+                    dao.hasInFlightRun(runId)
+                }
+                if (parentStillPresent) {
+                    runBlocking(Dispatchers.IO) { dao.appendInFlightEvent(row, now) }
+                } else {
+                    throw constraint
+                }
+            }
+        } finally {
+            // 检查点写入是每次事件同步落库，属主线程/执行线程上的阻塞点；
+            // 只有明显慢的才记，避免每个 delta 刷一行。
+            val spent = android.os.SystemClock.elapsedRealtime() - writeStartedAt
+            if (spent >= SLOW_APPEND_MS) {
+                io.github.mangi.eta.core.EtaTrace.log(
+                    "perf.ckpt.slow_append",
+                    "runId=$runId sortIndex=$sortIndex ms=$spent kind=${durableEvent::class.simpleName}",
+                )
             }
         }
     }
@@ -146,6 +180,10 @@ internal object AgentRunCheckpointStore {
             "ckpt.remove",
             "runId=$runId 调用方=${io.github.mangi.eta.core.EtaTrace.callerHint()}",
         )
+        // seededRuns 副本与 DB 行必须同步清理：否则 remove 后残留的旧 seed 会在下次
+        // append 触发 FK 恢复时，把已被清掉的 run 的旧父行（甚至同 runId 新会话的父行）
+        // 用过期数据顶回来，造成事件错挂旧 run。
+        seededRuns.remove(runId)
         runBlocking(Dispatchers.IO) {
             EtaDatabase.get(context.applicationContext)
                 .runtimeRunDao()

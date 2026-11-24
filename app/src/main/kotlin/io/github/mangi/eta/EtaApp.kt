@@ -68,6 +68,8 @@ class EtaApp : Application(), XposedServiceHelper.OnServiceListener {
         runCatching { CrashRecorder.install(this) }
         // 自留日志：任何进程启动就落盘，诊断包不再依赖 logcat 的 2 分钟缓冲。
         runCatching { io.github.mangi.eta.core.EtaTrace.init(this) }
+        // 应用日志文件：日志页直接读它（最多 3 份，超出自动删旧）。
+        runCatching { io.github.mangi.eta.core.AppLogFiles.init(this) }
         if (!AppProcessPolicy.shouldInitializeFullRuntime(Application.getProcessName(), packageName)) {
             return
         }
@@ -96,16 +98,39 @@ class EtaApp : Application(), XposedServiceHelper.OnServiceListener {
         McpServerRepository.init(this)
         GitHubAccountManager.init(this)
         applicationScope.launch(Dispatchers.IO) {
-            runCatching {
+            // 恢复与补排各步骤独立兜底：任何一步抛错只记自己的日志，绝不让同一段
+            // runCatching 把后面几步的闹钟补排一起吞掉。诊断包自动导出曾因此断链——
+            // 闹钟被系统清掉后，前面某步（DB 恢复、备份补跑、巡检补跑）抛错就轮不到
+            // 它重排，结果整周静默且连一条 diag.auto 痕迹都没有。
+            suspend fun guard(step: String, block: suspend () -> Unit) {
+                runCatching { block() }.onFailure { error ->
+                    AndroidAgentLogger.warn("Automation recovery step failed: step=$step type=${error.safeLogType()}")
+                }
+            }
+            guard("agentTaskRecover") {
                 io.github.mangi.eta.data.db.EtaDatabase.get(this@EtaApp).agentTaskDao().recoverInterrupted(System.currentTimeMillis())
                 io.github.mangi.eta.agent.automation.AgentTaskScheduler.enqueueDue(this@EtaApp)
                 io.github.mangi.eta.agent.automation.AgentTaskScheduler.refresh(this@EtaApp)
+            }
+            guard("autoBackup") {
                 // 自动备份：先排下一次唤醒（闹钟可能已被系统清掉），再补一次到期检查。
                 AutoBackupAlarm.refresh(this@EtaApp)
                 AutoBackupRunner.maybeRun(this@EtaApp)
-                // 诊断包每周自动导出一次，直接落到「诊断包备份」。
+            }
+            guard("diagnosticsPatrol") {
+                // 巡检：同一套补排——先重排闹钟（可能已被系统清掉），错过周期再补跑一次。
+                // 没有这条钩子，进程被杀或闹钟被清后周期链就断了，只能等开机或手动触发。
+                io.github.mangi.eta.core.DiagnosticsPatrolAlarm.refresh(this@EtaApp)
+                io.github.mangi.eta.core.DiagnosticsPatrol.maybeRun(this@EtaApp)
+            }
+            guard("diagnosticsAutoExport") {
+                // 诊断包每周自动导出一次，直接落到「诊断包备份」；补排必须独立于上面任何一步的失败。
                 io.github.mangi.eta.core.DiagnosticsAutoExport.refresh(this@EtaApp)
-            }.onFailure { AndroidAgentLogger.warn("Automation recovery unavailable") }
+            }
+            guard("keepalive") {
+                // 保活：开关打开就排周期自检（关着则撤掉），重启后由 setPersisted 自己续上。
+                io.github.mangi.eta.agent.automation.AgentKeepaliveScheduler.refresh(this@EtaApp)
+            }
         }
         XposedServiceHelper.registerListener(this)
         applicationScope.launch {

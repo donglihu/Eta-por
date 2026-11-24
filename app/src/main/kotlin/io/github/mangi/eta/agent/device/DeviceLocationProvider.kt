@@ -11,7 +11,6 @@ import android.os.SystemClock
 internal object DeviceLocationProvider {
     enum class AccessState {
         DENIED,
-        FOREGROUND_ONLY,
         DISABLED,
         AVAILABLE,
     }
@@ -36,11 +35,9 @@ internal object DeviceLocationProvider {
         val manager = context.getSystemService(LocationManager::class.java)
             ?: return AccessState.DISABLED
         if (!manager.isLocationEnabled) return AccessState.DISABLED
-        // 后台定位只有在持续订阅或后台触发读取时才需要；读取系统已有的最近位置
-        // 属于前台读一次缓存，拿到「使用时允许」就够用，不能再当成拒绝。
-        val backgroundGranted = context.checkSelfPermission(Manifest.permission.ACCESS_BACKGROUND_LOCATION) ==
-            PackageManager.PERMISSION_GRANTED
-        return if (backgroundGranted) AccessState.AVAILABLE else AccessState.FOREGROUND_ONLY
+        // 本应用只在工具的当前回合读一次系统缓存，从不持续订阅，因此不需要
+        // ACCESS_BACKGROUND_LOCATION；「使用时允许」就是这个能力的全部前提。
+        return AccessState.AVAILABLE
     }
 
     @SuppressLint("MissingPermission")
@@ -48,8 +45,7 @@ internal object DeviceLocationProvider {
         return when (accessState(context)) {
             AccessState.DENIED -> Result.Unavailable("permission_required")
             AccessState.DISABLED -> Result.Unavailable("location_disabled")
-            // FOREGROUND_ONLY 也能读最近位置，只是不能后台持续读取。
-            AccessState.FOREGROUND_ONLY, AccessState.AVAILABLE -> {
+            AccessState.AVAILABLE -> {
                 val manager = context.getSystemService(LocationManager::class.java)
                     ?: return Result.Unavailable("unavailable")
                 val providers = runCatching { manager.getProviders(true) }

@@ -27,6 +27,16 @@ import org.robolectric.annotation.Config
 @Config(sdk = [36])
 class ToolCatalogUiTest {
     @Test
+    fun orchestrationGroupExposesExpertAndAskUserCards() {
+        val group = buildToolsState(RuntimeEnvironment.getApplication()).groups.first { it.id == "orchestration" }
+        assertTrue(group.tools.map { it.id }.containsAll(listOf("expert_manage", "ask_user", "update_plan", "subagent", "subagent_profile")))
+        // 每个工具卡都有显式元数据且能在 AgentToolRequirements 找到登记（图标单测依赖）。
+        group.tools.forEach { toolCardRequirement(it.id) }
+        assertEquals(RootRequirement.NONE, toolCardRequirement("expert_manage").rootRequirement)
+        assertEquals(RootRequirement.NONE, toolCardRequirement("ask_user").rootRequirement)
+    }
+
+    @Test
     fun everyRuntimeToolAndDisplayedCardHasASpecificIcon() {
         val tools = AgentToolCatalog.build(
             terminalTools = true,

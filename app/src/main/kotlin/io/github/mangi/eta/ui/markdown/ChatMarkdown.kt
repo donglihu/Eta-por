@@ -6,6 +6,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.produceState
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Modifier
@@ -100,9 +101,26 @@ internal fun StreamingMarkdown(
     LaunchedEffect(state) {
         state.parseUpdates()
     }
+    // 每来一个增量都会重启这个 effect；节流后再提交，避免每秒几十次全量 GFM 解析。
+    val submitMark = remember(state, style.inline) { StreamingMarkdownSubmitMark() }
     LaunchedEffect(content, isStreaming, style.inline) {
-        state.parseTargets.trySend(StreamingMarkdownTarget(content, isStreaming, style.inline))
-        if (isStreaming) currentCallback(false)
+        val mark = submitMark
+        val now = System.nanoTime()
+        // 终态无条件提交；首个增量立即提交（首字不能等）；流式中要求「新增 ≥64 字」且
+        // 距上次提交 ≥80ms；慢速流由 240ms 兜底刷新，内容不会长时间停在旧快照。
+        val grewEnough = mark.submittedChars < 0 ||
+            content.length - mark.submittedChars >= StreamingMarkdownSubmitMinChars
+        val cooled = mark.submittedChars < 0 ||
+            now - mark.submittedAtNanos >= StreamingMarkdownSubmitIntervalNanos
+        val idleLongEnough = now - mark.submittedAtNanos >= StreamingMarkdownSubmitFallbackNanos &&
+            mark.submittedContent !== content
+        if (!isStreaming || (grewEnough && cooled) || idleLongEnough) {
+            mark.submittedChars = content.length
+            mark.submittedAtNanos = now
+            mark.submittedContent = content
+            state.parseTargets.trySend(StreamingMarkdownTarget(content, isStreaming, style.inline))
+            if (isStreaming) currentCallback(false)
+        }
     }
     LaunchedEffect(content, isStreaming, snapshot, reveal) {
         val target = snapshot
@@ -145,6 +163,22 @@ internal fun StreamingMarkdown(
         },
     )
 }
+
+/** 流式解析提交流水：上次提交的长度、时刻与内容，用来判断下一次解析该不该跑。 */
+private class StreamingMarkdownSubmitMark {
+    var submittedChars: Int = -1
+    var submittedAtNanos: Long = 0L
+    var submittedContent: String? = null
+}
+
+/** 至少新增这么多字符才值得重新全量解析。 */
+private const val StreamingMarkdownSubmitMinChars = 64
+
+/** 两次提交之间的最小间隔。 */
+private const val StreamingMarkdownSubmitIntervalNanos = 80_000_000L
+
+/** 慢速流的兜底刷新间隔。 */
+private const val StreamingMarkdownSubmitFallbackNanos = 240_000_000L
 
 /**
  * 已完成消息的文档缓存。内容与行内样式共同决定文档；容量按条数限制，

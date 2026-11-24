@@ -12,6 +12,9 @@ import io.github.mangi.eta.data.datastore.SettingsDataStore
 import io.github.mangi.eta.data.repository.AgentMemoryRepository
 import io.github.mangi.eta.data.repository.RuntimeConfigRepository
 import io.github.mangi.eta.ui.model.AgentMemoryUiState
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -34,9 +37,22 @@ internal class AgentMemoryStore(
                 val snapshot = AgentMemoryRepository.snapshot()
                 val settings = SettingsDataStore.settings()
                 val contextWindow = RuntimeConfigRepository.currentRuntimeConfig()?.contextWindow
-                Triple(snapshot, settings, AgentMemoryContextBuilder.coreBudgetChars(contextWindow))
+                Triple(snapshot, settings, contextWindow)
             }.fold(
-                onSuccess = { (snapshot, settings, coreBudget) ->
+                onSuccess = { (snapshot, settings, contextWindow) ->
+                    val backupStatus = AgentMemoryRepository.memoryBackupStatus()
+                    val backupSummary = backupStatus?.let { status ->
+                        val stamp = SimpleDateFormat("MM-dd HH:mm", Locale.US).format(Date(status.at))
+                        if (status.ok) {
+                            appContext.getString(R.string.memory_backup_summary_done, stamp, status.directory)
+                        } else {
+                            appContext.getString(
+                                R.string.memory_backup_summary_failed,
+                                status.error.orEmpty(),
+                                status.directory,
+                            )
+                        }
+                    }
                     withContext(Dispatchers.Main) {
                         memoryState = AgentMemoryUiState(
                             enabled = settings.memoryEnabled,
@@ -47,7 +63,16 @@ internal class AgentMemoryStore(
                             draft = snapshot.content,
                             savedContent = snapshot.content,
                             draftBytes = snapshot.byteSize,
-                            coreBudgetChars = coreBudget,
+                            coreBudgetChars = AgentMemoryContextBuilder.coreBudgetChars(
+                                contextWindow,
+                                settings.memoryCoreBudgetChars,
+                            ),
+                            coreBudgetOverride = settings.memoryCoreBudgetChars,
+                            headingBudgetChars = AgentMemoryContextBuilder.headingBudgetChars(
+                                settings.memoryHeadingBudgetChars,
+                            ),
+                            headingBudgetOverride = settings.memoryHeadingBudgetChars,
+                            backupSummary = backupSummary,
                         )
                     }
                 },
@@ -204,6 +229,62 @@ internal class AgentMemoryStore(
                         }
                     },
                 )
+        }
+    }
+
+    /** 手动触发一次记忆镜像备份；结果回显在记忆页的「记忆自动备份」那一行。 */
+    fun backupMemory() {
+        scope.launch(Dispatchers.IO) {
+            val status = runCatching { AgentMemoryRepository.backupNow() }.getOrNull()
+            if (status == null) {
+                withContext(Dispatchers.Main) {
+                    memoryState = memoryState.copy(
+                        notice = appContext.getString(
+                            R.string.memory_backup_summary_failed,
+                            "备份未执行",
+                            io.github.mangi.eta.data.repository.AgentMemoryBackup.WORKSPACE_DIRECTORY,
+                        ),
+                    )
+                }
+            } else {
+                refreshMemory()
+            }
+        }
+    }
+
+    /** 自定义核心注入预算；0 = 自动。保存后立即刷新界面上的实际注入值。 */
+    fun setCoreBudget(chars: Int) {
+        scope.launch(Dispatchers.IO) {
+            runCatching { SettingsDataStore.setMemoryCoreBudgetChars(chars) }
+                .onSuccess { withContext(Dispatchers.Main) { refreshMemory() } }
+                .onFailure { throwable ->
+                    AndroidAgentLogger.warnThrottled("agent_memory_budget_failed") {
+                        "Memory budget update failed: type=${throwable.safeLogType()}"
+                    }
+                }
+        }
+    }
+
+    /** 自定义标题索引预算；0 = 自动。 */
+    fun setHeadingBudget(chars: Int) {
+        scope.launch(Dispatchers.IO) {
+            runCatching { SettingsDataStore.setMemoryHeadingBudgetChars(chars) }
+                .onSuccess { withContext(Dispatchers.Main) { refreshMemory() } }
+                .onFailure { throwable ->
+                    AndroidAgentLogger.warnThrottled("agent_memory_budget_failed") {
+                        "Memory budget update failed: type=${throwable.safeLogType()}"
+                    }
+                }
+        }
+    }
+
+    /** 两项预算一起恢复自动（跟随上下文窗口）。 */
+    fun resetMemoryBudgets() {
+        scope.launch(Dispatchers.IO) {
+            runCatching {
+                SettingsDataStore.setMemoryCoreBudgetChars(0)
+                SettingsDataStore.setMemoryHeadingBudgetChars(0)
+            }.onSuccess { withContext(Dispatchers.Main) { refreshMemory() } }
         }
     }
 

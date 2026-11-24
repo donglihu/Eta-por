@@ -15,6 +15,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.core.content.FileProvider
 import io.github.mangi.eta.core.CrashRecorder
 import io.github.mangi.eta.core.DiagnosticsBundle
+import io.github.mangi.eta.core.SharedStorage
 import io.github.mangi.eta.ui.components.EtaPreference
 import io.github.mangi.eta.ui.components.EtaPreferenceDivider
 import io.github.mangi.eta.ui.components.EtaPreferenceGroup
@@ -81,7 +82,7 @@ internal fun DiagnosticsCenterScreen(onBack: () -> Unit) {
         withContext(Dispatchers.IO) {
             crashes = CrashRecorder.records(context)
             bundleCount = countZips(File(DiagnosticsBundle.DEFAULT_DIR))
-            autoCount = countZips(File(DiagnosticsBundle.DEFAULT_DIR, "自动"))
+            autoCount = countZips(File(SharedStorage.DIAGNOSTICS_AUTO_DIR))
         }
     }
 
@@ -99,7 +100,8 @@ internal fun DiagnosticsCenterScreen(onBack: () -> Unit) {
                     val name = DiagnosticsBundle.defaultFileName()
                     val saved = withContext(Dispatchers.IO) {
                         runCatching {
-                            val dir = File(DiagnosticsBundle.DEFAULT_DIR).apply { mkdirs() }
+                            val dir = File(DiagnosticsBundle.DEFAULT_DIR)
+                            if (!SharedStorage.ensureDirectory(dir)) error("无法创建诊断包目录")
                             File(dir, name).apply { writeBytes(bytes) }
                         }.getOrNull()
                     }

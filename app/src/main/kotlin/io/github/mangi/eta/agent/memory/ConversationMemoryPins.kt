@@ -17,6 +17,8 @@ internal object ConversationMemoryPins {
     private class Pin(
         val context: AgentMemoryContext,
         val contextWindow: Int?,
+        val coreBudget: Int,
+        val headingBudget: Int,
         var knownRevision: String,
     )
 
@@ -28,14 +30,29 @@ internal object ConversationMemoryPins {
 
     @Synchronized
     fun contextFor(conversationId: String?, snapshot: AgentMemorySnapshot, contextWindow: Int?): AgentMemoryContext {
+        // 预算滑杆改了也要重建：否则注入值会一直沿用旧快照。
+        val coreBudget = MemoryBudgetPolicy.coreChars
+        val headingBudget = MemoryBudgetPolicy.headingChars
         if (conversationId != null) {
             val pin = pins[conversationId]
-            if (pin != null && pin.knownRevision == snapshot.revision && pin.contextWindow == contextWindow) {
+            if (pin != null &&
+                pin.knownRevision == snapshot.revision &&
+                pin.contextWindow == contextWindow &&
+                pin.coreBudget == coreBudget &&
+                pin.headingBudget == headingBudget
+            ) {
                 return pin.context
             }
         }
-        val context = AgentMemoryContextBuilder.build(snapshot, contextWindow)
-        if (conversationId != null) pins[conversationId] = Pin(context, contextWindow, snapshot.revision)
+        val context = AgentMemoryContextBuilder.build(
+            snapshot = snapshot,
+            contextWindow = contextWindow,
+            coreBudgetOverride = coreBudget,
+            headingBudgetOverride = headingBudget,
+        )
+        if (conversationId != null) {
+            pins[conversationId] = Pin(context, contextWindow, coreBudget, headingBudget, snapshot.revision)
+        }
         return context
     }
 

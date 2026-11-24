@@ -14,6 +14,8 @@ import io.github.mangi.eta.data.model.enabledModel
 import io.github.mangi.eta.data.model.enabledModelByApiId
 import io.github.mangi.eta.agent.terminal.TerminalExecutionContext
 import io.github.mangi.eta.agent.tool.AgentToolCapabilities
+import io.github.mangi.eta.agent.tool.AgentToolRequirements
+import io.github.mangi.eta.agent.tool.ToolDomain
 import java.util.concurrent.ConcurrentHashMap
 import org.json.JSONArray
 import org.json.JSONObject
@@ -50,6 +52,15 @@ internal class SubagentExecutor(
 ) {
     private val latestSnapshots = ConcurrentHashMap<String, String>()
 
+    /**
+     * 子代理历史的裁剪与淘汰要在应用日志里可见：静默丢上下文会让 `resume` 行为变得无法解释，
+     * 排查内存问题时也看不到「到底裁掉了多少」。赋值幂等，按实例初始化即可。
+     */
+    init {
+        SubagentSessionStore.onEvicted = { message ->
+            io.github.mangi.eta.core.EtaTrace.log("subagent.memory", message)
+        }
+    }
     fun latestSnapshotJson(toolCallId: String): String? = latestSnapshots[toolCallId]
 
     /** 同一主 Agent 下存活的子智能体计数（按对话隔离）；达到并行上限时拒绝新的派发。 */
@@ -59,23 +70,9 @@ internal class SubagentExecutor(
         parentRound: Int,
         toolCall: AgentModelClient.ToolCall,
     ): AgentModelClient.ToolResult {
-        val limit = runCatching {
-            kotlinx.coroutines.runBlocking {
-                io.github.mangi.eta.data.datastore.SettingsDataStore.subagentSettings()
-            }.maxParallel
-        }.getOrDefault(8)
-        if (!SubagentConcurrency.tryAcquire(concurrencyKey, limit)) {
-            return errorResult(
-                "SUBAGENT_LIMIT_REACHED",
-                "同一主 Agent 下已有 $limit 个子智能体在运行，本次派发被拒绝；" +
-                    "请等现有子智能体结束，或在设置里调高并行上限。",
-            )
-        }
-        return try {
-            executeInternal(parentRound, toolCall)
-        } finally {
-            SubagentConcurrency.release(concurrencyKey)
-        }
+        // 并发上限在 executeInternal 里做：上限取决于该子代理的工具白名单（要不要屏幕），
+        // 而那要等 profile 解析出来才知道。这里提前拿不到 profile，就不做二次计数。
+        return executeInternal(parentRound, toolCall)
     }
 
     private fun executeInternal(
@@ -284,6 +281,59 @@ internal class SubagentExecutor(
 
         publishSnapshot(force = true)
 
+        /**
+         * 子代理工具执行同样要过资源域闸门。
+         *
+         * 之前这里直接调 [baseToolExecutor]，等于把子代理的终端、文件写入、设备设置
+         * 全部排除在串行之外：主会话正在跑的 shell 会被子代理的命令插进来，同一目录的两次
+         * 写入也会并行。槽位键沿用父会话的 [conversationKey]，语义是「同一对话的工具实例串行」，
+         * 与主链路 [AgentLoop] 完全一致。
+         *
+         * 闸门抛出的三类异常在这里就地转成工具结果，不向上冒泡：子代理的失败必须回给它的模型，
+         * 而不是把整条父任务打断。
+         */
+        fun runGated(subCall: AgentModelClient.ToolCall): AgentModelClient.ToolResult {
+            val args = runCatching { JSONObject(subCall.argumentsJson.ifBlank { "{}" }) }
+                .onFailure { failure ->
+                    io.github.mangi.eta.core.EtaTrace.log(
+                        "perf.tool.args_invalid",
+                        "scope=subagent name=${subCall.name} err=${failure.message}",
+                    )
+                }
+                .getOrNull()
+            return try {
+                io.github.mangi.eta.agent.model.AgentResourceGate.dispatch(
+                    toolName = subCall.name,
+                    args = args,
+                    conversationKey = conversationKey,
+                    action = args?.optString("action"),
+                    isCancelled = { childController.isCancelled },
+                ) {
+                    baseToolExecutor.execute(subCall)
+                }
+            } catch (busy: io.github.mangi.eta.agent.model.AgentResourceGate.GateTimeout) {
+                AgentModelClient.ToolResult(
+                    content = JSONObject()
+                        .put("ok", false)
+                        .put("code", "RESOURCE_BUSY")
+                        .put(
+                            "message",
+                            "资源 ${busy.slotKey} 被 ${busy.holder ?: "其它会话"} 占用，本次未执行；可稍后重试",
+                        )
+                        .put("retry_after_ms", 2_000)
+                        .toString(),
+                )
+            } catch (reentrant: io.github.mangi.eta.agent.model.AgentResourceGate.GateReentrant) {
+                AgentModelClient.ToolResult(
+                    content = JSONObject()
+                        .put("ok", false)
+                        .put("code", "RESOURCE_REENTRANT")
+                        .put("message", "域 ${reentrant.slotKey} 内重复申请，已拒绝")
+                        .toString(),
+                )
+            }
+        }
+
         val childToolExecutor = AgentModelClient.ToolExecutor { subCall ->
             childController.throwIfCancelled()
             if (!profile.isToolAllowed(subCall.name)) {
@@ -297,8 +347,27 @@ internal class SubagentExecutor(
                         )
                         .toString(),
                 )
+            } else if (AgentToolRequirements.domainOf(subCall.name) == ToolDomain.SCREEN) {
+                // 灵屏是单例：另一个子代理正在用，就排队等，不要把两次点击交错到同一块屏幕上。
+                if (SubagentRunRegistry.acquireScreen(subagentId)) {
+                    runGated(subCall)
+                } else {
+                    val owner = SubagentRunRegistry.screenOwner() ?: "其它子代理"
+                    AgentModelClient.ToolResult(
+                        content = JSONObject()
+                            .put("ok", false)
+                            .put("code", "SCREEN_BUSY")
+                            .put(
+                                "message",
+                                "屏幕正被另一子代理使用（占用者 $owner），已排队第 " +
+                                    "${SubagentRunRegistry.screenQueueSize()} 位；" +
+                                    "可先做不需要屏幕的准备工作，或等它释放。",
+                            )
+                            .toString(),
+                    )
+                }
             } else {
-                baseToolExecutor.execute(subCall)
+                runGated(subCall)
             }
         }
 
@@ -319,6 +388,25 @@ internal class SubagentExecutor(
         var abortCode: String? = null
         var abortReason: String? = null
         var consecutiveFailures = 0
+
+        // 并发上限：只有真要动屏幕的子代理才吃「屏幕槽位 2」，纯查资料/写文件的按配置来。
+        // 不再借内存闸门（sessionLimit）或控制台会话数当上界：那是「同时跑几个会话」的语义，
+        // 拿来限制「一个会话内派几个子代理」会随内存波动误杀。见论证 §4.4/R9。
+        val configured = (guard?.maxParallel ?: 8).coerceAtLeast(1)
+        val wantsScreen = profile.isToolAllowed("observe_screen") && profile.isToolAllowed("tap")
+        val screenCap = if (wantsScreen) 2 else configured
+        val effective = minOf(configured, screenCap).coerceAtLeast(1)
+        if (!SubagentConcurrency.tryAcquire(concurrencyKey, effective)) {
+            SubagentRunRegistry.unregister(subagentId)
+            controllerBinding.close()
+            SubagentSessionStore.releaseRunning(conversationKey, subagentId)
+            return errorResult(
+                "SUBAGENT_LIMIT_REACHED",
+                "本会话当前可并行 $effective 个（配置 $configured" +
+                    (if (wantsScreen) "，屏幕槽位 2" else "") + "），本次派发被拒绝；" +
+                    "请等现有子智能体结束，或在子智能体设置里调高并行上限。",
+            )
+        }
 
         return try {
             val response = AgentModelClient.complete(
@@ -474,6 +562,9 @@ internal class SubagentExecutor(
                 command = latestSnapshots[toolCall.id],
             )
         } finally {
+            SubagentConcurrency.release(concurrencyKey)
+            // 先归还屏幕槽位再注销：releaseScreen 要把队首扶正并唤醒它。
+            SubagentRunRegistry.releaseScreen(subagentId)
             SubagentRunRegistry.unregister(subagentId)
             controllerBinding.close()
         }
@@ -888,8 +979,17 @@ internal object SubagentConcurrency {
         }
     }
 
+    /**
+     * 归还一个并行名额。
+     *
+     * 必须用 [ConcurrentHashMap.compute] 原子完成「减一并可能移除」：早先是
+     * `decrementAndGet()` 后再 `remove(key, counter)`，两个线程交错时，
+     * 刚被移除的那个 counter 可能仍被另一线程的 CAS 持有 → 计数随对象一起消失、
+     * `activeCount` 归 0，随后新建的计数器又放行上限个，实际并发可翻倍。
+     */
     fun release(key: String) {
-        val counter = active[key] ?: return
-        if (counter.decrementAndGet() <= 0) active.remove(key, counter)
+        active.compute(key) { _, counter ->
+            counter?.let { if (it.decrementAndGet() <= 0) null else counter }
+        }
     }
 }

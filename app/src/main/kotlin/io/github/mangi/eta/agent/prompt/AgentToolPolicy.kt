@@ -22,7 +22,34 @@ internal data class AgentToolPolicy(
     val version: Int = 0,
 ) {
     fun allows(toolName: String): Boolean =
-        mode == ToolPolicyMode.ALLOW_ALL || toolName in allowedTools
+        mode == ToolPolicyMode.ALLOW_ALL || toolName in allowedTools || toolName in ALWAYS_ALLOWED
+
+    /**
+     * 白名单模式下被「无条件放行」的工具。
+     *
+     * 这些工具是**编排类**的：它们自己不碰设备、不改文件，只是决定「本轮允许模型做什么」。
+     * 提示词里已经按开关声明了它们（见 [io.github.mangi.eta.agent.model.AgentPromptBuilder]
+     * 的 subagent 段），如果白名单把它们滤掉，就会出现「提示词教模型用 subagent，
+     * 请求里却没有这个工具」的错位——模型一调就是 TOOL_NOT_AVAILABLE，
+     * 而用户在设置页的白名单清单里根本找不到它可勾选（2026-11-20 实测）。
+     *
+     * 真正的边界仍然在执行侧：[io.github.mangi.eta.agent.tool.AgentLocalTools] 的
+     * 审批闸门与子代理自身的工具白名单照常生效，这里只是不让编排工具在目录层消失。
+     */
+    private val ALWAYS_ALLOWED: Set<String> = setOf(
+        io.github.mangi.eta.agent.subagent.AgentSubagentToolCatalog.TOOL_NAME,
+        io.github.mangi.eta.agent.subagent.AgentSubagentToolCatalog.PROFILE_TOOL_NAME,
+        // 专家管理同样属于编排类：只读写应用内 Prefs（ExpertStore），不碰设备、不改文件，
+        // 白名单模式下若被滤掉，就会出现「提示词教模型用 expert_manage，请求里却没有」的错位，
+        // 用户说「帮我建个 XX 专家」时模型一调就是 TOOL_NOT_AVAILABLE（2026-11-20 实测）。
+        io.github.mangi.eta.agent.model.AgentExpertToolCatalog.TOOL_NAME,
+        // ask_user 是模型唯一能主动追问用户并拿到选项答案的入口，属于编排/交互类：
+        // 不改设备、不改文件、只暂停本轮等用户选择（风险决策由系统审批卡拦截）。
+        // 白名单模式下若被滤掉，模型遇到需要用户拍板的场景就只剩编答案一条路。
+        // 与 expert_manage 同样的错位问题：设置页白名单列表里根本没有它可勾选，
+        // 必须放入无条件放行集合，避免「提示词教模型问，请求里却没有 ask_user」。
+        "ask_user",
+    )
 
     fun filterTools(tools: JSONArray): JSONArray {
         if (mode == ToolPolicyMode.ALLOW_ALL) return tools
@@ -30,7 +57,7 @@ internal data class AgentToolPolicy(
         for (index in 0 until tools.length()) {
             val schema = tools.optJSONObject(index) ?: continue
             val name = schema.optJSONObject("function")?.optString("name").orEmpty()
-            if (name.isNotEmpty() && allows(name)) filtered.put(schema)
+            if (name.isNotEmpty() && (allows(name) || name in ALWAYS_ALLOWED)) filtered.put(schema)
         }
         return filtered
     }

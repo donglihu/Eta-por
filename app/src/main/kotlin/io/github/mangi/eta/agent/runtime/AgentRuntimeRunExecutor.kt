@@ -8,6 +8,8 @@ import io.github.mangi.eta.agent.tool.ConversationHistoryTool
 import io.github.mangi.eta.data.db.EtaDatabase
 import io.github.mangi.eta.agent.model.AgentModelClient
 import io.github.mangi.eta.agent.model.AgentModelExecutionException
+import io.github.mangi.eta.agent.model.AgentResourceGate
+import io.github.mangi.eta.agent.display.VirtualScreenSession
 import io.github.mangi.eta.agent.model.AgentModelFailure
 import io.github.mangi.eta.agent.model.AgentHttpClient
 import io.github.mangi.eta.agent.memory.AgentMemoryContext
@@ -33,14 +35,23 @@ import io.github.mangi.eta.agent.tool.AgentToolRequirements
 import io.github.mangi.eta.agent.tool.AgentToolCapabilities
 import io.github.mangi.eta.agent.tool.PendingSkillConflictCapabilityParser
 import io.github.mangi.eta.agent.tool.ToolExecutionDecision
+import io.github.mangi.eta.agent.tool.ToolReviewArbiter
 import io.github.mangi.eta.agent.voice.EtaAssistantOverlayService
 import io.github.mangi.eta.core.AndroidAgentLogger
 import io.github.mangi.eta.core.safeLogType
 import io.github.mangi.eta.data.repository.AgentMemoryRepository
 import io.github.mangi.eta.data.repository.RuntimeConfigRepository
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONArray
 import org.json.JSONObject
+
+/** Root 探测等待上限；超时按「权限未确认」继续，避免整次运行无限挂起。 */
+private const val ROOT_PROBE_WAIT_TIMEOUT_MS = 8_000L
+
+/** 超长工具结果的落盘目录（相对 cacheDir）与单个 run 目录的文件数上限。 */
+private const val TOOL_OUTPUT_DIR = "agent-tool-output"
+private const val TOOL_OUTPUT_MAX_FILES = 64
 
 /**
  * 单次 Runtime run 的阻塞执行器。
@@ -75,7 +86,23 @@ internal class AgentRuntimeRunExecutor(
         request: AgentRuntimeWire.RunRequest,
     ): Outcome {
         val runController = session.controller
+        // 资源闸门的生产侧接线（放在 runtime 包：它本来就依赖 agent/display，model 包不反向依赖）：
+        // ① 屏幕槽按「该会话有没有活跃灵屏」分槽——灵屏是按 owner 多开的，两个会话各自的屏
+        //    不该挤在 SCREEN:main 里互相排队；② 每次运行开始刷新总开关，改 Prefs 后下一个 run 生效。
+        AgentResourceGate.screenSlotOf = { conversation ->
+            if (conversation.isNotBlank() && VirtualScreenSession.isActive(conversation)) {
+                "ls:$conversation"
+            } else {
+                "main"
+            }
+        }
+        AgentResourceGate.refreshEnabledFromPrefs()
         val archivedEvents = mutableListOf<AgentEvent>()
+        // 归档事件只对「外部入口 handoff」的 run 有消费者（AgentRunArchiveStore → importExternalRun
+        // 逐条回放事件补出正文）；其余 run 的归档在 persistArchivedRun 里立即丢弃。
+        // 这些 run 不再收文本增量，流式期同一条正文不必在内存里躺两遍。
+        val archiveDeltaEvents = request.handoff
+            ?.let { handoff -> AgentExternalArchivePayload.from(handoff.payload) } != null
         var entrySurfaceGuard: EntrySurfaceGuard? = null
         var toolExecutor: AutoCloseable? = null
         var toolsBinding: AgentRunController.ResourceBinding? = null
@@ -84,12 +111,24 @@ internal class AgentRuntimeRunExecutor(
         var roleplayRun = false
         var checkpointRecorder: AgentRunCheckpointRecorder? = null
         val timing = AgentRunTiming(AndroidAgentLogger)
+        AgentPerfTrace.trace(
+            "perf.run.begin",
+            "runId=${request.runId.take(12)} op=${request.operation} " +
+                "history=${request.history.size} prompt=${request.prompt.length} " +
+                "images=${request.images.size} plan=${request.planMode}",
+        )
+
+        /** 准备阶段各节点的单调时钟起点：只看相邻两行的差值就能定位慢在哪一步。 */
+        fun stageMark(): Long = AgentPerfTrace.elapsedNow()
 
         // 失败清理需要在 try 外拿到会话 id。
         var memoryConversationId: String? = null
         val result = try {
             val contextWindow = request.config.knownContextWindow
+            var mark = stageMark()
             checkpointRecorder = AgentRunCheckpointRecorder.create(appContext, request)
+            timing.stage("checkpoint", mark)
+            mark = stageMark()
             entrySurfaceGuard = EntrySurfaceGuard.from(
                 handoff = request.handoff,
                 logger = AndroidAgentLogger,
@@ -97,6 +136,8 @@ internal class AgentRuntimeRunExecutor(
                     EtaAssistantOverlayService.dismissForForegroundOperation(appContext)
                 },
             )
+            timing.stage("entry_surface", mark)
+            mark = stageMark()
             val skillIndexService = SkillRuntime.createIndexService(appContext)
             val skillLoader = SkillRuntime.createLoader(appContext)
             val skillResourceReader = SkillRuntime.createResourceReader(appContext)
@@ -109,6 +150,8 @@ internal class AgentRuntimeRunExecutor(
                 installedSkills = skillIndexService.listInstalledSkills()
                     .filter { SkillCompatibilityChecker.evaluate(it).available },
             )
+            timing.stage("skills", mark)
+            mark = stageMark()
             val memoryEnabled = runBlocking { AgentMemoryRepository.isEnabled() }
             val uiPayload = request.handoff
                 ?.takeIf { it.source == AgentRuntimeWire.AGENT_UI_HANDOFF_SOURCE }
@@ -116,6 +159,8 @@ internal class AgentRuntimeRunExecutor(
             val conversationId = uiPayload?.conversationId
                 ?.takeIf { it.isNotBlank() }
             memoryConversationId = conversationId
+            timing.stage("ui_payload", mark)
+            mark = stageMark()
             val roleplayContext = conversationId?.let { id ->
                 runBlocking { RoleplayRunContext.resolve(appContext, id, contextWindow, memoryEnabled) }
             }
@@ -149,15 +194,31 @@ internal class AgentRuntimeRunExecutor(
             } else {
                 AgentMemoryContext.DISABLED
             }
+            timing.stage("memory_context", mark)
+            mark = stageMark()
             if (request.config.terminalTools) {
                 // 启动探测由 App 拥有；模型首轮等待其结果，避免把检测中的授权当成普通设备。
-                runBlocking {
-                    while (io.github.mangi.eta.agent.device.RootAccess.state.value.isChecking) {
-                        runController.throwIfCancelled()
-                        kotlinx.coroutines.delay(100)
+                val rootProbeSettled = runBlocking {
+                    withTimeoutOrNull(ROOT_PROBE_WAIT_TIMEOUT_MS) {
+                        while (io.github.mangi.eta.agent.device.RootAccess.state.value.isChecking) {
+                            runController.throwIfCancelled()
+                            kotlinx.coroutines.delay(100)
+                        }
+                        true
+                    } ?: false
+                }
+                if (!rootProbeSettled) {
+                    AgentPerfTrace.trace(
+                        "perf.prepare.root_probe_timeout",
+                        "waited_ms=${ROOT_PROBE_WAIT_TIMEOUT_MS}",
+                    )
+                    AndroidAgentLogger.warnThrottled("root_probe_wait_timeout") {
+                        "Root probe still checking after ${ROOT_PROBE_WAIT_TIMEOUT_MS}ms; continuing with unconfirmed permissions"
                     }
                 }
             }
+            timing.stage("root_probe", mark)
+            mark = stageMark()
             val pendingSkillConflict = PendingSkillConflictCapabilityParser.parse(request.history)
             val mcpSnapshot = runBlocking {
                 runCatching { McpRunSnapshot.load() }.getOrElse { throwable ->
@@ -168,12 +229,41 @@ internal class AgentRuntimeRunExecutor(
                 }
             }
             val mcpTools = JSONArray().also(mcpSnapshot::appendModelTools)
+            timing.stage("mcp_snapshot", mark)
+            mark = stageMark()
+            // 工具调用审查「智能」档的 LLM 裁决器：优先用 toolReviewDecisionModelId 指定的决策模型，
+            // 未指定回落主对话模型；裁决失败/超时一律放行，不新增阻断面。
+            // 决策模型 ID 有两种历史口径：新值存 Model.id（UUID），旧版本存对外 modelId。
+            // 这里先归一到 Model.id 再交给 runtimeConfigFor，既修掉老配置永远匹配不上、
+            // 静默回落主对话模型的问题，也保留它内部的 ensureBuiltInsMerged 与默认模型兜底语义。
+            val reviewArbiter = ToolReviewArbiter(
+                config = runBlocking {
+                    val decisionModelId =
+                        io.github.mangi.eta.data.datastore.SettingsDataStore.settings().toolReviewDecisionModelId
+                    if (decisionModelId.isBlank()) {
+                        request.config
+                    } else {
+                        io.github.mangi.eta.data.repository.ProviderRepository.ensureBuiltInsMerged()
+                        val providers = io.github.mangi.eta.data.repository.ProviderRepository.allProviders()
+                        val canonicalId = providers.enabledModel(decisionModelId)?.model?.id
+                            ?: providers.enabledModelByApiId(decisionModelId)?.model?.id
+                            ?: decisionModelId
+                        RuntimeConfigRepository.runtimeConfigFor(canonicalId) ?: request.config
+                    }
+                },
+            )
+            timing.stage("review_arbiter", mark)
+            mark = stageMark()
             val executor = AgentLocalTools(
                 context = appContext,
                 logger = AndroidAgentLogger,
                 browserRunId = request.runId,
                 virtualScreenOwner = request.virtualScreenOwner,
                 isRunCancelled = { runController.isCancelled },
+                // 上游 36b1c77f：read_image 等图片摄入按当前渠道预算编码（Anthropic 3.5 MB / 其它 8 MB）。
+                imageBudgetProvider = {
+                    io.github.mangi.eta.agent.media.ModelImageBudget.forProviderType(request.config.providerType)
+                },
                 browserToolsEnabled = {
                     request.config.browserTools && currentPermissions().browserTools
                 },
@@ -261,9 +351,12 @@ internal class AgentRuntimeRunExecutor(
                 runAvailableSkillIds = skillContext.installedSkills.mapTo(mutableSetOf()) { it.id },
                 pendingSkillConflict = pendingSkillConflict,
                 skillAuthoringService = SkillAuthoringService(skillIndexService, skillPackageInstaller),
+                toolReviewArbiter = reviewArbiter::decide,
                 onMainScreenFallback = { session.mainScreenFallbackApproved.set(true) },
                 onVirtualTaskCancelled = { session.cancel("用户取消灵屏任务") },
             )
+            timing.stage("local_tools", mark)
+            mark = stageMark()
             val routingExecutor = RoutingToolExecutor(
                 local = executor,
                 mcp = McpToolExecutor(mcpSnapshot),
@@ -271,6 +364,8 @@ internal class AgentRuntimeRunExecutor(
             toolExecutor = routingExecutor
             toolsBinding = runController.register(routingExecutor::close)
             timing.preparationFinished(skillContext.installedSkills.size)
+            timing.stage("routing_executor", mark)
+            mark = stageMark()
             // 手动压缩复用主会话工具目录以保持 Provider 前缀缓存，必须暴露与 OP_CHAT 一致的 conversation_history。
             val historyTool = if (
                 request.operation == AgentRuntimeWire.OP_CHAT ||
@@ -324,6 +419,7 @@ internal class AgentRuntimeRunExecutor(
                         session,
                         progressEvent,
                         archivedEvents,
+                        archiveDeltaEvents,
                         entrySurfaceGuard,
                         checkpointRecorder,
                     )
@@ -395,9 +491,27 @@ internal class AgentRuntimeRunExecutor(
                     }
                 }
             }
+            // 专家可以覆盖模型：指定了 provider+model 就用它跑这一轮；
+            // 解析失败（模型被删/停用）时退回会话配置，不因为一个过期字段让整轮发不出去。
+            val expert = io.github.mangi.eta.agent.expert.ExpertStore.active()
+            val runConfig = if (expert != null && !expert.inheritsModel) {
+                runBlocking {
+                    RuntimeConfigRepository.expertRuntimeConfig(request.config, expert.providerId, expert.modelId)
+                }
+            } else {
+                request.config
+            }
+            timing.stage("run_tools_and_config", mark)
+            AgentPerfTrace.trace(
+                "perf.loop.begin",
+                "runId=${request.runId.take(12)} prepare_ms=${AgentPerfTrace.since(timing.runStartElapsed)} " +
+                    "tools=${runTools.length()} msgs=${request.history.size}",
+            )
             val completedResponse = AgentModelClient.complete(
-                config = request.config,
+                config = runConfig,
                 sessionId = request.effectiveModelSessionId,
+                // 并发闸门的会话键与子代理同一个表达式：同对话的工具串行，跨对话按资源并行。
+                conversationKey = conversationId ?: request.runId,
                 operationId = request.runId,
                 initialUserMessageId = uiPayload?.promptMessageId(request.runId) ?: "user-${request.runId}",
                 initialSupplementIndex = uiPayload?.lastSupplementIndex ?: 0,
@@ -426,12 +540,16 @@ internal class AgentRuntimeRunExecutor(
                 memoryContext = memoryContext,
                 additionalTools = runTools,
                 executionContext = executor.terminalExecutionContext,
+                toolResultSpill = { toolName, toolCallId, content ->
+                    spillToolResult(appContext, request.runId, toolName, toolCallId, content)
+                },
             ) { event ->
                 timing.accept(event)
                 acceptEvent(
                     session,
                     event,
                     archivedEvents,
+                    archiveDeltaEvents,
                     entrySurfaceGuard,
                     checkpointRecorder,
                 )
@@ -483,6 +601,7 @@ internal class AgentRuntimeRunExecutor(
                         session,
                         event,
                         archivedEvents,
+                        archiveDeltaEvents,
                         entrySurfaceGuard,
                         checkpointRecorder,
                     )
@@ -548,6 +667,13 @@ internal class AgentRuntimeRunExecutor(
                 }
         }
         val reviewEpoch = reviewGeneration
+        if (!committed) {
+            // complete() 在会话已被 cancel/替换（state 非 RUNNING）时返回 false：结果不能再发
+            // 第二次，也不能把这个 run 投影回运行中；留一条日志供对账。
+            AndroidAgentLogger.info(
+                "Agent runtime result not published: session already terminal, run_id=${request.runId}"
+            )
+        }
         if (committed && result.ok && !cancelled && !roleplayRun && reviewEpoch != null) {
             response?.let { completed ->
                 runCatching { AgentExperienceReview.submit(appContext, reviewEpoch, completedRequest, completed, archivedEvents.toList()) }
@@ -563,16 +689,70 @@ internal class AgentRuntimeRunExecutor(
         )
     }
 
+    /**
+     * 超长工具结果落到应用缓存目录，返回全文绝对路径。
+     *
+     * 会话里只留头尾分段，全文留在磁盘：这是 2026-11-22 堆爆那条链路的收口点
+     * （同一条 `get_logcat` 几万字符会在 messages、transcript、checkpoint、子代理历史里各存一份）。
+     * 写失败不静默：节流记一条 warn，循环侧拿不到路径就只在截断说明里写「全文未落盘」。
+     */
+    private fun spillToolResult(
+        context: Context,
+        runId: String,
+        toolName: String,
+        toolCallId: String,
+        content: String,
+    ): String? {
+        val dir = java.io.File(java.io.File(context.cacheDir, TOOL_OUTPUT_DIR), runId.take(48))
+        return try {
+            if (!dir.exists() && !dir.mkdirs() && !dir.isDirectory) {
+                AndroidAgentLogger.warnThrottled("agent_tool_spill_dir_failed") {
+                    "Tool result spill directory unavailable: runId=$runId"
+                }
+                return null
+            }
+            pruneToolOutput(dir)
+            val safeCallId = toolCallId
+                .filter { it.isLetterOrDigit() || it == '-' || it == '_' }
+                .take(64)
+                .ifBlank { "tool" }
+            val file = java.io.File(dir, "$safeCallId.txt")
+            file.writeText(content, Charsets.UTF_8)
+            AndroidAgentLogger.debug {
+                "Tool result spilled: name=$toolName chars=${content.length} path=${file.absolutePath}"
+            }
+            file.absolutePath
+        } catch (failure: java.io.IOException) {
+            AndroidAgentLogger.warnThrottled("agent_tool_spill_failed") {
+                "Tool result spill failed: name=$toolName type=${failure.safeLogType()}"
+            }
+            null
+        }
+    }
+
+    /** 单个 run 目录里的落盘文件按数量兜底，避免长会话把缓存目录堆满。 */
+    private fun pruneToolOutput(dir: java.io.File) {
+        val files = dir.listFiles() ?: return
+        if (files.size < TOOL_OUTPUT_MAX_FILES) return
+        files.sortedBy { it.lastModified() }
+            .take(files.size - TOOL_OUTPUT_MAX_FILES + 1)
+            .forEach { stale -> stale.delete() }
+    }
+
     private fun acceptEvent(
         session: AgentRuntimeSession,
         event: AgentEvent,
         archivedEvents: MutableList<AgentEvent>,
+        archiveDeltaEvents: Boolean,
         entrySurfaceGuard: EntrySurfaceGuard?,
         checkpointRecorder: AgentRunCheckpointRecorder?,
     ) {
         checkpointRecorder?.accept(event)
         if (!session.emit(event)) return
-        archivedEvents += event
+        // 文本增量只对需要回放重建正文的外部归档有意义，见 execute() 里的说明。
+        if (archiveDeltaEvents || event !is AgentEvent.AssistantBlockDelta) {
+            archivedEvents += event
+        }
         if (event is AgentEvent.ModelRetryScheduled) {
             AndroidAgentLogger.warn("Agent runtime event: ${event.toLogLine()}")
         } else if (event !is AgentEvent.AssistantBlockDelta) {

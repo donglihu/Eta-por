@@ -27,9 +27,41 @@ internal object AgentHistoryTrimmer {
         return cjk + (other + 3) / 4
     }
 
-    /** 单条消息的估算：直接按它的 JSON 体积折算，含 content / tool_calls / 模型思考。 */
+    /**
+     * 单条消息的估算：按它的 JSON 体积折算，含 content / tool_calls / 模型思考。
+     *
+     * 早期实现是 `estimateTokens(message.toString())`，一次裁剪就要为**每条历史消息**
+     * 物化一整份 JSON 字符串（还要在「算总量」与「算被丢轮次」两趟里各来一遍）。
+     * 一条几万字符的工具结果 × 数百条历史 × 6 个并发 run 就是堆爆的直接来源，
+     * 因此改成不分配字符串的逐字段字符计数：[estimateJsonTokens]。
+     */
     private fun estimateMessageTokens(message: JSONObject?): Int =
-        if (message == null) 0 else estimateTokens(message.toString())
+        if (message == null) 0 else estimateJsonTokens(message)
+
+    /**
+     * 不物化字符串的 JSON 字符数估算：递归累加键名与值，数字/布尔按字面长度折算。
+     * 只用于 token 预算判定，不需要与 `toString()` 完全等长（键名分隔符等固定开销可忽略）。
+     */
+    fun estimateJsonTokens(value: Any?): Int = when (value) {
+        null, JSONObject.NULL -> 0
+        is String -> estimateTokens(value)
+        is JSONObject -> {
+            var total = 0
+            val keys = value.keys()
+            while (keys.hasNext()) {
+                val key = keys.next()
+                total += key.length
+                total += estimateJsonTokens(value.opt(key))
+            }
+            total
+        }
+        is JSONArray -> {
+            var total = 0
+            for (index in 0 until value.length()) total += estimateJsonTokens(value.opt(index))
+            total
+        }
+        else -> estimateTokens(value.toString())
+    }
 
     data class Outcome(
         val omittedMessages: Int = 0,

@@ -90,6 +90,13 @@ internal data class ConversationIdentity(
 
 internal data class ConversationMessageContent(val id: String, val content: String)
 
+/** 会话首条用户消息（可能仍带分块引用头，读取时需 [ChunkedTextDao.restoreText] 还原）。 */
+internal data class ConversationFirstUserMessage(
+    @ColumnInfo(name = "conversation_id") val conversationId: String,
+    val id: String,
+    val content: String,
+)
+
 @Serializable
 @Entity(
     tableName = "conversation_context_checkpoints",
@@ -166,6 +173,13 @@ internal data class ConversationMessageEntity(
     @ColumnInfo(name = "result_summary") val resultSummary: String? = null,
     @ColumnInfo(name = "image_count") val imageCount: Int = 0,
     @ColumnInfo(name = "tools_json") val toolsJson: String = "[]",
+    /**
+     * 工具开始执行的墙钟毫秒（只对 `type = tool` 且仍在运行的消息有意义）。
+     *
+     * 落库是为了让运行计时跟着会话走：切会话回来继续算，而不是从 0 重来。
+     * 旧库行没有这个值，读取侧按「没有起点」处理。
+     */
+    @ColumnInfo(name = "tool_started_at") val toolStartedAt: Long? = null,
     /** 消息写入时刻（毫秒）；0 表示这条消息来自没有该列的旧版本，界面按「不显示时间」处理。 */
     @ColumnInfo(name = "created_at", defaultValue = "0") val createdAt: Long = 0L,
 )

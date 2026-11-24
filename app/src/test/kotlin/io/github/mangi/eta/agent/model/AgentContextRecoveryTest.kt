@@ -35,11 +35,82 @@ class AgentContextRecoveryTest {
     }
 
     @Test
+    fun thresholdSettingDrivesAutomaticCompactionBoundary() {
+        // 阈值来自设置（0=关闭，其余为窗口占用百分比），不再是写死的 85%。
+        fun summariesAt(percent: Int, input: Int): Pair<Int, Boolean> {
+            var summaries = 0
+            val session = AgentContextSession(
+                config.copy(autoCompactionTriggerPercent = percent), messages(), 1, "operation",
+                provider { _, _ -> summaries++; response("历史已完成。") },
+                AgentRunController(), { emptySet() }, {}, {},
+            )
+            session.observeInputTokens(input)
+            session.compact()
+            return summaries to (session.snapshot() != null)
+        }
+        // 900_000 窗口：60% → 540_000 触发；90% → 810_000 触发。
+        assertEquals(0 to false, summariesAt(60, 539_999))
+        assertEquals(1 to true, summariesAt(60, 540_000))
+        assertEquals(0 to false, summariesAt(90, 809_999))
+        assertEquals(1 to true, summariesAt(90, 810_000))
+        // 0 = 关闭：用量再高也不自动压缩。
+        assertEquals(0 to false, summariesAt(0, 890_000))
+    }
+
+    @Test
+    fun failedAutomaticSummaryKeepsTheRoundAndOriginalHistory() {
+        // 自动压缩是后台优化：摘要请求失败只能「这次没压成」，不能把整轮回答打成运行错误。
+        val messages = messages()
+        val original = messages.toString()
+        var compactionRequests = 0
+        val session = AgentContextSession(config, messages, 1, "operation", provider { request, _ ->
+            if (request.purpose == ProviderRequestPurpose.COMPACTION) {
+                compactionRequests++
+                throw AgentModelFailure("MODEL_TIMEOUT", true, "fixture")
+            }
+            response("不应走到这里")
+        }, AgentRunController(), { emptySet() }, {}, { fail("失败摘要不能提交") })
+        session.observeInputTokens(765_000)
+        session.compact()
+        assertEquals(1, compactionRequests)
+        assertEquals(original, messages.toString())
+        assertNull(session.snapshot())
+    }
+
+    @Test
+    fun failedAutomaticSummaryBacksOffBeforeRetrying() {
+        // 失败重试要按用量退避（5% 窗口），否则长任务每个 round 都重打一次注定失败的摘要。
+        val messages = messages()
+        var compactionRequests = 0
+        val session = AgentContextSession(config, messages, 1, "operation", provider { request, _ ->
+            if (request.purpose == ProviderRequestPurpose.COMPACTION) {
+                compactionRequests++
+                throw AgentModelFailure("MODEL_TIMEOUT", true, "fixture")
+            }
+            response("不应走到这里")
+        }, AgentRunController(), { emptySet() }, {}, {})
+        session.observeInputTokens(765_000)
+        session.compact()
+        session.compact()
+        assertEquals(1, compactionRequests)
+        // 900_000 窗口的 5% = 45_000：涨满才允许再试。
+        session.observeInputTokens(765_000 + 44_999)
+        session.compact()
+        assertEquals(1, compactionRequests)
+        session.observeInputTokens(765_000 + 45_000)
+        session.compact()
+        assertEquals(2, compactionRequests)
+    }
+
+    @Test
     fun automaticCompactionUsesOnlyActualInputUsageAndConfiguredWindow() {
-        for (input in listOf(null, 300_000, 764_999, 765_000)) {
+        // 阈值显式给 80%（当前默认档），边界 = 900_000 × 80% = 720_000；
+        // 不再依赖 ModelConfig 的默认值，避免默认档位调整时这条用例跟着漂。
+        val thresholdConfig = config.copy(autoCompactionTriggerPercent = 80)
+        for (input in listOf(null, 300_000, 719_999, 720_000)) {
             var summaries = 0
             val events = mutableListOf<AgentEvent>()
-            val result = AgentModelClient.complete(config, "继续",
+            val result = AgentModelClient.complete(thresholdConfig, "继续",
                 AgentModelClient.ToolExecutor { error("不应执行工具") },
                 history = history(), onEvent = events::add, provider = provider { request, emit ->
                     if (request.purpose == ProviderRequestPurpose.COMPACTION) {
@@ -51,11 +122,11 @@ class AgentContextRecoveryTest {
                         response("完成")
                     }
                 })
-            assertEquals(if (input == 765_000) 1 else 0, summaries)
+            assertEquals(if (input == 720_000) 1 else 0, summaries)
             assertEquals("完成", result.content)
             val completed = events.filterIsInstance<AgentEvent.ContextCompaction>().lastOrNull()
-            if (input == 765_000) {
-                assertEquals(765_000, completed!!.tokensBefore)
+            if (input == 720_000) {
+                assertEquals(720_000, completed!!.tokensBefore)
                 assertNull(completed.tokensAfter)
             } else assertNull(completed)
         }

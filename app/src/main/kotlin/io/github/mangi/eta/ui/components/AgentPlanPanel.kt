@@ -13,24 +13,33 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.rounded.CheckCircle
+import androidx.compose.material.icons.outlined.CheckBox
 import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.ExpandLess
 import androidx.compose.material.icons.rounded.ExpandMore
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
+import androidx.compose.ui.input.nestedscroll.NestedScrollSource
+import androidx.compose.ui.input.nestedscroll.nestedScroll
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -55,7 +64,24 @@ import top.yukonga.miuix.kmp.theme.MiuixTheme
 private val HeaderIconTouchTarget = 40.dp
 
 /**
- * 会话框上方的任务清单：标题行常驻，展开才是完整步骤。
+ * 展开态步骤列表的最大高度。
+ *
+ * 面板停靠在会话框输入框的正上方，展开时会长高；步骤一多就把消息区挤没，
+ * 表现就是「待办列表超长时看不到后面的步骤」。
+ *
+ * 这里给展开列表一个高度上限并让它自己滚：超出上限的部分在面板内部滑动，
+ * 输入框与面板始终留在屏幕上，步骤一条都不丢。
+ */
+private val PlanExpandedMaxHeight = 320.dp
+
+/** 展开列表最多占屏幕高度的比例：矮屏上不能把消息区挤没。 */
+private const val PlanExpandedMaxScreenRatio = 0.42f
+
+/**
+ * 会话输入框正上方的任务清单：标题行常驻，展开才是完整步骤。
+ *
+ * 位置：贴在输入框上方（同一列内、输入栏之上），不是浮在屏幕顶部也不是盖住会话。
+ * 用户始终能同时看到「待办」和「输入框」，两者是一条连续的底部区域。
  *
  * 标题固定为「任务待办」，状态不写进标题：
  * 进度胶囊给总账（0/8 完成），行内的「进行中」胶囊给当前那一步，
@@ -75,14 +101,60 @@ internal fun AgentPlanPanel(
 ) {
     if (steps.isEmpty()) return
     var expanded by rememberSaveable(expandedKey) { mutableStateOf(false) }
+    val planScrollState = rememberScrollState()
+    // 拦截面板的嵌套滑动：面板可滚时全部自己吃掉；到顶/到底后也不再往下传，
+    // 避免会话列表被面板的滑动带着跑。
+    // 拦截面板的嵌套滑动，锁住手势不让下层会话列表跟着滚。
+    //
+    // 写法和项目既有的 EtaVoicePanel 一致（onPreScroll + onPostScroll 双段）：
+    // onPreScroll 拦「还没到边界」的部分，onPostScroll 补拦「面板已经吃不动」的剩余位移，
+    // 两段合起来才不会出现「滑到尽头后手指一松，会话列表突然跟着跳一下」。
+    val planScrollConnection = remember {
+        object : NestedScrollConnection {
+            override fun onPreScroll(available: Offset, source: NestedScrollSource): Offset {
+                if (source != NestedScrollSource.UserInput) return Offset.Zero
+                val state = planScrollState
+                val delta = available.y
+                // 已经到对应方向的边界：整段吃掉，下层列表就不动。
+                val atTop = state.value <= 0f
+                val atBottom = state.value >= state.maxValue
+                if ((delta > 0f && atTop) || (delta < 0f && atBottom)) {
+                    return Offset(0f, delta)
+                }
+                return Offset.Zero
+            }
+
+            override fun onPostScroll(
+                consumed: Offset,
+                available: Offset,
+                source: NestedScrollSource,
+            ): Offset {
+                if (source != NestedScrollSource.UserInput) return Offset.Zero
+                val state = planScrollState
+                val remaining = available.y
+                if (remaining == 0f) return Offset.Zero
+                // 面板已经吃不动了：把剩余位移也吃掉，绝不传给下层的会话列表。
+                val atTop = state.value <= 0f
+                val atBottom = state.value >= state.maxValue
+                if ((remaining > 0f && atTop) || (remaining < 0f && atBottom)) {
+                    return Offset(0f, remaining)
+                }
+                return Offset.Zero
+            }
+        }
+    }
+    val screenHeight = LocalConfiguration.current.screenHeightDp.dp
+    val maxExpandedHeight = minOf(PlanExpandedMaxHeight, screenHeight * PlanExpandedMaxScreenRatio)
     val done = steps.count { it.isDone }
     val state = planPanelState(steps, isRunning)
     Column(
         modifier = modifier
             .fillMaxWidth()
             .animateContentSize()
+            // 卡片感：描边 + 浅底色，让它读起来是「贴在输入框上方的卡片」，
+            // 而不是浮在会话顶部的一块遮罩。投影已经由外层 Box 提供。
             .squircleBorder(width = 1.dp, color = MiuixTheme.colorScheme.dividerLine, cornerRadius = 18.dp)
-            .squircleSurface(color = MiuixTheme.colorScheme.surface, cornerRadius = 18.dp)
+            .squircleSurface(color = MiuixTheme.colorScheme.surfaceContainer, cornerRadius = 18.dp)
             .padding(horizontal = 14.dp, vertical = 10.dp),
         verticalArrangement = Arrangement.spacedBy(6.dp),
     ) {
@@ -98,8 +170,10 @@ internal fun AgentPlanPanel(
                     .clickable { expanded = !expanded },
                 verticalAlignment = Alignment.CenterVertically,
             ) {
+                // 标题图标用「空心选中复选框」：方框描边、勾是描边，不填底色。
+                // 不用实心 CheckBox——标题行是常驻装饰，实心色块会和右侧的主色进度胶囊抢视觉。
                 Icon(
-                    imageVector = Icons.Rounded.CheckCircle,
+                    imageVector = Icons.Outlined.CheckBox,
                     contentDescription = null,
                     modifier = Modifier.size(20.dp),
                     tint = MiuixTheme.colorScheme.primary,
@@ -131,7 +205,8 @@ internal fun AgentPlanPanel(
             }
             Spacer(modifier = Modifier.width(6.dp))
             PlanHeaderIconButton(
-                icon = if (expanded) Icons.Rounded.ExpandLess else Icons.Rounded.ExpandMore,
+                // 面板停在底部：折叠时箭头朝上（点了向上展开），展开时箭头朝下（点了收回去）。
+                icon = if (expanded) Icons.Rounded.ExpandMore else Icons.Rounded.ExpandLess,
                 contentDescription = stringResource(
                     if (expanded) R.string.chat_plan_collapse else R.string.chat_plan_expand,
                 ),
@@ -146,10 +221,26 @@ internal fun AgentPlanPanel(
         }
         AnimatedVisibility(
             visible = expanded,
-            enter = expandVertically(tween(160)),
-            exit = shrinkVertically(tween(120)),
+            // 面板停在底部（输入框正上方），所以展开要往上长：expandFrom = Bottom 让内容
+            // 从下沿往上铺，收起时也从下沿往下缩。默认的 Top 方向在底部停靠的布局里
+            // 看起来是「内容往下掉」，和「点击向上展开」的直觉相反。
+            enter = expandVertically(animationSpec = tween(160), expandFrom = Alignment.Bottom),
+            exit = shrinkVertically(animationSpec = tween(120), shrinkTowards = Alignment.Bottom),
         ) {
-            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            // 上限 + 内部滚动：步骤再多也只占固定高度，超出的在面板里滑动查看。
+            // heightIn 在 verticalScroll 外层：内容短时按内容高度，长时封顶到上限并可滚动。
+            // 不用 weight：面板本身是 wrap-content 高度，weight 在这种父容器里拿不到剩余空间。
+            //
+            // nestedScroll 把滑动**锁在面板内**：面板就贴在输入框上方，
+            // 不加这个拦截的话，手指在面板上滑到尽头后会把剩余位移交给上面的 LazyColumn，
+            // 表现为「在待办面板上滑动，会话信息也跟着滚」（2026-11-20 用户反馈）。
+            Column(
+                modifier = Modifier
+                    .heightIn(max = maxExpandedHeight)
+                    .nestedScroll(planScrollConnection)
+                    .verticalScroll(planScrollState),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
                 steps.forEach { step ->
                     PlanStepRow(step, isRunning = isRunning, state = state)
                 }

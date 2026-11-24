@@ -8,7 +8,6 @@ import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
-import org.junit.Assert.assertNull
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
@@ -82,8 +81,17 @@ class AgentModelRetryTest {
             assertFalse(AgentModelFailure.http(status, "").retryable)
         }
         assertFalse(AgentModelFailure.http(429, """{"error":{"code":"insufficient_quota"}}""").retryable)
-        assertNull(AgentModelFailure.transport(SSLHandshakeException("certificate")))
-        assertNull(AgentModelFailure.transport(org.json.JSONException("invalid JSON")))
+        // 2026-11-22 契约变更：TLS/协议/未知异常不再返回 null（原来直接抛原异常，日志 model_code 为空），
+        // 改为稳定错误码 + 不重试。
+        val tlsFailure = AgentModelFailure.transport(SSLHandshakeException("certificate"))
+        assertEquals("MODEL_TLS_FAILED", tlsFailure.code)
+        assertFalse(tlsFailure.retryable)
+        val protocolFailure = AgentModelFailure.transport(java.net.ProtocolException("bad status line"))
+        assertEquals("MODEL_PROTOCOL_ERROR", protocolFailure.code)
+        assertFalse(protocolFailure.retryable)
+        val unexpectedFailure = AgentModelFailure.transport(org.json.JSONException("invalid JSON"))
+        assertEquals("MODEL_UNEXPECTED", unexpectedFailure.code)
+        assertFalse(unexpectedFailure.retryable)
         assertTrue(AgentModelFailure.stream(JSONObject().put("type", "overloaded_error"), "过载").retryable)
         assertFalse(AgentModelFailure.stream(JSONObject().put("type", "authentication_error"), "认证失败").retryable)
         assertFalse(AgentModelFailure.http(503, "secret request text").message.orEmpty().contains("secret"))

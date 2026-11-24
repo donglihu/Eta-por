@@ -24,6 +24,14 @@ internal class AgentContextSession(
 ) {
     private val contextWindow = config.knownContextWindow
     private var inputTokens: Int? = null
+    /**
+     * 自动压缩失败后的重试点（绝对输入用量）。
+     *
+     * 失败一次就记下「当前用量 + 5% 窗口」，只有用量涨过这条线才允许再试；
+     * 否则一个长任务里每个 round 都会重打一次注定失败的摘要（手动压缩不受影响，
+     * 它是用户点了就要立刻出结果的路径）。
+     */
+    private var autoRetryAtTokens: Int? = null
     private var compacted = false
     private var consumedSupplementCount = 0
     private var consumedUserTurns = (systemCount until messages.length()).sumOf {
@@ -71,8 +79,13 @@ internal class AgentContextSession(
             }
             return
         }
-        if (!force && (!config.autoCompactionEnabled || contextWindow == null || before == null ||
-                before < contextWindow * TRIGGER_RATIO)
+        // 触发条件 = 「允许自动压缩」且「阈值百分比 > 0」且「实际输入用量 >= 窗口 × 阈值」。
+        // 0 或布尔关闭都表示不自动压缩，交给用户在需要时手动压缩。
+        // 另外：上一次自动压缩失败后要等到用量涨过 5% 窗口才重试，避免每轮都重打一次。
+        val triggerRatio = config.autoCompactionTriggerRatio
+        val waitingForRetry = !force && autoRetryAtTokens?.let { before == null || before < it } == true
+        if (!force && (waitingForRetry || !config.autoCompactionEnabled || triggerRatio <= 0.0 ||
+                contextWindow == null || before == null || before < contextWindow * triggerRatio)
         ) {
             try {
                 publishSnapshot()
@@ -113,6 +126,7 @@ internal class AgentContextSession(
             while (messages.length() > 0) messages.remove(messages.length() - 1)
             for (index in 0 until candidate.length()) messages.put(candidate.getJSONObject(index))
             inputTokens = null
+            autoRetryAtTokens = null
             onEvent(
                 AgentEvent.ContextCompaction(
                     operationId = operation,
@@ -126,9 +140,20 @@ internal class AgentContextSession(
             runController.throwIfCancelled()
             onEvent(AgentEvent.ContextCompaction(operation, "failed", before,
                 reasonCode = (failure as? AgentModelFailure)?.code ?: "CONTEXT_SUMMARY_FAILED"))
-            if (!final) throw failure
-            // 已完成的回答仍成功交付；完整快照随终态 outbox 保存，不依赖先前检查点写入成功。
-            committedSnapshot = createSnapshot(messages)
+            // 自动压缩失败：记下 5% 窗口的退试点，别让长任务每个 round 都重打一次注定失败的摘要。
+            if (!force) {
+                autoRetryAtTokens = contextWindow?.takeIf { it > 0 }?.let { window ->
+                    before?.plus(window / 20)
+                }
+            }
+            // 手动压缩（force）与收尾快照必须显式失败：用户点了压缩就要看到真实结果。
+            // 自动压缩只是后台优化，失败的代价只能是「这一轮没压成」——原始上下文完整保留，
+            // 下一轮用量继续上涨会再触发；绝不因为一次摘要失败把整轮回答打成运行错误。
+            if (force || final) {
+                if (!final) throw failure
+                // 已完成的回答仍成功交付；完整快照随终态 outbox 保存，不依赖先前检查点写入成功。
+                committedSnapshot = createSnapshot(messages)
+            }
         }
     }
 
@@ -139,9 +164,5 @@ internal class AgentContextSession(
             if (!message.optBoolean("_eta_observation")) durable.put(message)
         }
         return AgentConversationCodec.transcript(durable, 0, sensitiveIds())
-    }
-
-    private companion object {
-        const val TRIGGER_RATIO = 0.85
     }
 }

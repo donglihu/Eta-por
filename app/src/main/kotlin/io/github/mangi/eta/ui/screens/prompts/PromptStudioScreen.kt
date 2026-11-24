@@ -29,6 +29,7 @@ import io.github.mangi.eta.agent.prompt.AgentToolPolicyStore
 import io.github.mangi.eta.agent.prompt.PromptConflictAnalyzer
 import io.github.mangi.eta.agent.prompt.PromptConflictLevel
 import io.github.mangi.eta.agent.prompt.PromptCustomizationStore
+import io.github.mangi.eta.agent.prompt.PromptJailbreakStore
 import io.github.mangi.eta.agent.prompt.ToolPolicyMode
 import io.github.mangi.eta.ui.components.EtaArrowPreference
 import io.github.mangi.eta.ui.components.EtaExpandPreference
@@ -37,6 +38,7 @@ import io.github.mangi.eta.ui.components.EtaPreferenceColors
 import io.github.mangi.eta.ui.components.EtaPreferenceGroup
 import io.github.mangi.eta.ui.components.EtaPreferenceGroupTitle
 import io.github.mangi.eta.ui.components.EtaPreferenceIcon
+import io.github.mangi.eta.ui.components.EtaSwitchPreference
 import io.github.mangi.eta.ui.components.MiuixScaffoldPage
 import io.github.mangi.eta.ui.navigation.AppRoute
 import top.yukonga.miuix.kmp.basic.Text
@@ -63,6 +65,10 @@ internal fun PromptStudioScreen(
     val blocking = conflicts.count { it.level == PromptConflictLevel.ERROR }
 
     var showConflicts by remember { mutableStateOf(false) }
+    // 破甲模式：开关与正文都在这里读写，关掉不会丢正文。
+    var jailbreak by remember { mutableStateOf(PromptJailbreakStore.load()) }
+    var editingJailbreak by remember { mutableStateOf(false) }
+    var jailbreakDraft by remember { mutableStateOf(jailbreak.text) }
     val effectiveSummary = rememberEffectiveSnapshotSummary()
 
 
@@ -141,6 +147,68 @@ internal fun PromptStudioScreen(
                     },
                     onClick = { onNavigate(AppRoute.PromptIntegrity) },
                 )
+                EtaPreferenceDivider(hasLeading = true)
+                EtaSwitchPreference(
+                    title = stringResource(R.string.prompt_jailbreak_title),
+                    summary = if (jailbreak.enabled) {
+                        stringResource(R.string.prompt_jailbreak_summary_on, jailbreak.charCount)
+                    } else {
+                        stringResource(R.string.prompt_jailbreak_summary_off)
+                    },
+                    checked = jailbreak.enabled,
+                    startAction = {
+                        EtaPreferenceIcon(icon = Icons.Rounded.Visibility, tint = EtaPreferenceColors.Orange)
+                    },
+                    onCheckedChange = { enabled ->
+                        val next = jailbreak.copy(enabled = enabled)
+                        if (PromptJailbreakStore.save(next)) jailbreak = next
+                    },
+                )
+                EtaPreferenceDivider(hasLeading = true)
+                EtaExpandPreference(
+                    expanded = editingJailbreak,
+                    title = stringResource(R.string.prompt_jailbreak_edit),
+                    summary = stringResource(R.string.prompt_jailbreak_edit_summary, jailbreak.charCount),
+                    startAction = {
+                        EtaPreferenceIcon(icon = Icons.Rounded.Description, tint = EtaPreferenceColors.Yellow)
+                    },
+                    onClick = {
+                        editingJailbreak = !editingJailbreak
+                        if (editingJailbreak) jailbreakDraft = jailbreak.text
+                    },
+                )
+            }
+        }
+        if (editingJailbreak) {
+            item(key = "jailbreak_editor") {
+                Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp)) {
+                    PromptTextField(
+                        label = stringResource(R.string.prompt_jailbreak_text_label),
+                        value = jailbreakDraft,
+                        onValueChange = { jailbreakDraft = it },
+                    )
+                    EtaPreferenceGroup(modifier = Modifier.fillMaxWidth()) {
+                        EtaArrowPreference(
+                            title = stringResource(R.string.prompt_jailbreak_save),
+                            onClick = {
+                                val next = jailbreak.copy(text = jailbreakDraft)
+                                if (PromptJailbreakStore.save(next)) {
+                                    jailbreak = next.normalized()
+                                    jailbreakDraft = jailbreak.text
+                                }
+                            },
+                        )
+                        EtaPreferenceDivider(hasLeading = false)
+                        EtaArrowPreference(
+                            title = stringResource(R.string.prompt_jailbreak_reset),
+                            onClick = {
+                                PromptJailbreakStore.resetText()
+                                jailbreak = PromptJailbreakStore.load()
+                                jailbreakDraft = jailbreak.text
+                            },
+                        )
+                    }
+                }
             }
         }
 

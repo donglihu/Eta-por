@@ -49,6 +49,11 @@ sealed interface AgentHomeAction {
     /** @ 引用：挂上 / 去掉一条历史消息。 */
     data class AttachMessageReference(val reference: MessageReferenceUi) : AgentHomeAction
     data class RemoveMessageReference(val messageId: String) : AgentHomeAction
+    /** 技能引用：长按技能栏加入会话引用；skillId 用于加载 SKILL.md 正文块。 */
+    data class AttachSkillReference(val skillId: String, val name: String) : AgentHomeAction
+    data class RemoveSkillReference(val skillId: String) : AgentHomeAction
+    /** MCP 服务器引用：长按 MCP 行加入会话引用。 */
+    data class AttachMcpReference(val serverId: String, val name: String) : AgentHomeAction
     data object DismissAgentCommandConfirm : AgentHomeAction
     data class DeleteMessage(val id: String) : AgentHomeAction
     data class RegenerateMessage(val id: String) : AgentHomeAction
@@ -86,6 +91,7 @@ sealed interface AgentSkillsAction {
     data class ToggleSkill(val skillId: String, val enabled: Boolean) : AgentSkillsAction
     data class DeleteSkill(val skillId: String) : AgentSkillsAction
     data class ReinstallBuiltin(val skillId: String) : AgentSkillsAction
+    data object OpenStore : AgentSkillsAction
 }
 
 sealed interface AgentSystemEnhanceAction {
@@ -100,6 +106,14 @@ sealed interface AgentMemoryAction {
     data class ToggleAutoMemory(val enabled: Boolean) : AgentMemoryAction
     data class ToggleAutoSkills(val enabled: Boolean) : AgentMemoryAction
     data class ToggleAutoCompact(val enabled: Boolean) : AgentMemoryAction
+    /** 自定义核心记忆注入预算；0 表示恢复自动。 */
+    data class SetCoreBudget(val chars: Int) : AgentMemoryAction
+    /** 自定义标题索引注入预算；0 表示恢复自动。 */
+    data class SetHeadingBudget(val chars: Int) : AgentMemoryAction
+    /** 两项预算一起恢复自动（跟随上下文窗口）。 */
+    data object ResetBudgets : AgentMemoryAction
+    /** 立即把 MEMORY.md 镜像备份到工作区 memory/。 */
+    data object BackupNow : AgentMemoryAction
     data class DraftChanged(val content: String) : AgentMemoryAction
     data object Save : AgentMemoryAction
     data object Clear : AgentMemoryAction

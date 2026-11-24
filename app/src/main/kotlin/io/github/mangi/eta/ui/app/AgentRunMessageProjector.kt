@@ -15,6 +15,14 @@ import io.github.mangi.eta.ui.model.ToolActivityStatusUi
 import io.github.mangi.eta.ui.model.UserMessageUi
 
 internal class AgentRunMessageProjector(
+    /**
+     * 工具运行计时的起点时钟（墙钟）：起点要写进消息、跟着会话落库，必须是可持久化的墙钟。
+     * 与 [nowElapsedRealtime] 分开：已用时用单调钟算，校时不会把秒数拉回 0 或跳大。
+     *
+     * 两个时间源一律具名传入：按位置传会把墙钟与单调钟写反，而两者都是 `() -> Long`，
+     * 编译期发现不了。
+     */
+    private val nowWallClockMillis: () -> Long = { System.currentTimeMillis() },
     private val nowElapsedRealtime: () -> Long = { SystemClock.elapsedRealtime() },
 ) {
     private val thinkingStartedAt = mutableMapOf<String, Long>()
@@ -216,25 +224,30 @@ internal class AgentRunMessageProjector(
     ): List<AgentChatMessageUi> {
         if (delta.isEmpty()) return messages
 
-        val transitioned = transitionVisibleBlock(
-            runId = runId,
-            round = round,
-            kind = AgentEvent.AssistantBlockKind.TEXT,
-            index = index,
-            messages = messages,
-        )
         val assistantId = assistantMessageId(runId, round, index)
         var updated = false
-        val next = transitioned.map { message ->
-            if (message is AgentMessageUi && message.id == assistantId) {
-                updated = true
-                message.copy(
-                    content = message.content + delta,
-                    isStreaming = true,
-                    renderMarkdown = false,
-                )
-            } else {
-                message
+        // 可见块迁移与正文追加合并成一次 map：每个增量只建一张表，不再先迁移再追加。
+        val next = messages.map { message ->
+            when {
+                message is AgentMessageUi && message.id == assistantId -> {
+                    updated = true
+                    message.copy(
+                        content = message.content + delta,
+                        isStreaming = true,
+                        renderMarkdown = false,
+                    )
+                }
+
+                message is AgentMessageUi &&
+                    message.isStreaming &&
+                    isAssistantMessageForRound(message.id, runId, round) ->
+                    message.copy(
+                        content = message.content.trimEnd(),
+                        isStreaming = false,
+                        renderMarkdown = true,
+                    )
+
+                else -> message
             }
         }
         if (updated) return next
@@ -258,27 +271,37 @@ internal class AgentRunMessageProjector(
     ): List<AgentChatMessageUi> {
         if (delta.isEmpty()) return messages
 
-        val transitioned = transitionVisibleBlock(
-            runId = runId,
-            round = round,
-            kind = AgentEvent.AssistantBlockKind.THINKING,
-            index = index,
-            messages = messages,
-        )
         val thinkingId = thinkingMessageId(runId, round, index)
         val elapsedSeconds = elapsedSeconds(thinkingId)
         var updated = false
-        val next = transitioned.map { message ->
-            if (message is ThinkingMessageUi && message.id == thinkingId) {
-                updated = true
-                message.copy(
-                    content = message.content + delta,
-                    isStreaming = true,
-                    elapsedSeconds = elapsedSeconds,
-                    collapsed = false,
-                )
-            } else {
-                message
+        // 与正文增量同理：迁移与追加一次 map 走完。
+        val next = messages.map { message ->
+            when {
+                message is ThinkingMessageUi && message.id == thinkingId -> {
+                    updated = true
+                    message.copy(
+                        content = message.content + delta,
+                        isStreaming = true,
+                        elapsedSeconds = elapsedSeconds,
+                        collapsed = false,
+                    )
+                }
+
+                message is AgentMessageUi &&
+                    message.isStreaming &&
+                    isAssistantMessageForRound(message.id, runId, round) ->
+                    message.copy(
+                        content = message.content.trimEnd(),
+                        isStreaming = false,
+                        renderMarkdown = true,
+                    )
+
+                message is ThinkingMessageUi &&
+                    message.isStreaming &&
+                    isThinkingMessageForRound(message.id, runId, round) ->
+                    message.finished()
+
+                else -> message
             }
         }
         if (updated) return next
@@ -468,8 +491,12 @@ internal class AgentRunMessageProjector(
             status = ToolActivityStatusUi.Running,
             argumentsSummary = event.argsPreview,
             command = event.command,
+            startedAtMillis = nowWallClockMillis(),
         )
         if (messages.any { it.id == message.id }) return messages
+        // 一次写入两个起点：墙钟随消息落库（跨进程对比用），单调钟进映射（进程内算已用时）。
+        // putIfAbsent 语义保证重复的 ToolStarted 不会把起点往后推。
+        ToolRunStopwatch.mark(message.id, message.startedAtMillis, nowElapsedRealtime())
         return messages + message
     }
 
@@ -491,6 +518,7 @@ internal class AgentRunMessageProjector(
         }
         val targetIndex = messages.indexOfLast { it is ToolActivityMessageUi && it.id == targetId }
         if (targetIndex < 0) return messages
+        ToolRunStopwatch.clear(targetId)
 
         return messages.mapIndexed { index, message ->
             if (index == targetIndex && message is ToolActivityMessageUi) {
@@ -499,6 +527,8 @@ internal class AgentRunMessageProjector(
                     command = event.command ?: message.command,
                     resultSummary = event.resultSummary,
                     imageCount = event.imageCount,
+                    // 结束时清掉起点：运行中才有「已用时」，残留起点会在下一次恢复里被误用。
+                    startedAtMillis = null,
                 )
             } else {
                 message
@@ -533,8 +563,11 @@ internal class AgentRunMessageProjector(
             toolName = event.name,
             status = ToolActivityStatusUi.Running,
             argumentsSummary = "",
+            startedAtMillis = nowWallClockMillis(),
         )
-        return if (messages.any { it.id == message.id }) messages else messages + message
+        if (messages.any { it.id == message.id }) return messages
+        ToolRunStopwatch.mark(message.id, message.startedAtMillis, nowElapsedRealtime())
+        return messages + message
     }
 
     fun finishHostedTool(
@@ -543,11 +576,13 @@ internal class AgentRunMessageProjector(
         messages: List<AgentChatMessageUi>,
     ): List<AgentChatMessageUi> {
         val targetId = toolActivityMessageId(runId, event.round, event.toolCallId)
+        ToolRunStopwatch.clear(targetId)
         return messages.map { message ->
             if (message is ToolActivityMessageUi && message.id == targetId) {
                 message.copy(
                     status = if (event.success) ToolActivityStatusUi.Success else ToolActivityStatusUi.Failed,
                     resultSummary = null,
+                    startedAtMillis = null,
                 )
             } else {
                 message
@@ -561,9 +596,11 @@ internal class AgentRunMessageProjector(
     ): List<AgentChatMessageUi> =
         messages.map { message ->
             if (message is ToolActivityMessageUi && message.status == ToolActivityStatusUi.Running) {
+                ToolRunStopwatch.clear(message.id)
                 message.copy(
                     status = ToolActivityStatusUi.Failed,
                     resultSummary = reason.take(MAX_TOOL_RESULT_PREVIEW_CHARS),
+                    startedAtMillis = null,
                 )
             } else {
                 message
@@ -576,17 +613,26 @@ internal class AgentRunMessageProjector(
     ): List<AgentChatMessageUi> =
         messages.map { message ->
             if (message is ToolActivityMessageUi && message.status == ToolActivityStatusUi.Running) {
+                ToolRunStopwatch.clear(message.id)
                 message.copy(
                     status = ToolActivityStatusUi.Unknown,
                     resultSummary = reason.take(MAX_TOOL_RESULT_PREVIEW_CHARS),
+                    startedAtMillis = null,
                 )
             } else {
                 message
             }
         }
 
+    /**
+     * run 结束时清掉它名下所有进程内计时状态。
+     *
+     * 思考块与工具条各有一套 id 前缀，必须各自清：run 被异常丢弃（Runtime 死亡、会话删除）
+     * 时收不到 finish/fail/interrupt，单条清理没机会执行，计时条目会一直留在进程里。
+     */
     fun clearRun(runId: String) {
         thinkingStartedAt.keys.removeAll { it.startsWith("$runId-thinking-") }
+        ToolRunStopwatch.clearRun(runId)
     }
 
     private fun ThinkingMessageUi.finished(

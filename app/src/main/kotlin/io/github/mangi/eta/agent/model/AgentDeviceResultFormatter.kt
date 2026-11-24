@@ -53,7 +53,6 @@ internal object AgentDeviceResultFormatter {
         val location = json.optJSONObject("location") ?: return time
         val status = when (location.optString("status")) {
             "permission_required" -> "位置未授权"
-            "background_permission_required" -> "后台位置未授权"
             "location_disabled" -> "系统定位已关闭"
             "unavailable" -> "暂无最近位置"
             else -> null

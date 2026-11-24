@@ -94,6 +94,45 @@ class AgentWorkStepsTest {
         assertNull(tool("t1", "read_file", status = ToolActivityStatusUi.Running, resultSummary = "x").outcomeLine())
     }
 
+    /** 并行批次里后发的调用先完成，序号按本轮工具条数算，不会从 3 掉回 2。 */
+    @Test
+    fun parallelBatchKeepsOrdinalWhenLaterCallFinishesFirst() {
+        val summary = listOf(
+            tool("t1", "read_file", status = ToolActivityStatusUi.Running),
+            tool("t2", "read_file", status = ToolActivityStatusUi.Running),
+            tool("t3", "read_file"),
+        ).runningStepSummary()
+
+        assertEquals("t2", summary.running?.id)
+        assertEquals(3, summary.ordinal)
+    }
+
+    /** 串行执行时最后一条 Running 就是最后一条工具，序号与该切片的工具条数相等。 */
+    @Test
+    fun serialToolsOrdinalEqualsToolCount() {
+        val summary = listOf(
+            tool("t1", "read_file"),
+            tool("t2", "run_command"),
+            tool("t3", "observe_screen", status = ToolActivityStatusUi.Running),
+        ).runningStepSummary()
+
+        assertEquals("t3", summary.running?.id)
+        assertEquals(3, summary.ordinal)
+    }
+
+    /** 没有 Running 工具时不给「第 N 步」：running 为空，序号归零。 */
+    @Test
+    fun withoutRunningToolSummaryIsEmpty() {
+        val summary = listOf(
+            tool("t1", "read_file"),
+            ThinkingMessageUi(id = "k1", content = "想", isStreaming = false),
+            tool("t2", "run_command", status = ToolActivityStatusUi.Failed),
+        ).runningStepSummary()
+
+        assertNull(summary.running)
+        assertEquals(0, summary.ordinal)
+    }
+
     private fun tool(
         id: String,
         name: String,

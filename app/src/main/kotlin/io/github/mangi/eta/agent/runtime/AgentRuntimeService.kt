@@ -236,6 +236,9 @@ internal class AgentRuntimeService : Service(), LifecycleOwner, SavedStateRegist
     }
 
     override fun onDestroy() {
+        // 返回桌面/组件销毁不主动取消运行中会话：执行线程在进程内存里继续跑完并发布终态，
+        // 若进程被系统回收，checkpoint 现场由 recoverRuntimeRuns 对账恢复为 interrupted。
+        // 只有用户显式停止才走 cancelRun（MSG_CANCEL 路径）。
         // 经验复盘由自己的执行引用持有；文字任务关闭入口服务后仍可完成。
         startRequestGeneration++
         pendingStartRequests.values.toList().forEach { pending ->
@@ -252,11 +255,18 @@ internal class AgentRuntimeService : Service(), LifecycleOwner, SavedStateRegist
             )
         }
         pendingStartRequests.clear()
-        sessions.values.forEach { session -> session.cancel("Agent Runtime 服务已停止") }
-        sessions.clear()
+        // 只在销毁时把在途会话的缓冲增量强制落盘，保证恢复能看到最新现场；不 cancel、不清空
+        // sessions，执行线程仍能继续投递事件与收尾（onDestroy 后 Handler/Looper 仍存活）。
+        runCatching { AgentRunCheckpointRecorder.sealAllActive() }
+            .onFailure { throwable ->
+                AndroidAgentLogger.warnThrottled("runtime_destroy_seal_failed") {
+                    "Agent runtime destroy checkpoint seal failed: type=${throwable.safeLogType()}"
+                }
+            }
         islandBridge.close()
         resultIo.shutdownNow()
-        mainHandler.removeCallbacksAndMessages(null)
+        // 不移除 mainHandler 回调：onDestroy 后执行线程的事件投递与收尾回调仍需执行，
+        // 若全量移除会丢掉尚未执行的 postTerminalOverlay，导致会话卡在 sessions 里。
         lifecycleRegistry.handleLifecycleEvent(Lifecycle.Event.ON_DESTROY)
         super.onDestroy()
     }
@@ -562,6 +572,12 @@ internal class AgentRuntimeService : Service(), LifecycleOwner, SavedStateRegist
             runId = request.runId,
             operation = request.operation,
             conversationKey = request.effectiveModelSessionId,
+            // 标题与 conversationKey 取同一来源（agent_ui handoff），避免两处判定漂移：
+            // 会话 key 认的那条 handoff，才是标题该信任的那条。
+            conversationTitle = request.handoff
+                ?.takeIf { it.source == AgentRuntimeWire.AGENT_UI_HANDOFF_SOURCE }
+                ?.let { AgentUiHandoffPayload.from(it.payload).title }
+                .orEmpty(),
             eventSink = { event ->
                 val current = sessionFor(request.runId)
                 if (current != null && event is AgentEvent.ToolStarted &&
@@ -691,7 +707,19 @@ internal class AgentRuntimeService : Service(), LifecycleOwner, SavedStateRegist
             },
             persistArtifacts = ::persistRunArtifacts,
         ).execute(session, request)
-        if (!outcome.shouldUpdateHost) return
+        AgentPerfTrace.trace(
+            "perf.run.executor_returned",
+            "runId=${request.runId.take(12)} should_update_host=${outcome.shouldUpdateHost}",
+        )
+        if (!outcome.shouldUpdateHost) {
+            // 结果没抢到提交点（会话在收尾前已被 cancel 并发布过自己的终态）：这里不能再推
+            // 第二个结果，但 Service 侧登记必须注销，否则会话永远留在 sessions 里，
+            // 进度卡与并发槽位跟着一起挂住。会话已被同 runId 的新实例替换时不碰它。
+            mainHandler.post {
+                if (sessionFor(session.runId) === session) retireSession(session)
+            }
+            return
+        }
         postTerminalOverlay(
             session = session,
             result = outcome.result,
@@ -765,6 +793,21 @@ internal class AgentRuntimeService : Service(), LifecycleOwner, SavedStateRegist
             }
     }
 
+    /** 进展卡片与并发记账的收尾：撤这一张卡，按剩余会话数决定整体停通知。主线程调用。 */
+    private fun retireSession(session: AgentRuntimeSession) {
+        // 按实例条件删除：同 runId 若已被新实例替换，绝不能误摘活会话。只有当前
+        // sessions[runId] 仍指向这个收尾实例才移除，否则收尾属于已被接管的旧会话。
+        if (sessions[session.runId] === session) sessions.remove(session.runId)
+        RunControl.clearRun(session.runId, "runtime.finished")
+        if (sessions.isEmpty()) {
+            RunProgressNotifier.stop(this, pinned = fluidPinned())
+        } else {
+            // 多卡：只撤这一个会话的卡片，其余会话的卡继续挂着。
+            RunProgressNotifier.removeRun(session.runId, pinned = fluidPinned())
+            RunProgressNotifier.noteConcurrency(runningSessionCount())
+        }
+    }
+
     private fun postTerminalOverlay(
         session: AgentRuntimeSession,
         result: AgentRuntimeWire.RunResult,
@@ -775,18 +818,18 @@ internal class AgentRuntimeService : Service(), LifecycleOwner, SavedStateRegist
             // 收尾与「撤进度通知」必须无条件执行：会话被替换或重复收尾时若直接 return，
             // 通知会一直挂在通知栏（实测 start 12 次只 stop 1 次）。
             val needsOverlay = sessionFor(session.runId) === session
-            // 卡片马上会被撤掉，标题要在此之前读，否则结束通知里没有会话名。
-            val finishedConversationTitle = RunProgressNotifier.titleOf(session.runId)
+            // 结束通知的标题按「会话自带快照 → 卡片 → 运行表」三级回落：
+            // 点停止时终态由 cancelRun 当场发布，它已经撤卡（removeRun）并摘掉 runningSessionInfo，
+            // 而这一段是事后排进主线程的，进来时卡片和运行表通常都已经空了。
+            // 所以主来源必须是派发时随会话带走的 conversationTitle；
+            // 卡片（按 runId 反查）与 runningSessionInfo 只在「未撤卡」的完成路径和系统入口上兜底。
+            val finishedConversationTitle = RunFinishTitle.resolve(
+                sessionTitle = session.conversationTitle,
+                cardTitle = RunProgressNotifier.titleOf(session.runId),
+                liveTitle = runningSessionInfo[session.runId]?.title.orEmpty(),
+            )
             lastCompletedRunContext = completedContext
-            sessions.remove(session.runId)
-            RunControl.clearRun(session.runId, "runtime.finished")
-            if (sessions.isEmpty()) {
-                RunProgressNotifier.stop(this, pinned = fluidPinned())
-            } else {
-                // 多卡：只撤这一个会话的卡片，其余会话的卡继续挂着。
-                RunProgressNotifier.removeRun(session.runId, pinned = fluidPinned())
-                RunProgressNotifier.noteConcurrency(runningSessionCount())
-            }
+            retireSession(session)
             // 完成通知必须无条件发：needsOverlay 为假（会话被接管过 / 被替换）时提前 return，
             // 之前它排在那句 return 后面，等于永远不发——实测通知渠道压根没被创建过。
             io.github.mangi.eta.core.EtaTrace.log(
@@ -1071,16 +1114,100 @@ internal class AgentRuntimeService : Service(), LifecycleOwner, SavedStateRegist
             RunControl.clearRun(runId, "runtime.cancel.pending")
             return
         }
+        // 等内存的排队 run 还没有 session：以前这里直接 return，用户点停止完全没反应，
+        // 只能等它排上并启动后才被取消（内存紧张时可能几分钟）。
+        val queued = queuedRuns.firstOrNull { item -> item.request.runId == runId }
+        if (queued != null && queuedRuns.removeIf { item -> item.request.runId == runId }) {
+            io.github.mangi.eta.core.EtaTrace.log("run.queue.cancel", "runId=$runId 排队中已撤销")
+            sendResultTo(
+                queued.replyTo,
+                AgentRuntimeWire.RunResult(runId = runId, ok = false, content = "", error = "已停止"),
+            )
+            RunControl.clearRun(runId, "runtime.cancel.queued")
+            return
+        }
         val session = sessionFor(runId) ?: return
         if (runId != session.runId) {
             AndroidAgentLogger.debug { "Agent runtime ignored stale cancel request" }
             return
         }
         if (!session.isTerminal) {
-            session.controller.cancel()
+            // 用户点停止必须立刻有终态：这里以前只置 controller 的取消位，终态要等执行线程
+            // 跑到下一个检查点后由循环收尾回传。执行线程若卡在长阻塞工具上（terminal 命令、
+            // 无障碍/子智能体等待），界面就一直显示「运行中」，体感就是点了没反应很久。
+            // session.cancel() 在锁内把状态置 TERMINAL 并把结果推给订阅者；执行线程稍后收尾时
+            // 会看到「已终态」，只补落盘、不会再推第二个结果，也不会把会话投影回运行中。
+            val published = session.cancel("已停止")
+            if (!published) {
+                // 已经进入提交阶段：提交方马上要发布它自己的结果，这里只打断在途请求，
+                // 不抢提交胜者，避免「客户端收到已停止、outbox 却留下成功结果」的分裂状态。
+                // 撤卡与终态同样不能在这里做：那会让用户看到「已停止」闪一下随即变已完成，
+                // 而且 enterFinalState 会顺带清掉 hasExecutedForegroundTool。
+                // 这两件事交给提交方自己的 postTerminalOverlay。
+                session.controller.cancel()
+                // 提交方若卡死（beforePublish 死锁 / 执行线程丢失），界面会永远停在「停止中」。
+                // 长超时兜底：超过窗口仍未终态时强制接管，发布「已停止」并撤卡，避免 UI 卡死。
+                scheduleCancelTimeoutFallback(runId, session)
+            }
+            // 控制位与终态发布无关，两个分支都要清，否则 RunControl 会留着这个 run 的会话归属记录。
             RunControl.clearRun(runId, "runtime.cancel")
-            state.value = state.value.copy(status = AgentOverlayStatus.Stopping)
+            if (published) {
+                // 只有「终态由这里发出」时才由这里撤卡：published == false 时终态属于提交方。
+                RunProgressNotifier.removeRun(runId, pinned = fluidPinned())
+                // 必须在 syncRunningSessions 之前摘掉展示信息：syncRunningSessions 只
+                // retainAll(sessions.keys)、不按 isTerminal 过滤，而刚停掉的 run 此刻仍在 sessions 里
+                // （isTerminal=true）。不摘就会以 running=true 的幽灵条目留在胶囊会话清单上，
+                // 执行线程卡在不可打断工具上时这条一直挂着。
+                runningSessionInfo.remove(runId)
+                syncRunningSessions()
+                if (runningSessionCount() == 0) {
+                    // 只剩它自己：胶囊也不用再停在「停止中」等执行线程回来。
+                    enterFinalState(
+                        AgentOverlayState(
+                            phase = AgentOverlayPhase.FAILED,
+                            status = AgentOverlayStatus.Stopped,
+                            detailText = "已停止",
+                        )
+                    )
+                } else {
+                    // 还有别的会话在跑：只把自己标成停止中，别把别人的卡片一起带走。
+                    state.value = state.value.copy(status = AgentOverlayStatus.Stopping)
+                }
+            }
         }
+    }
+
+    /**
+     * 提交阶段（COMMITTING）超时兜底：用户点停止时 session 已进入提交窗口，
+     * 正常情况下提交方很快发布终态并撤卡。若提交方卡死（beforePublish 死锁、
+     * 执行线程丢失、进程异常），界面会永远停在「停止中」。这里安排一个长超时，
+     * 超时后仍未终态则强制接管：取消并发布「已停止」、撤卡、同步运行表。
+     */
+    private fun scheduleCancelTimeoutFallback(runId: String, session: AgentRuntimeSession) {
+        mainHandler.postDelayed({
+            if (sessionFor(runId) !== session || session.isTerminal) return@postDelayed
+            io.github.mangi.eta.core.EtaTrace.log(
+                "run.cancel.timeout",
+                "runId=$runId 提交窗口超时，强制接管终态",
+            )
+            val forced = session.forceTerminal("已停止")
+            if (!forced) return@postDelayed
+            RunControl.clearRun(runId, "runtime.cancel.timeout")
+            RunProgressNotifier.removeRun(runId, pinned = fluidPinned())
+            runningSessionInfo.remove(runId)
+            syncRunningSessions()
+            if (runningSessionCount() == 0) {
+                enterFinalState(
+                    AgentOverlayState(
+                        phase = AgentOverlayPhase.FAILED,
+                        status = AgentOverlayStatus.Stopped,
+                        detailText = "已停止",
+                    )
+                )
+            } else {
+                state.value = state.value.copy(status = AgentOverlayStatus.Stopping)
+            }
+        }, CANCEL_COMMITTING_TIMEOUT_MS)
     }
 
     private fun requestPause(runId: String?) {
@@ -1320,6 +1447,12 @@ internal class AgentRuntimeService : Service(), LifecycleOwner, SavedStateRegist
         private const val MEMORY_QUEUE_INTERVAL_MS = 5_000L
         /** 排队上限，避免内存紧张时请求无限堆积。 */
         private const val MEMORY_QUEUE_MAX = 8
+
+        /**
+         * 取消进入提交窗口（COMMITTING）后的超时兜底时长：提交方正常应在毫秒级完成
+         * beforePublish 并发布终态；超过 30s 仍无终态视为提交方卡死，强制接管发布「已停止」。
+         */
+        private const val CANCEL_COMMITTING_TIMEOUT_MS = 30_000L
 
         const val ACTION_KEEP_ALIVE = "io.github.mangi.eta.agent.runtime.KEEP_ALIVE"
         /** 胶囊展开列表里最多保留几条会话（运行中 + 最近完成）。 */

@@ -17,6 +17,10 @@ internal object RootlessLinuxInstaller {
     private const val MAX_EXPANDED_BYTES = 3L * 1024 * 1024 * 1024
     private const val MAX_ENTRIES = 200_000
 
+    /** 归档目标必有父目录；缺失时给出可追踪的失败消息，而不是 NPE。 */
+    private fun parentOf(target: File): File =
+        requireNotNull(target.parentFile) { "归档目标缺少父目录: ${target.name}" }
+
     suspend fun extract(archive: File, destination: File, xz: Boolean, stripComponents: Int = 0) {
         require(destination.mkdirs() || destination.isDirectory)
         val root = destination.canonicalFile
@@ -38,7 +42,7 @@ internal object RootlessLinuxInstaller {
                         entry.isDirectory -> require(target.mkdirs() || target.isDirectory)
                         entry.isSymbolicLink || entry.isLink -> links += Triple(target, entry.linkName, entry.isLink)
                         entry.isFile -> {
-                            require(target.parentFile!!.mkdirs() || target.parentFile!!.isDirectory)
+                            require(parentOf(target).mkdirs() || parentOf(target).isDirectory)
                             require(!Files.isSymbolicLink(target.toPath()))
                             val available = root.usableSpace
                             if (available > 0 && entry.size + 16L * 1024 * 1024 > available) {
@@ -74,7 +78,7 @@ internal object RootlessLinuxInstaller {
                 val (target, linkName) = iterator.next()
                 val source = safePath(root, requireNotNull(normalizedArchivePath(linkName, stripComponents)))
                 if (!source.isFile || Files.isSymbolicLink(source.toPath())) continue
-                require(target.parentFile!!.mkdirs() || target.parentFile!!.isDirectory)
+                require(parentOf(target).mkdirs() || parentOf(target).isDirectory)
                 require(!Files.exists(target.toPath(), LinkOption.NOFOLLOW_LINKS)) { "重复归档路径" }
                 Files.createLink(target.toPath(), source.toPath())
                 iterator.remove()
@@ -88,9 +92,9 @@ internal object RootlessLinuxInstaller {
             val source = if (linkName.startsWith('/')) File(root, linkName.removePrefix("/")) else File(target.parentFile, linkName)
             val normalized = source.toPath().normalize()
             require(normalized.startsWith(root.toPath())) { "归档链接越界" }
-            require(target.parentFile!!.mkdirs() || target.parentFile!!.isDirectory)
+            require(parentOf(target).mkdirs() || parentOf(target).isDirectory)
             require(!Files.exists(target.toPath(), LinkOption.NOFOLLOW_LINKS)) { "重复归档路径" }
-            Files.createSymbolicLink(target.toPath(), target.parentFile!!.toPath().relativize(normalized))
+            Files.createSymbolicLink(target.toPath(), parentOf(target).toPath().relativize(normalized))
         }
     }
 
@@ -110,8 +114,10 @@ internal object RootlessLinuxInstaller {
     suspend fun installBase(artifact: VerifiedArtifact, archive: File, rootfs: File, distribution: LinuxDistribution): Boolean {
         val staging = File(rootfs.parentFile, "rootfs.installing")
         try {
-            if (!staging.parentFile!!.mkdirs() && !staging.parentFile!!.isDirectory) throw RootlessInstallFailure("INSTALL_DIRECTORY_UNAVAILABLE", "无法创建环境目录，请检查内部存储")
-            val available = staging.parentFile!!.usableSpace
+            val stagingParent = staging.parentFile
+                ?: throw RootlessInstallFailure("INSTALL_DIRECTORY_UNAVAILABLE", "无法确定环境目录，请检查内部存储")
+            if (!stagingParent.mkdirs() && !stagingParent.isDirectory) throw RootlessInstallFailure("INSTALL_DIRECTORY_UNAVAILABLE", "无法创建环境目录，请检查内部存储")
+            val available = stagingParent.usableSpace
             if (available in 1 until 512L * 1024 * 1024) throw RootlessInstallFailure("INSUFFICIENT_STORAGE", "安装 Linux 至少需要 512 MB 可用内部存储，请清理后重试")
             if (staging.exists() && !staging.deleteRecursively()) throw RootlessInstallFailure("STAGING_CLEANUP_FAILED", "无法清理未完成安装，请重启 Eta 后重试")
             extract(archive, staging, xz = distribution == LinuxDistribution.DEBIAN, stripComponents = if (distribution == LinuxDistribution.DEBIAN) 1 else 0)

@@ -93,6 +93,8 @@ import io.github.mangi.eta.ui.screens.characters.CharacterLibraryScreen
 import io.github.mangi.eta.ui.screens.characters.CharacterMemoryScreen
 import io.github.mangi.eta.ui.screens.characters.CharacterPersonaScreen
 import io.github.mangi.eta.ui.screens.enhance.SystemEnhanceScreen
+import io.github.mangi.eta.ui.screens.expert.ExpertCenterScreen
+import io.github.mangi.eta.ui.screens.expert.ExpertDetailScreen
 import io.github.mangi.eta.ui.screens.home.AgentHomeScreen
 import io.github.mangi.eta.ui.screens.mcp.McpServerDetailScreen
 import io.github.mangi.eta.ui.screens.github.GitHubAccountScreen
@@ -103,6 +105,7 @@ import io.github.mangi.eta.ui.screens.usage.DataUsageScreen
 import io.github.mangi.eta.ui.screens.usage.TokenUsageScreen
 import io.github.mangi.eta.ui.screens.permissions.PermissionHealthScreen
 import io.github.mangi.eta.ui.screens.skills.AgentSkillsScreen
+import io.github.mangi.eta.ui.screens.skills.SkillStoreScreen
 import io.github.mangi.eta.ui.screens.subagent.SubagentSettingsScreen
 import io.github.mangi.eta.ui.screens.terminal.LinuxEnvironmentScreen
 import io.github.mangi.eta.ui.screens.terminal.LinuxFilesScreen
@@ -564,6 +567,13 @@ fun AgentAppRoot(
                         state = agentState.homeState,
                         modelPickerState = agentState.modelPickerState,
                         onOpenModelProviders = { pushRoute(AppRoute.ModelProviders) },
+                        onTestModel = agentState::testModel,
+                        modelTestStates = agentState.modelTestStates,
+                        onShowTestDetail = agentState::showModelTestDetail,
+                        modelTestDetail = agentState.modelTestDetail,
+                        onDismissTestDetail = agentState::dismissModelTestDetail,
+                        onExpertSelectionChanged = { agentState.refreshExpertBinding() },
+                        expertRefreshToken = agentState.expertBindingVersion,
                         conversationKey = agentState.conversationPaneState.selectedConversationId,
                         commands = agentState.agentCommands,
                         commandResult = agentState.homeState.commandResult,
@@ -601,6 +611,12 @@ fun AgentAppRoot(
                                     agentState.attachMessageReference(action.reference)
                                 is AgentHomeAction.RemoveMessageReference ->
                                     agentState.removeMessageReference(action.messageId)
+                                is AgentHomeAction.AttachSkillReference ->
+                                    agentState.attachSkillReference(action.skillId, action.name)
+                                is AgentHomeAction.AttachMcpReference ->
+                                    agentState.attachMcpReference(action.serverId, action.name)
+                                is AgentHomeAction.RemoveSkillReference ->
+                                    agentState.removeSkillReference(action.skillId)
                                 is AgentHomeAction.ToggleMcpServer -> uiScope.launch {
                                     runCatching {
                                         val server = io.github.mangi.eta.data.repository.McpServerRepository
@@ -743,14 +759,17 @@ fun AgentAppRoot(
                 SubagentSettingsScreen(onBack = ::popRoute)
             }
             entry<AppRoute.Skills>(swipeDismiss = swipeDismiss) {
-                LaunchedEffect(Unit) {
-                    skills.refreshSkills()
+                // 从技能商店返回时 Skills 这条 entry 不会重建，只挂 LaunchedEffect(Unit)
+                // 会一直显示进店前的旧列表；改成跟随「当前是否停在本页」重跑。
+                LaunchedEffect(backStack.lastOrNull() == AppRoute.Skills) {
+                    if (backStack.lastOrNull() == AppRoute.Skills) skills.refreshSkills()
                 }
                 AgentSkillsScreen(
                     state = skills.skillsState,
                     onAction = { action ->
                         when (action) {
                             AgentSkillsAction.NavigateBack -> popRoute()
+                            AgentSkillsAction.OpenStore -> pushRoute(AppRoute.SkillStore)
                             is AgentSkillsAction.ImportZip -> skills.importSkillZip(action.uri)
                             AgentSkillsAction.ConfirmZipReplacement -> skills.confirmSkillZipReplacement()
                             AgentSkillsAction.CancelZipReplacement -> skills.cancelSkillZipReplacement()
@@ -762,11 +781,35 @@ fun AgentAppRoot(
                     },
                 )
             }
+            entry<AppRoute.SkillStore>(swipeDismiss = swipeDismiss) {
+                SkillStoreScreen(
+                    onBack = ::popRoute,
+                    onSkillInstalled = { skills.refreshSkills() },
+                )
+            }
             entry<AppRoute.Characters>(swipeDismiss = swipeDismiss) {
                 LaunchedEffect(backStack.lastOrNull() == AppRoute.Characters) {
                     if (backStack.lastOrNull() == AppRoute.Characters) characterStore.loadLibrary()
                 }
                 CharacterLibraryScreen(characterStore, { if (navigator.current() == AppRoute.Characters) pushRoute(it) }, ::popRoute)
+            }
+            entry<AppRoute.ExpertCenter>(swipeDismiss = swipeDismiss) {
+                // 在专家中心新建/召唤/删除后，首页输入栏的专家图标要立刻跟上；
+                // 退出这一页时把版本号推一格，按钮随之重读 Prefs。
+                DisposableEffect(Unit) {
+                    onDispose { agentState.refreshExpertBinding() }
+                }
+                ExpertCenterScreen(
+                    onBack = ::popRoute,
+                    onOpenExpert = { name -> pushRoute(AppRoute.ExpertDetail(name)) },
+                    refreshToken = agentState.expertBindingVersion,
+                )
+            }
+            entry<AppRoute.ExpertDetail>(swipeDismiss = swipeDismiss) { route ->
+                DisposableEffect(Unit) {
+                    onDispose { agentState.refreshExpertBinding() }
+                }
+                ExpertDetailScreen(expertName = route.expertName, onBack = ::popRoute)
             }
             entry<AppRoute.CharacterDetail>(swipeDismiss = swipeDismiss) { route ->
                 LaunchedEffect(route.characterId, backStack.lastOrNull() == route) {
@@ -871,16 +914,6 @@ fun AgentAppRoot(
                                                     )
                                                 )
                                             }
-                                            DeviceLocationProvider.AccessState.FOREGROUND_ONLY -> {
-                                                runCatching {
-                                                    context.startActivity(
-                                                        Intent(
-                                                            Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
-                                                            Uri.parse("package:${context.packageName}")
-                                                        )
-                                                    )
-                                                }
-                                            }
                                             DeviceLocationProvider.AccessState.DISABLED -> {
                                                 runCatching {
                                                     context.startActivity(
@@ -974,6 +1007,9 @@ fun AgentAppRoot(
             }
             entry<AppRoute.DiagnosticsCenter>(swipeDismiss = swipeDismiss) {
                 io.github.mangi.eta.ui.screens.diagnostics.DiagnosticsCenterScreen(onBack = { popRoute() })
+            }
+            entry<AppRoute.LogViewer>(swipeDismiss = swipeDismiss) {
+                io.github.mangi.eta.ui.screens.diagnostics.LogViewerScreen(onBack = { popRoute() })
             }
 
             entry<AppRoute.PromptStudio>(swipeDismiss = swipeDismiss) {
@@ -1079,6 +1115,7 @@ fun AgentAppRoot(
                     context = context,
                     onBack = ::popRoute,
                     onExport = agentState::exportBackup,
+                    onExportFull = agentState::exportFullBackup,
                     onImport = agentState::importBackup,
                 )
             }
@@ -1095,6 +1132,10 @@ fun AgentAppRoot(
                             is AgentMemoryAction.ToggleAutoMemory -> memory.setAutomaticReview(memory = action.enabled)
                             is AgentMemoryAction.ToggleAutoSkills -> memory.setAutomaticReview(skills = action.enabled)
                             is AgentMemoryAction.ToggleAutoCompact -> memory.setMemoryAutoCompact(action.enabled)
+                            is AgentMemoryAction.SetCoreBudget -> memory.setCoreBudget(action.chars)
+                            is AgentMemoryAction.SetHeadingBudget -> memory.setHeadingBudget(action.chars)
+                            is AgentMemoryAction.ResetBudgets -> memory.resetMemoryBudgets()
+                            AgentMemoryAction.BackupNow -> memory.backupMemory()
                             is AgentMemoryAction.DraftChanged -> memory.updateMemoryDraft(action.content)
                             AgentMemoryAction.Save -> memory.saveMemory()
                             AgentMemoryAction.Clear -> memory.clearMemory()

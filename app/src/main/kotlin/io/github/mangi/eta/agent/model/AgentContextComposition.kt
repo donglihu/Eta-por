@@ -79,12 +79,25 @@ internal object AgentContextComposition {
         val content = when {
             rawContent == null || rawContent === JSONObject.NULL -> ""
             rawContent is String -> rawContent
-            else -> rawContent.toString()
+            // 多模态 content（图片观察）也是整段 JSON；逐字段计数，避免每轮为它物化字符串。
+            else -> return AgentHistoryTrimmer.estimateJsonTokens(rawContent) +
+                reasoningTokens(message) +
+                toolCallTokens(message)
         }
         var total = AgentHistoryTrimmer.estimateTokens(content)
-        message.optJSONArray("tool_calls")?.let { total += AgentHistoryTrimmer.estimateTokens(it.toString()) }
-        val reasoning = message.optString("reasoning_content")
-        if (reasoning.isNotEmpty()) total += AgentHistoryTrimmer.estimateTokens(reasoning)
+        total += toolCallTokens(message)
+        total += reasoningTokens(message)
         return total
+    }
+
+    private fun toolCallTokens(message: JSONObject): Int {
+        val calls = message.optJSONArray("tool_calls") ?: return 0
+        return AgentHistoryTrimmer.estimateJsonTokens(calls)
+    }
+
+    private fun reasoningTokens(message: JSONObject): Int {
+        val reasoning = message.optString("reasoning_content")
+        if (reasoning.isEmpty()) return 0
+        return AgentHistoryTrimmer.estimateTokens(reasoning)
     }
 }

@@ -125,6 +125,7 @@ internal suspend fun buildEffectivePreview(
         memoryContext = memoryContext,
         rootAvailable = capabilities.rootAvailable,
         customization = customization,
+        jailbreak = io.github.mangi.eta.agent.prompt.PromptJailbreakStore.load(),
     )
     // 真实请求还会追加两样：MCP 工具、会话历史工具（conversation_history）。
     // 少了它们预览会永远比实际少（上次 114 vs 115 就差分这一个会话工具）。

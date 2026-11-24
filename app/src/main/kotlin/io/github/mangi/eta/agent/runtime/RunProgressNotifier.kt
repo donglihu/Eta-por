@@ -136,11 +136,17 @@ internal object RunProgressNotifier {
         if (active) postCard(card)
     }
 
-    /** 暂停/恢复后立刻重画：真源在 [RunControl]，这里只负责把新状态画出来。 */
-    /** 会话标题：结束通知要带上「哪条对话」。只在主线程读，避免和卡片更新抢状态。 */
+    /**
+     * 会话标题：结束通知要带上「哪条对话」。只在主线程读，避免和卡片更新抢状态。
+     *
+     * 卡片按 [RunCard.key]（会话 key，缺席才退回 runId）索引，而 App 派发的 run 一定带
+     * conversationId，所以 cards[runId] 恒为空；必须和 [removeRun] 一样按 runId 反查，
+     * 否则结束通知永远拿不到标题。
+     */
     fun titleOf(runId: String): String =
-        if (isMainThread()) cards[runId]?.title.orEmpty() else ""
+        if (isMainThread()) cards.values.firstOrNull { it.runId == runId }?.title.orEmpty() else ""
 
+    /** 暂停/恢复后立刻重画：真源在 [RunControl]，这里只负责把新状态画出来。 */
     fun refresh() {
         if (!isMainThread()) {
             handler.post { refresh() }

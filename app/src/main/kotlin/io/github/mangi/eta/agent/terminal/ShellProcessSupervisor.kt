@@ -294,11 +294,63 @@ internal class ShellProcessSupervisor(
         val rootfs = shellQuote(rootfsPath)
         val mode = if (command == null) "session" else "command"
         val payload = shellQuote(command.orEmpty())
-        // name 经 SharedFolderMounts 校验只含 [A-Za-z0-9._-]，可安全拼进双引号路径。
-        val mountsBlock = sharedMounts.joinToString("\n") { mount ->
-            "eta_mount_optional ${shellQuote(mount.sourcePath)} " +
-                "\"\$eta_rootfs${SharedFolderMounts.LINUX_MOUNTS_ROOT}/${mount.name}\" bind"
-        }
+        // name 经 SharedFolderMounts 校验只含 [A-Za-z0-9._-]，可安全拼进双引号路径；
+        // 这里再过滤一次：链接分支会 rm -rf 挂载点，不能让未校验的名字进来。
+        // workspace 内的源不能 bind 到 /workspace/mounts/<name>（mount --bind /a /a/b 自嵌套），改用符号链接。
+        val mountsBlock = sharedMounts
+            .filter { SharedFolderMounts.validateName(it.name, emptyList()) == null }
+            .joinToString("\n") { mount ->
+                val linkTarget = SharedFolderMounts.workspaceLinkTarget(mount.sourcePath)
+                if (linkTarget != null && SharedFolderMounts.linkTargetLoopsBack(linkTarget)) {
+                    // 源在 workspace/mounts 内部：链接要建在 mounts 目录里却指回 mounts 自身，遍历会绕圈。
+                    // 与 bind 失败一致，必须显式报错而不是静默丢弃。
+                    "echo ETA_SHARED_SKIP ${shellQuote(mount.name)} ${shellQuote(mount.sourcePath)} " +
+                        "reason=loop_back >&2"
+                } else if (linkTarget != null) {
+                    "eta_link_shared ${shellQuote(mount.name)} ${shellQuote(linkTarget)}"
+                } else {
+                    "eta_mount_optional ${shellQuote(mount.sourcePath)} " +
+                        "\"\$eta_rootfs${SharedFolderMounts.LINUX_MOUNTS_ROOT}/${mount.name}\" bind"
+                }
+            }
+        // 挂载点目录本身挂一份 tmpfs：符号链接与 bind 目标都只活在本会话的 namespace 里，
+        // 会话结束随 namespace 回收；Android 侧 /data/local/tmp/eta/mounts 因 mkdir -p 会残留一个空目录，
+        // 目录内无条目，无需卸载或清理。
+        // 只在有共享文件夹时才拼进脚本，避免无共享时改动既有 payload。
+        val mountsSupportBlock = """
+            eta_mounts_tmpfs() {
+              "${'$'}eta_busybox" mkdir -p "${'$'}1" 2>/dev/null || return 0
+              "${'$'}eta_busybox" mount -t tmpfs -o mode=0755,size=16m eta-mounts "${'$'}1" 2>/dev/null || true
+            }
+            eta_link_shared() {
+              eta_name=${'$'}1
+              eta_target=${'$'}2
+              eta_dir="${'$'}eta_rootfs${SharedFolderMounts.LINUX_MOUNTS_ROOT}"
+              "${'$'}eta_busybox" mkdir -p "${'$'}eta_dir" 2>/dev/null || true
+              "${'$'}eta_busybox" rm -rf "${'$'}eta_dir/${'$'}eta_name" 2>/dev/null || true
+              "${'$'}eta_busybox" ln -s "${'$'}eta_target" "${'$'}eta_dir/${'$'}eta_name" 2>/dev/null || true
+            }
+            eta_mounts_restore() {
+              eta_host_mounts="${SharedFolderMounts.ANDROID_MOUNTS_ROOT}"
+              eta_guest_dir="${'$'}eta_rootfs${SharedFolderMounts.LINUX_MOUNTS_ROOT}"
+              [ -d "${'$'}eta_host_mounts" ] || return 0
+              for eta_host_entry in "${'$'}eta_host_mounts"/*; do
+                [ -e "${'$'}eta_host_entry" ] || continue
+                eta_entry_name=${'$'}{eta_host_entry##*/}
+                eta_entry_target="${'$'}eta_guest_dir/${'$'}eta_entry_name"
+                # 已被共享文件夹链接/bind 占用的同名条目优先，不覆盖。
+                if [ -e "${'$'}eta_entry_target" ] || [ -L "${'$'}eta_entry_target" ]; then continue; fi
+                if [ -d "${'$'}eta_host_entry" ]; then
+                  "${'$'}eta_busybox" mkdir -p "${'$'}eta_entry_target" 2>/dev/null || continue
+                else
+                  : > "${'$'}eta_entry_target" 2>/dev/null || continue
+                fi
+                "${'$'}eta_busybox" mount -o bind "${'$'}eta_host_entry" "${'$'}eta_entry_target" 2>/dev/null || true
+              done
+            }
+            eta_mounts_tmpfs "${'$'}eta_rootfs${SharedFolderMounts.LINUX_MOUNTS_ROOT}"
+            eta_mounts_restore
+        """.trimIndent()
         val innerScriptHead = """
             eta_rootfs=${'$'}1
             eta_busybox=${'$'}2
@@ -326,8 +378,8 @@ internal class ShellProcessSupervisor(
             fi
             [ -d /data/local/tmp ] || exit 125
             eta_mount_required /data/local/tmp "${'$'}eta_rootfs/data/local/tmp" bind
-            "${'$'}eta_busybox" mkdir -p /data/local/tmp/eta || exit 125
-            eta_mount_required /data/local/tmp/eta "${'$'}eta_rootfs/workspace" bind
+            "${'$'}eta_busybox" mkdir -p ${SharedFolderMounts.HOST_WORKSPACE_ROOT} || exit 125
+            eta_mount_required ${SharedFolderMounts.HOST_WORKSPACE_ROOT} "${'$'}eta_rootfs${SharedFolderMounts.LINUX_WORKSPACE_ROOT}" bind
         """.trimIndent()
         val innerScriptTail = """
             if [ "${'$'}eta_mode" = command ]; then
@@ -360,7 +412,7 @@ internal class ShellProcessSupervisor(
         val innerScript = if (mountsBlock.isEmpty()) {
             "$innerScriptHead\n$innerScriptTail"
         } else {
-            "$innerScriptHead\n$mountsBlock\n$innerScriptTail"
+            "$innerScriptHead\n$mountsSupportBlock\n$mountsBlock\n$innerScriptTail"
         }
         val discovery = AndroidBusyBox.discoveryScript()
         // Alpine 的 /bin/sh 是指向 /bin/busybox 的绝对符号链接，Android 侧 -x 会按宿主根目录

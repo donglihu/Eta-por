@@ -48,6 +48,7 @@ import androidx.compose.material.icons.rounded.ContentCopy
 import androidx.compose.material.icons.rounded.Terminal
 import androidx.compose.material.icons.rounded.Delete
 import androidx.compose.material.icons.rounded.Edit
+import androidx.compose.material.icons.rounded.Hub
 import androidx.compose.material.icons.rounded.Lightbulb
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.TextFields
@@ -125,7 +126,15 @@ internal fun rememberDataUrlBitmap(dataUrl: String, maxPx: Int? = null) = rememb
     decodeDataUrlBitmap(dataUrl, maxPx)
 }
 
+/**
+ * 解码消息图片引用：data URL（旧数据）与文件路径（11-22 落盘后）都支持。
+ * 路径来源与 ImagePreviewOverlay.decodeMediaBitmap 同一约定：BitmapFactory + inSampleSize 降采样，
+ * 避免按原尺寸解码一张大图直接吃几十 MB 堆。
+ */
 internal fun decodeDataUrlBitmap(dataUrl: String, maxPx: Int? = null): ImageBitmap? {
+    if (!dataUrl.startsWith("data:image", ignoreCase = true)) {
+        return decodePathBitmap(dataUrl, maxPx)
+    }
     val base64 = dataUrl.substringAfter("base64,", "")
     if (base64.isBlank()) return null
     return runCatching {
@@ -140,6 +149,28 @@ internal fun decodeDataUrlBitmap(dataUrl: String, maxPx: Int? = null): ImageBitm
             while (longest > 0 && longest / (sample * 2) >= maxPx) sample *= 2
             val opts = BitmapFactory.Options().apply { inSampleSize = sample }
             BitmapFactory.decodeByteArray(bytes, 0, bytes.size, opts)?.asImageBitmap()
+        }
+    }.getOrNull()
+}
+
+private fun decodePathBitmap(source: String, maxPx: Int?): ImageBitmap? {
+    val path = when {
+        source.startsWith("file://", ignoreCase = true) ->
+            android.net.Uri.parse(source).path ?: return null
+        source.startsWith("/") -> source
+        else -> return null
+    }
+    return runCatching {
+        if (maxPx == null) {
+            BitmapFactory.decodeFile(path)?.asImageBitmap()
+        } else {
+            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeFile(path, bounds)
+            var sample = 1
+            val longest = maxOf(bounds.outWidth, bounds.outHeight)
+            while (longest > 0 && longest / (sample * 2) >= maxPx) sample *= 2
+            val opts = BitmapFactory.Options().apply { inSampleSize = sample }
+            BitmapFactory.decodeFile(path, opts)?.asImageBitmap()
         }
     }.getOrNull()
 }
@@ -308,6 +339,7 @@ internal fun ChatMessageItem(
 
 // ── 用户消息：轻盈美观气泡 ──────────────────────────────────────────────
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun UserMessageBubble(
     message: UserMessageUi,
@@ -343,9 +375,10 @@ private fun UserMessageBubble(
     val visiblePrompt = remember(message.content) {
         AgentFileReferencePromptCodec.parse(message.content)
     }
-    // 技能调用要跟普通消息区别开：正文被剥掉了，只剩这句话，这里补回「用了哪个技能」。
-    val skillCommand = remember(message.content) {
-        AgentSkillCommandPromptCodec.parseHeader(message.content)
+    // 引用块要跟普通消息区别开：块正文被剥掉了，只剩这句话，这里补回「引用了什么」。
+    // 技能与 MCP 服务器混排，长按可连加多个，所以要按块逐个渲染胶囊。
+    val referenceBlocks = remember(message.content) {
+        AgentFileReferencePromptCodec.referenceBlocks(message.content)
     }
     val overlayBubbleColor = if (MiuixTheme.colorScheme.background.luminance() < 0.5f) {
         Color(0xFF37393D)
@@ -375,7 +408,7 @@ private fun UserMessageBubble(
                             onClick = {
                                 @Suppress("DEPRECATION")
                                 clipboardManager.setText(
-                                    AnnotatedString(AgentSkillCommandPromptCodec.strip(message.content)),
+                                    AnnotatedString(AgentFileReferencePromptCodec.stripSkillBlocks(message.content)),
                                 )
                                 haptic.performHapticFeedback(HapticFeedbackType.Confirm)
                                 tooltipState.dismiss()
@@ -437,28 +470,51 @@ private fun UserMessageBubble(
                         vertical = if (assistantOverlay) 8.dp else 12.dp,
                     ),
             ) {
-                skillCommand?.let { skill ->
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        modifier = Modifier
-                            .padding(bottom = 8.dp)
-                            .background(
-                                color = MiuixTheme.colorScheme.primary.copy(alpha = 0.12f),
-                                shape = RoundedCornerShape(9.dp),
-                            )
-                            .padding(horizontal = 8.dp, vertical = 3.dp),
+                if (referenceBlocks.isNotEmpty()) {
+                    FlowRow(
+                        modifier = Modifier.padding(bottom = 8.dp),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp),
                     ) {
-                        Text(
-                            text = "/" + skill.skillId,
-                            style = MiuixTheme.textStyles.footnote1,
-                            fontWeight = FontWeight.Medium,
-                            color = MiuixTheme.colorScheme.primary,
-                        )
-                        Text(
-                            text = " · " + stringResource(R.string.agent_command_skill_tag),
-                            style = MiuixTheme.textStyles.footnote1,
-                            color = MiuixTheme.colorScheme.primary.copy(alpha = 0.72f),
-                        )
+                        referenceBlocks.forEach { block ->
+                            val isMcp = block.kind == AgentSkillCommandPromptCodec.ReferenceBlockKind.McpServer
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                modifier = Modifier
+                                    .background(
+                                        color = MiuixTheme.colorScheme.primary.copy(alpha = 0.12f),
+                                        shape = RoundedCornerShape(9.dp),
+                                    )
+                                    .padding(horizontal = 8.dp, vertical = 3.dp),
+                            ) {
+                                Icon(
+                                    imageVector = if (isMcp) Icons.Rounded.Hub else Icons.Rounded.AutoAwesome,
+                                    contentDescription = null,
+                                    modifier = Modifier.size(13.dp),
+                                    tint = MiuixTheme.colorScheme.primary,
+                                )
+                                Spacer(Modifier.width(4.dp))
+                                Text(
+                                    text = if (isMcp) {
+                                        block.name.ifBlank { block.id }
+                                    } else {
+                                        "/" + block.id
+                                    },
+                                    style = MiuixTheme.textStyles.footnote1,
+                                    fontWeight = FontWeight.Medium,
+                                    color = MiuixTheme.colorScheme.primary,
+                                )
+                                Text(
+                                    text = " · " + if (isMcp) {
+                                        stringResource(R.string.tool_access_mcp_section)
+                                    } else {
+                                        stringResource(R.string.agent_command_skill_tag)
+                                    },
+                                    style = MiuixTheme.textStyles.footnote1,
+                                    color = MiuixTheme.colorScheme.primary.copy(alpha = 0.72f),
+                                )
+                            }
+                        }
                     }
                 }
                 if (message.images.isNotEmpty()) {
@@ -524,7 +580,7 @@ private fun UserMessageBubble(
             onCopy = {
                 @Suppress("DEPRECATION")
                 clipboardManager.setText(
-                    AnnotatedString(AgentSkillCommandPromptCodec.strip(message.content)),
+                    AnnotatedString(AgentFileReferencePromptCodec.stripSkillBlocks(message.content)),
                 )
                 copied = true
             },

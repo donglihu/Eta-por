@@ -24,6 +24,15 @@ internal object SubagentRunRegistry {
     @Volatile
     private var screenOwnerId: String? = null
 
+    /** 想用屏幕但还没轮到的子智能体（FIFO，先到先得）。 */
+    private val screenQueue = ArrayDeque<String>()
+
+    /** 声明过要屏幕的子智能体：只用于界面/诊断，不参与排队判定。 */
+    private val screenWanted = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+
+    /** 屏幕槽位的唯一锁：register / unregister / acquire / release 全在这里同步，别混用 synchronized(this)。 */
+    private val screenLock = Any()
+
     fun register(
         conversationKey: String,
         subagentId: String,
@@ -32,14 +41,80 @@ internal object SubagentRunRegistry {
     ) {
         controllers[subagentId] = controller
         conversationOf[subagentId] = conversationKey
-        if (ownsScreen) screenOwnerId = subagentId
+        // 只登记「想要屏幕」，真正占用在第一次调用屏幕工具时由 acquireScreen 争抢：
+        // 否则并行派发的三个 screen 子代理会同时认为自己持有灵屏。
+        synchronized(screenLock) { if (ownsScreen) screenWanted.add(subagentId) }
     }
 
     fun unregister(subagentId: String) {
         controllers.remove(subagentId)
         conversationOf.remove(subagentId)
         pausedIds.remove(subagentId)
-        if (screenOwnerId == subagentId) screenOwnerId = null
+        val next: String?
+        synchronized(screenLock) {
+            screenWanted.remove(subagentId)
+            screenQueue.remove(subagentId)
+            next = if (screenOwnerId == subagentId) promoteLocked() else null
+        }
+        // 唤醒必须在锁外做：steer 会回调控制器的锁，持着 screenLock 调会造出锁序反转。
+        if (next != null) postSteer(next, "屏幕已空闲，归你使用")
+    }
+
+    /**
+     * 持有者退场后的交棒：出队 → 设新 owner → 维护 wanted。
+     *
+     * 调用方必须已持有 [screenLock]。release 与 unregister 共用这一处，避免「出队了但没人唤醒」
+     * 的半截实现：队首要过 SCREEN_BUSY，不通知它就以为屏幕还被占着，会把灵屏闲置到它整轮结束。
+     *
+     * @return 被扶正的 id；队列为空时返回 null。
+     */
+    private fun promoteLocked(): String? {
+        val next = screenQueue.removeFirstOrNull()
+        screenOwnerId = next
+        // 它仍在等着用屏幕，所以保留在 screenWanted 里；诊断面板靠它列出排队意图。
+        if (next != null) screenWanted.add(next)
+        return next
+    }
+
+    /**
+     * 申请屏幕槽位。
+     *
+     * @return true 表示当前归它用（无主或本来就是它）；false 表示已入队，本次调用不该执行。
+     */
+    fun acquireScreen(subagentId: String): Boolean = synchronized(screenLock) {
+        val owner = screenOwnerId
+        when {
+            owner == null || owner == subagentId -> {
+                screenOwnerId = subagentId
+                true
+            }
+            screenQueue.contains(subagentId) -> false
+            else -> {
+                screenQueue.addLast(subagentId)
+                false
+            }
+        }
+    }
+
+    /** 归还屏幕槽位：持有者交棒给队首并定向唤醒它；非持有者只把自己从队列里摘掉。 */
+    fun releaseScreen(subagentId: String) {
+        val next: String?
+        synchronized(screenLock) {
+            next = if (screenOwnerId == subagentId) {
+                promoteLocked()
+            } else {
+                screenQueue.remove(subagentId)
+                null
+            }
+        }
+        if (next != null) postSteer(next, "屏幕已空闲，归你使用")
+    }
+
+    /** 排队人数：给「已排队第 N 位」这类提示用。 */
+    fun screenQueueSize(): Int = synchronized(screenLock) { screenQueue.size }
+
+    private fun postSteer(subagentId: String, text: String) {
+        controllers[subagentId]?.steer(text)
     }
 
     /**

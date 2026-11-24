@@ -1,5 +1,7 @@
 package io.github.mangi.eta.agent.model
 
+import android.os.SystemClock
+import io.github.mangi.eta.core.EtaTrace
 import java.util.concurrent.locks.ReentrantLock
 
 /**
@@ -12,6 +14,10 @@ import java.util.concurrent.locks.ReentrantLock
  */
 internal object AgentToolGate {
     private val lock = ReentrantLock(true)
+
+    /** 当前独占持有者，仅用于打点判断「等锁」还是「持锁执行」。 */
+    @Volatile
+    private var holder: String? = null
 
     /** 纯只读工具：不改变手机、终端或文件状态，可以并发执行。 */
     private val readOnlyTools = setOf(
@@ -46,11 +52,26 @@ internal object AgentToolGate {
     /** 需要独占的工具排队执行；只读工具直接放行。 */
     fun <T> withGate(toolName: String, block: () -> T): T {
         if (!requiresGate(toolName)) return block()
+        // 打点：等锁时长单独记，避免「等别人」被算成工具自己慢。
+        val waitStartedAt = SystemClock.elapsedRealtime()
         lock.lock()
+        val waitedMs = SystemClock.elapsedRealtime() - waitStartedAt
+        val previous = holder
+        holder = toolName
+        if (waitedMs >= GATE_WAIT_LOG_MS) {
+            EtaTrace.log(
+                "perf.tool.gate_wait",
+                "name=$toolName waited_ms=$waitedMs holder=${previous ?: "无"}",
+            )
+        }
         return try {
             block()
         } finally {
+            holder = previous
             lock.unlock()
         }
     }
+
+    /** 等锁超过这个时长才记一行，避免正常排队刷满日志。 */
+    private const val GATE_WAIT_LOG_MS = 300L
 }

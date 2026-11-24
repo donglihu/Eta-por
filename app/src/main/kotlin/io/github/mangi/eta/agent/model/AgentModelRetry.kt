@@ -68,7 +68,7 @@ internal class AgentModelRetry(
             } catch (failure: Exception) {
                 controller.throwIfCancelled()
                 if (callbackFailed || Thread.currentThread().isInterrupted) throw failure
-                val classified = AgentModelFailure.transport(failure) ?: throw failure
+                val classified = AgentModelFailure.transport(failure)
                 if (hostedToolStarted) throw AgentModelFailure(
                     classified.code, false, classified.message.orEmpty(), classified,
                 )

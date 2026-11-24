@@ -21,8 +21,10 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.Bolt
 import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material.icons.rounded.Dns
 import androidx.compose.runtime.Composable
@@ -53,6 +55,8 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.DpSize
 import androidx.compose.ui.unit.dp
 import io.github.mangi.eta.R
+import io.github.mangi.eta.agent.model.ModelTestResult
+import io.github.mangi.eta.agent.model.ModelTestState
 import io.github.mangi.eta.ui.model.AgentModelOptionUi
 import io.github.mangi.eta.ui.model.AgentModelPickerUiState
 import io.github.mangi.eta.ui.model.filterGroups
@@ -62,6 +66,7 @@ import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.launch
 import top.yukonga.miuix.kmp.basic.Icon
 import top.yukonga.miuix.kmp.basic.IconButton
+import top.yukonga.miuix.kmp.basic.InfiniteProgressIndicator
 import top.yukonga.miuix.kmp.basic.InputField
 import top.yukonga.miuix.kmp.basic.PopupPositionProvider
 import top.yukonga.miuix.kmp.basic.Text
@@ -81,6 +86,9 @@ internal fun AgentModelPickerButton(
     popupMaxHeight: Dp,
     onModelSelected: (String) -> Unit,
     modifier: Modifier = Modifier,
+    modelTestStates: Map<String, ModelTestState> = emptyMap(),
+    onTestModel: (AgentModelOptionUi) -> Unit = {},
+    onShowTestDetail: (AgentModelOptionUi) -> Unit = {},
 ) {
     var showPopup by remember { mutableStateOf(false) }
     var showSheet by remember { mutableStateOf(false) }
@@ -144,6 +152,9 @@ internal fun AgentModelPickerButton(
                     showPopup = false
                     onModelSelected(modelId)
                 },
+                modelTestStates = modelTestStates,
+                onTestModel = onTestModel,
+                onShowTestDetail = onShowTestDetail,
             )
         }
 
@@ -160,6 +171,9 @@ internal fun AgentModelPickerButton(
                         showSheet = false
                         onModelSelected(modelId)
                     },
+                    modelTestStates = modelTestStates,
+                    onTestModel = onTestModel,
+                    onShowTestDetail = onShowTestDetail,
                 )
             }
         }
@@ -170,6 +184,9 @@ internal fun AgentModelPickerButton(
 private fun ModelQuickList(
     state: AgentModelPickerUiState,
     onModelSelected: (String) -> Unit,
+    modelTestStates: Map<String, ModelTestState> = emptyMap(),
+    onTestModel: (AgentModelOptionUi) -> Unit = {},
+    onShowTestDetail: (AgentModelOptionUi) -> Unit = {},
 ) {
     val select = rememberConfirmedSelection(onModelSelected)
     val selectedId = select.pendingId ?: state.selectedModel?.id
@@ -187,6 +204,9 @@ private fun ModelQuickList(
                     model = model,
                     selected = model.id == selectedId,
                     onClick = { select(model.id) },
+                    testState = modelTestStates[model.id],
+                    onTestModel = onTestModel,
+                    onShowTestDetail = { onShowTestDetail(model) },
                 )
             }
         }
@@ -209,6 +229,9 @@ private sealed interface ModelSheetEntry {
 private fun ModelSheetContent(
     state: AgentModelPickerUiState,
     onModelSelected: (String) -> Unit,
+    modelTestStates: Map<String, ModelTestState> = emptyMap(),
+    onTestModel: (AgentModelOptionUi) -> Unit = {},
+    onShowTestDetail: (AgentModelOptionUi) -> Unit = {},
 ) {
     var query by remember { mutableStateOf("") }
     var providerFilter by remember { mutableStateOf<String?>(null) }
@@ -306,6 +329,9 @@ private fun ModelSheetContent(
                         selected = entry.model.id == selectedId,
                         onClick = { select(entry.model.id) },
                         horizontalPadding = 12.dp,
+                        testState = modelTestStates[entry.model.id],
+                        onTestModel = onTestModel,
+                        onShowTestDetail = { onShowTestDetail(entry.model) },
                     )
                 }
             }
@@ -362,6 +388,9 @@ private fun ModelPickerRow(
     selected: Boolean,
     onClick: () -> Unit,
     horizontalPadding: Dp = 8.dp,
+    testState: ModelTestState? = null,
+    onTestModel: (AgentModelOptionUi) -> Unit = {},
+    onShowTestDetail: (() -> Unit)? = null,
 ) {
     val contentColor = if (selected) MiuixTheme.colorScheme.primary else MiuixTheme.colorScheme.onSurface
     Row(
@@ -381,6 +410,11 @@ private fun ModelPickerRow(
             overflow = TextOverflow.Ellipsis,
             modifier = Modifier.weight(1f),
         )
+        ModelTestIndicator(
+            state = testState,
+            onTest = { onTestModel(model) },
+            onShowDetail = onShowTestDetail,
+        )
         if (selected) {
             Spacer(modifier = Modifier.width(8.dp))
             Icon(
@@ -391,6 +425,91 @@ private fun ModelPickerRow(
             )
         }
     }
+}
+
+/**
+ * 模型行尾的测速指示器，对齐 miniAI：
+ * - 未测：闪电图标，点一下开测；
+ * - 测速中：同位置转圈；
+ * - 成功：绿色 ✓ + 绿色耗时（如 `120ms`）；
+ * - 失败：红色感叹号，点击弹出失败原因。
+ */
+@Composable
+private fun ModelTestIndicator(
+    state: ModelTestState?,
+    onTest: () -> Unit,
+    onShowDetail: (() -> Unit)?,
+) {
+    val success = state?.result?.takeIf { it.success }
+    val failed = state != null && state.failed
+    when {
+        state?.running == true -> {
+            Box(
+                modifier = Modifier.size(ModelTestIconSize),
+                contentAlignment = Alignment.Center,
+            ) {
+                InfiniteProgressIndicator(size = 14.dp)
+            }
+        }
+        success != null -> {
+            Row(
+                modifier = Modifier
+                    .clip(RoundedCornerShape(8.dp))
+                    .clickable(onClick = onTest)
+                    .padding(horizontal = 4.dp, vertical = 2.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Icon(
+                    imageVector = Icons.Rounded.Check,
+                    contentDescription = stringResource(R.string.model_test_ok),
+                    modifier = Modifier.size(14.dp),
+                    tint = ModelTestSuccessColor,
+                )
+                Spacer(modifier = Modifier.width(3.dp))
+                Text(
+                    text = formatTestLatency(success),
+                    style = MiuixTheme.textStyles.footnote2,
+                    color = ModelTestSuccessColor,
+                    maxLines = 1,
+                )
+            }
+        }
+        failed -> {
+            Box(
+                modifier = Modifier
+                    .size(ModelTestIconSize)
+                    .clip(RoundedCornerShape(8.dp))
+                    .clickable(enabled = onShowDetail != null) { onShowDetail?.invoke() },
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(
+                    text = "!",
+                    style = MiuixTheme.textStyles.body2,
+                    color = MiuixTheme.colorScheme.error,
+                )
+            }
+        }
+        else -> {
+            IconButton(
+                onClick = onTest,
+                minWidth = ModelTestIconSize,
+                minHeight = ModelTestIconSize,
+            ) {
+                Icon(
+                    imageVector = Icons.Rounded.Bolt,
+                    contentDescription = stringResource(R.string.model_test_action),
+                    modifier = Modifier.size(16.dp),
+                    tint = MiuixTheme.colorScheme.primary,
+                )
+            }
+        }
+    }
+}
+
+/** `850ms` / `1.20s`：超过一秒换单位，读数不至于变成五位数。 */
+private fun formatTestLatency(result: ModelTestResult): String {
+    val ms = if (result.latencyMs > 0) result.latencyMs else result.timings.totalMs
+    return if (ms >= 1000) String.format(java.util.Locale.US, "%.2fs", ms / 1000.0) else "${ms}ms"
 }
 
 @Composable
@@ -426,7 +545,13 @@ internal fun ModelBrandMark(
     }
 }
 
-private val ModelPopupWidth = 248.dp
+private val ModelPopupWidth = 268.dp
+
+/** 测速指示器占位；比图标略大，给点击留出手指余量。 */
+private val ModelTestIconSize = 26.dp
+
+/** 测速成功的绿色：与主题 success 语义一致，失败沿用 colorScheme.error。 */
+private val ModelTestSuccessColor = Color(0xFF2BA24C)
 
 /** 不超过这个数量时弹窗一眼就能看完，不需要搜索。 */
 private const val ModelPopupLimit = 8

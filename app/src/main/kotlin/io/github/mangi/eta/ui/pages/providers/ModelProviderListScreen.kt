@@ -212,7 +212,13 @@ private fun ProviderListItem(
         title = null,
         modifier = Modifier
             .fillMaxWidth()
-            .combinedClickable(onClick = onOpen, onLongClick = onDelete)
+            .combinedClickable(
+                onClick = onOpen,
+                // 删除是独立动作，必须有独立 action 名：读屏只播报「打开」时，
+                // 无障碍用户既发现不了长按删除，也无法与短按区分。
+                onLongClickLabel = if (onDelete != null) "删除提供商「${provider.name}」" else null,
+                onLongClick = onDelete,
+            )
             .graphicsLayer { alpha = opacity },
         startAction = { ProviderIcon(provider) },
         titleContent = {

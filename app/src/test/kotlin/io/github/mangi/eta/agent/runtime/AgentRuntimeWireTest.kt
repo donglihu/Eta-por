@@ -118,6 +118,14 @@ class AgentRuntimeWireTest {
             bundle.remove("auto_compaction_enabled")
             assertTrue(AgentRuntimeWire.runRequestFromBundle(bundle).config.autoCompactionEnabled)
         }
+        // 阈值档位必须跨进程存活：入口选的 60% 不能让运行时按默认 85% 压。
+        val custom = config.copy(autoCompactionEnabled = true, autoCompactionTriggerPercent = 60)
+        val roundTrip = AgentRuntimeWire.runRequestFromBundle(
+            AgentRuntimeWire.toLegacyBundle(
+                AgentRuntimeWire.RunRequest(runId = "threshold", prompt = "继续", config = custom, images = emptyList()),
+            ),
+        )
+        assertEquals(60, roundTrip.config.autoCompactionTriggerPercent)
     }
 
     @Test

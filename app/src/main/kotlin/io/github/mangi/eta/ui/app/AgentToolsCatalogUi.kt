@@ -149,5 +149,16 @@ internal fun buildToolsState(context: Context): AgentToolsUiState =
                     ToolItemUi("list_directory", context.getString(R.string.tool_ui_list_directory_96e765), context.getString(R.string.tool_ui_list_directory_contents_feff30)),
                 ),
             ),
+            ToolGroupUi(
+                id = "orchestration",
+                title = "能力与编排",
+                tools = listOf(
+                    ToolItemUi("expert_manage", "管理专家", "创建、修改、删除、列举专家（会话内直接操作）。"),
+                    ToolItemUi("ask_user", "向用户提问", "给用户一组选项让其拍板，用于需要确认的决策。"),
+                    ToolItemUi("update_plan", "任务计划", "提交并回写当前任务的完整计划清单。"),
+                    ToolItemUi("subagent", "派发子智能体", "派发子智能体执行子任务并汇总结果。"),
+                    ToolItemUi("subagent_profile", "管理子智能体模板", "保存、列举、删除可复用的子智能体模板。"),
+                ),
+            ),
         )
     )

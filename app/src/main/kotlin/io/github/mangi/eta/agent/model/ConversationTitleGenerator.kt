@@ -108,7 +108,9 @@ internal class ConversationTitleGenerator(
         fun buildUserInputSnippet(userPrompt: String, assistantReply: String): String? {
             val parsed = AgentFileReferencePromptCodec.parse(userPrompt)
             val cleanUser = AgentFileReferencePolicy
-                .titleSource(parsed.request, parsed.references)
+                // 未闭合标签残片（`<skill_command id="pua"`）也要在喂给标题模型前剥掉，
+                // 否则模型可能把标签当成主题，标题就还带着那串东西。
+                .titleSource(ConversationTitlePolicy.cleanInjectedTags(parsed.request), parsed.references)
                 .trim()
                 .let { truncateCleanly(it, MAX_USER_CHARS) }
             val cleanAssistant = assistantReply.trim()

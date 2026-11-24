@@ -26,6 +26,7 @@ internal object AgentToolNaming {
         "闹钟与计时",
         "记忆与人格",
         "技能与扩展",
+        "子智能体",
         "任务与自动化",
         "诊断与日志",
         CATEGORY_MCP,
@@ -160,8 +161,16 @@ internal object AgentToolNaming {
         "skills_read_resource" to "技能与扩展|读技能附带文件",
         "skills_list_curated" to "技能与扩展|看官方技能库",
         "skills_manage" to "技能与扩展|新建或改技能",
+        "expert_manage" to "技能与扩展|建/改/召唤专家",
+        "ask_user" to "技能与扩展|向用户提问",
+        "update_plan" to "技能与扩展|任务计划清单",
+        "tap_smart" to "屏幕与界面|智能点击",
         "skills_inspect_github" to "技能与扩展|看 GitHub 技能库",
         "skills_install_from_github" to "技能与扩展|装 GitHub 技能",
+
+        // 子智能体：编排类工具，不碰设备，只决定「本轮允许模型做什么」
+        "subagent" to "子智能体|派发子智能体",
+        "subagent_profile" to "子智能体|管理子智能体模板",
 
         // 任务与自动化
         "tasks_triggers" to "任务与自动化|可用的触发方式",

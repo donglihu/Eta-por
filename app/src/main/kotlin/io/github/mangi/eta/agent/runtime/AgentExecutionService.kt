@@ -29,6 +29,17 @@ internal class AgentExecutionService : Service() {
     private var foregroundActive = false
     @Volatile private var startRejected = false
 
+    /**
+     * 通知里的 PendingIntent 缓存。
+     *
+     * 每次状态刷新都重新 `Intent(...)` + `PendingIntent.getService` 会多一遍 Intent 序列化分配；
+     * 2026-11-22 的崩溃栈点正落在 `PendingIntent.getService → Intent.prepareToLeaveProcess`。
+     * 这里只在「动作变了」时重建，`stop` 动作恒定只建一次。
+     */
+    private var stopPendingIntent: PendingIntent? = null
+    private var openPendingIntent: PendingIntent? = null
+    private var openPendingAction: String? = null
+
     override fun onCreate() {
         super.onCreate()
         instance = this
@@ -50,7 +61,12 @@ internal class AgentExecutionService : Service() {
                 startForeground(NOTIFICATION_ID, notification())
             }
             foregroundActive = true
-        } catch (failure: RuntimeException) {
+        } catch (failure: Throwable) {
+            // 捕获 Throwable 而非仅 RuntimeException：OOM（OutOfMemoryError）在通知构建/
+            // startForeground 时也会抛，若只捕 RuntimeException 会让前台执行服务直接崩溃。
+            // 降级为拒绝启动前台，并收回本次已登记的任务，避免半启动状态泄漏。
+            // ThreadDeath（线程 stop 信号）不可恢复，必须重新抛出交给 VM 处理。
+            if (failure is ThreadDeath) throw failure
             startRejected = true
             AndroidAgentLogger.warn("Execution service foreground failed: type=${failure.safeLogType()}")
             stopTasks(startFailed = true)
@@ -89,25 +105,70 @@ internal class AgentExecutionService : Service() {
             stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf()
         } else {
-            getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID, notification())
+            try {
+                getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID, notification())
+            } catch (failure: Throwable) {
+                // 堆接近上限时连通知都构建不出来（11-22 栈点就在 notification() 里）。
+                // 这一次刷新降级跳过，让 run 继续跑并把真实错误留给 run 级日志，
+                // 而不是把主线程打死、连失败现场都留不下。ThreadDeath 必须原样抛出。
+                if (failure is ThreadDeath) throw failure
+                AndroidAgentLogger.warnThrottled("execution_notification_refresh_failed") {
+                    "Execution notification refresh failed: type=${failure.safeLogType()}"
+                }
+            }
         }
+    }
+
+    /**
+     * 打开入口的 PendingIntent：只在目标动作变化时重建。
+     *
+     * 这个 Intent 里**不放任何 extras**：需要让界面知道上下文时只传 id 或文件路径，
+     * 由接收方从存储读（大 payload 走 Intent/Bundle 会在序列化时再复制一份，
+     * 正是 11-22 崩在 `Intent.prepareToLeaveProcess` 的那类开销）。
+     */
+    private fun openPendingIntent(linuxBusy: Boolean): PendingIntent? {
+        val action = if (linuxBusy) MainActivity.ACTION_OPEN_LINUX_ENVIRONMENT else null
+        openPendingIntent?.let { cached -> if (openPendingAction == action) return cached }
+        val intent = Intent(this, MainActivity::class.java).setAction(action)
+        val created = try {
+            PendingIntent.getActivity(
+                this, if (action == null) 0 else 2, intent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+            )
+        } catch (failure: RuntimeException) {
+            AndroidAgentLogger.warnThrottled("execution_pending_intent_open_failed") {
+                "Execution notification open PendingIntent failed: type=${failure.safeLogType()}"
+            }
+            null
+        }
+        openPendingIntent = created
+        openPendingAction = action
+        return created
+    }
+
+    /** 停止动作恒定，只建一次；分配失败时下一次刷新重试。 */
+    private fun stopPendingIntent(): PendingIntent? {
+        stopPendingIntent?.let { return it }
+        val created = try {
+            PendingIntent.getService(
+                this, 1, Intent(this, AgentExecutionService::class.java).setAction(ACTION_STOP),
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+            )
+        } catch (failure: RuntimeException) {
+            AndroidAgentLogger.warnThrottled("execution_pending_intent_stop_failed") {
+                "Execution notification stop PendingIntent failed: type=${failure.safeLogType()}"
+            }
+            null
+        }
+        stopPendingIntent = created
+        return created
     }
 
     private fun notification(): Notification {
         val status = runStatus
         // 正在装 Linux 工具时，点击通知直接落到 Linux 工具环境页，而不是停在首页。
-        val openIntent = Intent(this, MainActivity::class.java)
-        if (io.github.mangi.eta.agent.terminal.LinuxInstallRunner.busy) {
-            openIntent.action = MainActivity.ACTION_OPEN_LINUX_ENVIRONMENT
-        }
-        val open = PendingIntent.getActivity(
-            this, if (openIntent.action == null) 0 else 2, openIntent,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
-        )
-        val stop = PendingIntent.getService(
-            this, 1, Intent(this, AgentExecutionService::class.java).setAction(ACTION_STOP),
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
-        )
+        val open = openPendingIntent(linuxBusy = io.github.mangi.eta.agent.terminal.LinuxInstallRunner.busy)
+        val stop = stopPendingIntent()
         val taskCount = leases.count()
         val contentText = status?.localizedText(resources)
             ?: resources.getQuantityString(R.plurals.execution_summary, taskCount, taskCount)
@@ -116,10 +177,14 @@ internal class AgentExecutionService : Service() {
             .setColor(0xFF4285F4.toInt())
             .setContentTitle(getString(R.string.execution_title))
             .setContentText(contentText)
-            .setContentIntent(open)
             .setOngoing(true)
             .setOnlyAlertOnce(true)
-            .addAction(Notification.Action.Builder(null, getString(R.string.execution_stop), stop).build())
+        open?.let { builder.setContentIntent(it) }
+        stop?.let { stopIntent ->
+            builder.addAction(
+                Notification.Action.Builder(null, getString(R.string.execution_stop), stopIntent).build()
+            )
+        }
         // Agent run 期间把运行总卡片提升为 Live Update：状态栏胶囊、锁屏与流体云都读这张卡。
         if (status != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.BAKLAVA) {
             // 不用无进度的 ProgressStyle：那会渲染出一条空进度白条。改用 BigTextStyle 承载状态文本。

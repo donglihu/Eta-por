@@ -60,11 +60,11 @@ class LocaleResourcesTest {
             localizedQuantity("en-US", R.plurals.execution_summary, 2),
         )
         assertEquals(
-            "已导入 1 个文件，其余文件无法读取或超过 32 MiB",
+            "已导入 1 个文件，其余无法读取或超过可用空间上限（开启「所有文件访问权限」后可不受限）",
             localizedQuantity("zh-CN", R.plurals.capability_workspace_partial_import, 1),
         )
         assertEquals(
-            "已匯入 2 個檔案，其餘檔案無法讀取或超過 32 MiB",
+            "已导入 2 个文件，其余无法读取或超过可用空间上限（开启「所有文件访问权限」后可不受限）",
             localizedQuantity("zh-TW", R.plurals.capability_workspace_partial_import, 2),
         )
         for (locale in listOf("en-US", "zh-CN", "zh-TW", "fr-FR")) {

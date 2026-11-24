@@ -7,10 +7,13 @@ import android.os.SystemClock
 import android.util.Base64
 import android.util.Base64InputStream
 import io.github.mangi.eta.agent.media.AgentImageCodec
+import io.github.mangi.eta.agent.media.MAX_SCREEN_IMAGE_BYTES
+import io.github.mangi.eta.agent.media.ModelImageBudget
+import io.github.mangi.eta.agent.media.SCREEN_ENCODE_MAX_BYTES
 import io.github.mangi.eta.agent.model.AgentModelClient
 import io.github.mangi.eta.core.AndroidAgentLogger
+import io.github.mangi.eta.core.EtaTrace
 import java.io.ByteArrayInputStream
-import java.io.ByteArrayOutputStream
 import java.io.Closeable
 import java.io.File
 import java.io.FileOutputStream
@@ -25,11 +28,29 @@ import java.util.concurrent.atomic.AtomicBoolean
  * 才恢复成模型协议需要的 data URL。远程 HTTP(S) URL 不落盘，直接透传。
  */
 internal object AgentRuntimeImageTransfer {
-    private const val MAX_IMAGE_COUNT = 8
-    private const val MAX_IMAGE_BYTES = 12 * 1024 * 1024
-    private const val MAX_TOTAL_IMAGE_BYTES = 32 * 1024 * 1024
+    internal const val MAX_IMAGE_COUNT = 8
+
+    /**
+     * 单张图片的跨进程传输上限，必须与截图/原图合同 [MAX_SCREEN_IMAGE_BYTES]（32 MiB）对齐。
+     *
+     * 此前写死 12 MiB：原图改成「落盘 + 只读 fd 传输」后，12 MiB 以上的手机原片会在传输层被直接拒掉，
+     * 用户选图即失败。传输上限只负责兜住 Messenger 的体积，真正的模型字节预算由接收端
+     * [ModelImageBudget] 按渠道收缩（Anthropic 3.5 MiB / 其它 8 MiB），两层不能互相打架。
+     */
+    internal const val MAX_IMAGE_BYTES = MAX_SCREEN_IMAGE_BYTES
+
+    /** 单次请求图片总量：8 张 × 32 MiB 的最坏情况不再按 32 MiB 拒收，取 64 MiB 兜底。 */
+    internal const val MAX_TOTAL_IMAGE_BYTES = 64 * 1024 * 1024
     private const val MAX_REMOTE_URL_CHARS = 16 * 1024
-    private const val MAX_ENCODED_IMAGE_CHARS = MAX_IMAGE_BYTES * 2
+
+    /**
+     * 内联 data URL 的字符上限。
+     *
+     * 内联的大头只有 screenshot 的 PNG（[SCREEN_ENCODE_MAX_BYTES] = 12 MiB，Base64 后恰好 16Mi 字符），
+     * 所以卡到 16Mi + 64Ki 字符，而不是 2× [MAX_IMAGE_BYTES]（64Mi）：旧值会让人以为能内联 64 MB。
+     * 也不能再压到 8Mi 字符（约 6 MiB）：6 MiB 以上的截图会在这里被误判「内联图片数据过大」。
+     */
+    internal const val MAX_ENCODED_IMAGE_CHARS = SCREEN_ENCODE_MAX_BYTES * 4 / 3 + 64 * 1024
     private const val CACHE_DIRECTORY = "agent-runtime-transfer"
     private const val STALE_FILE_AGE_MILLIS = 6 * 60 * 60 * 1_000L
 
@@ -124,18 +145,36 @@ internal object AgentRuntimeImageTransfer {
             return PreparedImages(wireImages, files)
         } catch (throwable: Throwable) {
             PreparedImages(wireImages, files).close()
+            // OOM 不是「图片读不出来」：原样上抛，交给调用方按内存不足处理。
+            if (throwable is OutOfMemoryError) throw throwable
             if (throwable is ImageTransferException) throw throwable
             throw ImageTransferException("无法读取待发送图片", throwable)
         }
     }
 
-    /** 必须在 Runtime 后台线程调用；会消费并关闭 [incoming] 持有的文件描述符。 */
+    /**
+     * 必须在 Runtime 后台线程调用；会消费并关闭 [incoming] 持有的文件描述符。
+     *
+     * [providerType] 决定接收端的字节预算：Anthropic 系要压到 3.5 MiB（Base64 后仍低于 5 MB 硬上限），
+     * 其它渠道 8 MiB。默认取请求自带 config 的渠道，调用方无需额外传参也不会退回 STANDARD。
+     */
     fun materialize(
         incoming: AgentRuntimeWire.IncomingRunRequest,
+        providerType: String? = incoming.request.config.providerType,
     ): AgentRuntimeWire.RunRequest = incoming.use { request ->
         if (request.images.size > MAX_IMAGE_COUNT) {
             throw ImageTransferException("一次最多支持 $MAX_IMAGE_COUNT 张图片")
         }
+        val budget = ModelImageBudget.forProviderType(providerType)
+        AndroidAgentLogger.debug {
+            "Agent image action=materialize_budget provider=${providerType ?: "unset"} " +
+                "budget_bytes=${budget.maxEncodedBytes} images=${request.images.size}"
+        }
+        EtaTrace.log(
+            "image.transfer",
+            "action=materialize_budget provider=${providerType ?: "unset"} " +
+                "budget_bytes=${budget.maxEncodedBytes} images=${request.images.size}",
+        )
 
         var totalBytes = 0L
         val images = request.images.mapIndexed { index, image ->
@@ -148,9 +187,13 @@ internal object AgentRuntimeImageTransfer {
                 if (statSize > MAX_IMAGE_BYTES) {
                     throw ImageTransferException("单张图片不能超过 ${MAX_IMAGE_BYTES / 1024 / 1024} MiB")
                 }
+                // statSize 已校验过上限：按实际大小一次性分配并读满，去掉 BAOS + toByteArray 的第二份拷贝
+                // （32 MiB 上限处原先瞬时 64 MB，正好叠在解码位图峰值之前）。
                 val bytes = ParcelFileDescriptor.AutoCloseInputStream(descriptor).use { input ->
-                    input.readBytesLimited(MAX_IMAGE_BYTES)
+                    input.readExactly(statSize.toInt())
                 }
+                // 防御性复核：readExactly 已在 EOF 处抛异常，正常情况下这里恒等，保留只为兜住
+                // 未来若换回「按上限读」的实现时不会静默放过短读。
                 if (bytes.size.toLong() != statSize) {
                     throw ImageTransferException("图片传输不完整")
                 }
@@ -161,13 +204,19 @@ internal object AgentRuntimeImageTransfer {
                 val materialized = if (image.preserveOriginal) {
                     AgentImageCodec.fromScreenBytes(bytes, image.source, image.mimeType)
                 } else {
-                    AgentImageCodec.fromAttachmentBytes(bytes, image.source, image.mimeType)
+                    AgentImageCodec.fromAttachmentBytes(
+                        bytes = bytes,
+                        source = image.source,
+                        mimeHint = image.mimeType,
+                        budget = budget,
+                    )
                 }
                 return@mapIndexed materialized.also {
                     AndroidAgentLogger.debug {
                         "Agent image action=materialize index=$index " +
                             "input_bytes=${bytes.size} output_bytes=${materialized.bytes} " +
                             "output=${materialized.width}x${materialized.height} " +
+                            "budget_bytes=${budget.maxEncodedBytes} provider=${providerType ?: "unset"} " +
                             "elapsed_ms=${SystemClock.elapsedRealtime() - startedAt}"
                     }
                 }
@@ -196,6 +245,7 @@ internal object AgentRuntimeImageTransfer {
                 value = reference,
                 source = image.source,
                 preserveOriginal = image.preserveOriginal,
+                budget = budget,
             ) ?: throw ImageTransferException("无法读取旧协议中的图片")
         }
         request.materializeText().copy(images = images)
@@ -262,7 +312,11 @@ internal object AgentRuntimeImageTransfer {
                 }
             else -> null
         }
-    }.getOrNull()
+    }.getOrElse { failure ->
+        // 打开描述符同样处在内存压力路径上：OOM 原样上抛，其余失败按「引用不可读」返回 null。
+        if (failure is OutOfMemoryError) throw failure
+        null
+    }
 
     private fun String.openDataUrlStream(): InputStream {
         val separator = indexOf(',')
@@ -296,19 +350,16 @@ internal object AgentRuntimeImageTransfer {
         }
     }
 
-    private fun InputStream.readBytesLimited(maxBytes: Int): ByteArray {
-        val output = ByteArrayOutputStream(minOf(maxBytes, 256 * 1024))
-        val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
-        var total = 0
-        while (true) {
-            val read = read(buffer)
-            if (read < 0) return output.toByteArray()
-            total += read
-            if (total > maxBytes) {
-                throw ImageTransferException("单张图片不能超过 ${maxBytes / 1024 / 1024} MiB")
-            }
-            output.write(buffer, 0, read)
+    /** 已知长度的一次性读取：只分配一份，读满即返回，不再复制第二份。 */
+    private fun InputStream.readExactly(size: Int): ByteArray {
+        val out = ByteArray(size)
+        var offset = 0
+        while (offset < size) {
+            val read = read(out, offset, size - offset)
+            if (read < 0) throw ImageTransferException("图片传输不完整")
+            offset += read
         }
+        return out
     }
 
     private fun String.isRemoteUrl(): Boolean =

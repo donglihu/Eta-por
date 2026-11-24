@@ -1,8 +1,10 @@
 package io.github.mangi.eta.agent.model
 
+import io.github.mangi.eta.agent.expert.Expert
 import io.github.mangi.eta.agent.memory.AgentMemoryContext
 import io.github.mangi.eta.agent.prompt.PromptCustomization
 import io.github.mangi.eta.agent.prompt.PromptCustomizationMode
+import io.github.mangi.eta.agent.prompt.PromptJailbreak
 import io.github.mangi.eta.agent.skill.SkillContext
 import io.github.mangi.eta.agent.roleplay.RoleplayRunContext
 import io.github.mangi.eta.agent.terminal.TerminalExecutionContext
@@ -25,8 +27,12 @@ internal object AgentPromptBuilder {
         virtualScreenFallbackEnabled: Boolean = false,
         customization: PromptCustomization = PromptCustomization(),
         planMode: Boolean = false,
+        /** 破甲模式：独立于自定义提示词，置顶注入；默认关闭。 */
+        jailbreak: PromptJailbreak = PromptJailbreak(),
+        /** 召唤的专家：定义会话的身份与方法论，紧跟破甲/计划段之后注入；默认无专家。 */
+        expert: Expert? = null,
     ): JSONArray {
-        val messages = buildSystemMessages(config, skillContext, memoryContext, rootAvailable, roleplayContext, executionContext, virtualScreenEnabled, virtualScreenFallbackEnabled, customization, planMode)
+        val messages = buildSystemMessages(config, skillContext, memoryContext, rootAvailable, roleplayContext, executionContext, virtualScreenEnabled, virtualScreenFallbackEnabled, customization, planMode, jailbreak, expert)
         val chatOnly = LocalToolProfileStore.current(config.providerId, config.model) == LocalToolProfile.CHAT
         history.forEach { item ->
             val json = runCatching { AgentConversationCodec.toJsonObject(item) }.getOrNull() ?: return@forEach
@@ -55,6 +61,10 @@ internal object AgentPromptBuilder {
         customization: PromptCustomization = PromptCustomization(),
         /** Plan 模式：系统提示尾部追加约束；执行边界不在此，改由审批闸门 + 提示词自约束负责。 */
         planMode: Boolean = false,
+        /** 破甲模式：置顶为第一条 system，只影响主代理，不参与 roleplay 与自定义提示词的版本语义。 */
+        jailbreak: PromptJailbreak = PromptJailbreak(),
+        /** 召唤的专家：身份与方法论，紧跟破甲/计划段之后；只影响主代理。 */
+        expert: Expert? = null,
     ): JSONArray {
         val messages = JSONArray()
         val custom = customization.takeIf { it.active }
@@ -74,7 +84,10 @@ internal object AgentPromptBuilder {
                 )
             )
             custom?.let { value -> customInstructionsMessage(value) }?.let(messages::put)
-            return messages
+            var chatOrdered = messages
+            expert?.takeIf { it.isActivePrompt() }?.let { active -> chatOrdered = insertSystemFirst(chatOrdered, expertBody(active, skillContext)) }
+            if (jailbreak.active) chatOrdered = insertSystemFirst(chatOrdered, jailbreakBody(jailbreak))
+            return chatOrdered
         }
         if (roleplayContext == null && basePrompt.isNotBlank()) {
             val identity = custom?.let { value -> customIdentityMessage(value, basePrompt) }
@@ -218,6 +231,18 @@ internal object AgentPromptBuilder {
                 )
             )
         }
+        // 专家创建接口：没有这段，模型会把「帮我建个专家」当成普通对话，答一句「请去设置里新建」。
+        messages.put(
+            systemMessage(
+                "用户可以让你直接创建或修改可召唤的专家（会话角色），用 expert_manage 工具，不要让他去设置页手动填表。" +
+                    "用户说「帮我建一个代码评审专家」「按这个风格写个人设」「改一下刚才那个专家的提示词」时：" +
+                    "先想要什么（谁 + 背景、擅长与不做的边界、工作流程、交付格式），再一次性把这些字段写进去；" +
+                    "name 用英文小写短横线（如 code-reviewer），description 写一句话适用场景，prompt 写完整人设正文。" +
+                    "不确定分类就省 category；不确定绑定技能就省 skills。创建成功后用返回的 summary 向用户交代结果，" +
+                    "不要复述整段提示词；用户说「就用这个身份」时再 action=summon。" +
+                    "只改某一项（比如只改提示词）时用 action=update 并只传要改的字段，其余字段会沿用旧值。"
+            )
+        )
         if (config.subagentTools) {
             messages.put(
                 systemMessage(
@@ -229,6 +254,8 @@ internal object AgentPromptBuilder {
                         "只有当用户明确要求‘保存/添加一个以后可复用的自定义 Subagent 模板’时，才调用 subagent_profile(action=\"save\", ...)。" +
                         "多个独立的子任务应在同一轮一并发出多个 subagent 调用，由 Runtime 自动并行执行；" +
                         "简单直接的单步查询优先直接调用对应工具，不必绕经 subagent。" +
+                        "**但若本轮已注入 <expert> 段且该专家的职责要求派发（例如小组长、编排型专家），" +
+                        "派发是强制流程而不是可选优化：以专家要求为准，不得以「简单任务不必绕经 subagent」「自己动手更快」为由跳过派发。**" +
                         "子智能体没有当前会话上下文，也不执行屏幕 GUI 手势；派发时提供完整目标与已知线索，收到汇总结果后由你向用户统一作答。"
                 )
             )
@@ -242,17 +269,57 @@ internal object AgentPromptBuilder {
             buildSkillSystemMessage(skillContext)?.let(messages::put)
         }
         custom?.let { value -> customInstructionsMessage(value) }?.let(messages::put)
-        if (planMode) {
-            // 计划约束放系统提示最前面：整段系统提示很长，末尾那条最容易被稀释；
-            // 有些服务商只保留首条 system，放末尾等于没注入——这正是「开关开着却不生效」的来源之一。
-            if (messages.length() == 0) {
-                messages.put(systemMessage(PLAN_MODE_INSTRUCTION))
-            } else {
-                messages.put(0, systemMessage(PLAN_MODE_INSTRUCTION))
-            }
-        }
-        return messages
+        // 计划约束放系统提示最前面：整段系统提示很长，末尾那条最容易被稀释；
+        // 有些服务商只保留首条 system，放末尾等于没注入——这正是「开关开着却不生效」的来源之一。
+        // 破甲段要求比 Plan 更靠前（顺序 [破甲, Plan, 身份…]），因此这里必须逐段前置。
+        var ordered = messages
+        expert?.takeIf { it.isActivePrompt() }?.let { active -> ordered = insertSystemFirst(ordered, expertBody(active, skillContext)) }
+        if (planMode) ordered = insertSystemFirst(ordered, PLAN_MODE_INSTRUCTION)
+        if (jailbreak.active) ordered = insertSystemFirst(ordered, jailbreakBody(jailbreak))
+        return ordered
     }
+
+    /**
+     * 系统提示前置插入。
+     *
+     * miniAI 的做法就是把 `pj.md` 整段拼在 system 最前（实测 ON 时 `You are 富江` 位于 offset 0，
+     * 内置身份段被整体后移到 8,645）。这里必须返回新数组：org.json 的 `put(index, value)`
+     * 在 index < length 时是**替换**而不是插入，直接 put(0) 会顶掉原有第一条身份段。
+     */
+    private fun insertSystemFirst(messages: JSONArray, content: String): JSONArray =
+        JSONArray().also { reordered ->
+            reordered.put(systemMessage(content))
+            for (index in 0 until messages.length()) reordered.put(messages.getJSONObject(index))
+        }
+
+    /** 破甲段正文：整段包在 `<jailbreak_mode>` 里，字数写入属性，改动前后可直接核对。 */
+    private fun jailbreakBody(jailbreak: PromptJailbreak): String = buildString {
+        append("<jailbreak_mode chars=\"").append(jailbreak.charCount).append("\">\n")
+        append(jailbreak.text)
+        append("\n</jailbreak_mode>")
+    }
+
+    /** 专家段正文：整段包在 `<expert>` 里，紧跟破甲/计划段之后，只影响主代理；绑定技能名一并列出。 */
+    private fun expertBody(expert: Expert, skillContext: SkillContext): String = buildString {
+        append("<expert name=\"").append(expert.name).append("\" category=\"").append(expert.category.key).append("\">\n")
+        if (expert.description.isNotBlank()) {
+            append("说明：").append(expert.description).append("\n")
+        }
+        append(expert.prompt)
+        append("\n</expert>")
+        val boundSkillNames = expert.skills.mapNotNull { skillId ->
+            skillContext.installedSkills.firstOrNull { it.id == skillId }?.name ?: skillId
+        }
+        if (boundSkillNames.isNotEmpty()) {
+            append("\n该专家绑定的技能：").append(boundSkillNames.joinToString("、"))
+            append("。正文随技能索引可读，按需调用 skills_read 加载。")
+        }
+        append("\n用户已召唤专家「").append(expert.title)
+        append("」：本会话以该专家的身份、背景与方法论作答；工具、设备、屏幕与证据规则仍然有效，按其执行。")
+    }
+
+    /** 只有启用且正文非空的专家才注入。 */
+    private fun Expert.isActivePrompt(): Boolean = this.enabled && this.prompt.isNotBlank()
 
     private fun customIdentityMessage(customization: PromptCustomization, base: String): JSONObject =
         if (customization.mode == PromptCustomizationMode.APPEND) {
@@ -311,6 +378,8 @@ internal object AgentPromptBuilder {
             appendLine("只保存跨对话仍有价值的稳定事实、偏好、关系和持续项目；不要保存密钥、验证码、凭据或一次性请求。")
             if (writable) {
                 appendLine("当用户明确要求记住、纠正长期偏好，或确认了跨对话复用的环境与项目事实时，主动调用 memory_write，优先替换已有章节并去重；只有需要详细背景或发生 revision 冲突时才调用 memory_get。")
+                appendLine("MEMORY.md 只放长期约束、稳定事实与持续项目上下文；项目进展、命令输出、临时结论、待办一律用 memory_write(scope=notes) 写进 NOTES.md，或落到知识库文件，不要塞进核心记忆。")
+                appendLine("核心段受注入预算硬约束（当前 ${context.coreBudgetChars} 字符）：写入会让核心段超预算时会被拒绝（MEMORY_BUDGET_EXCEEDED），此时不要原样重试——先用 replace_range 删掉过期细节，或改用 scope=notes。")
             } else {
                 appendLine("这是用户的现实记忆，在角色会话中只读；按需调用 memory_get，禁止把虚构人设或剧情写入此文件。剧情记忆使用 character_memory_get/character_memory_write。")
             }

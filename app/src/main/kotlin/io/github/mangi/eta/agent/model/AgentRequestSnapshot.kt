@@ -17,12 +17,12 @@ import java.util.concurrent.Executors
  */
 internal object AgentRequestSnapshot {
     private const val DIR = "prompt-snapshots"
-    private const val DEFAULT_RETAIN = 20
+    private const val DEFAULT_RETAIN = 5
 
     /** 上限：0 表示不记录快照；最高 30 份。 */
     const val MAX_RETAIN = 30
     private const val KEY_RETAIN = "agent_snapshot_retain"
-    private const val MAX_BYTES = 8L * 1024 * 1024
+    private const val MAX_BYTES = 2L * 1024 * 1024
 
     @Volatile
     private var appContext: Context? = null
@@ -46,7 +46,91 @@ internal object AgentRequestSnapshot {
         val context = appContext ?: return
         // 保留 0 份 = 不记录：直接不写盘，也不再清理（此时目录应当是空的/由 prune 清空）。
         if (retainLimit() == 0) return
-        executor.execute { runCatching { write(context, request, now) } }
+        // 在调用线程抽出写盘真正需要的字段：入队的闭包只带 system/tool 文本与各段字数，
+        // 不再强引用整份 ProviderRequest（history 的 JSONArray 与 ~185 个工具 schema）。
+        val payload = capturePayload(request, now)
+        executor.execute { runCatching { write(context, payload) } }
+    }
+
+    /**
+     * 快照的写盘载荷。
+     *
+     * system 与工具描述保留原文引用（快照详情页与 [io.github.mangi.eta.agent.security.PromptIntegrityGuard]
+     * 都要读全文），但工具参数 schema、历史正文与图片字节都不再被钉住。
+     */
+    private class Payload(
+        val at: Long,
+        val signature: String,
+        val sessionId: String,
+        val purpose: String,
+        val provider: String,
+        val model: String,
+        val endpoint: String,
+        val system: List<SystemEntry>,
+        val tools: List<ToolEntry>,
+        val messages: List<MessageEntry>,
+        val systemChars: Int,
+        val toolsChars: Int,
+    )
+
+    private class SystemEntry(val index: Int, val chars: Int, val text: String)
+
+    private class ToolEntry(val name: String, val chars: Int, val description: String)
+
+    private class MessageEntry(val role: String, val chars: Int)
+
+    private fun capturePayload(request: ProviderRequest, now: Long): Payload {
+        val system = ArrayList<SystemEntry>(4)
+        val messages = ArrayList<MessageEntry>(request.messages.length())
+        var systemChars = 0
+        for (index in 0 until request.messages.length()) {
+            val message = request.messages.optJSONObject(index) ?: continue
+            val role = message.optString("role")
+            val content = message.optString("content")
+            if (role == "system") {
+                system += SystemEntry(index, content.length, content)
+                systemChars += content.length
+            } else {
+                // 非 system 消息只留 role 与字数：正文由调用方继续持有，快照线程不必再钉一遍。
+                messages += MessageEntry(role, content.length)
+            }
+        }
+
+        val effectiveTools = request.effectiveTools
+        val tools = ArrayList<ToolEntry>(effectiveTools.length())
+        var toolsChars = 0
+        for (index in 0 until effectiveTools.length()) {
+            val function = effectiveTools.optJSONObject(index)?.optJSONObject("function") ?: continue
+            val description = function.optString("description")
+            tools += ToolEntry(function.optString("name"), description.length, description)
+            toolsChars += description.length
+        }
+
+        // 同一次对话里会混着不同工具集的请求（主对话 185 个、自动复盘 2 个、纯聊天 0 个）。
+        // 抓一个"配置指纹"，让对比只跟同配置的请求比，不会拿 185 个工具的去比 2 个工具的。
+        val signature = runCatching {
+            val joined = tools.sortedBy { it.name }.joinToString(",") { it.name }
+            java.security.MessageDigest.getInstance("SHA-256")
+                .digest((request.purpose.name + "|" + joined).toByteArray(Charsets.UTF_8))
+                .joinToString("") { byte -> "%02x".format(byte) }
+                .take(10)
+        }.getOrDefault("")
+
+        val config = request.effectiveConfig
+        return Payload(
+            at = now,
+            signature = signature,
+            sessionId = request.sessionId,
+            purpose = request.purpose.name,
+            provider = config.providerType,
+            model = config.model,
+            endpoint = config.openAiEndpointMode,
+            system = system,
+            tools = tools,
+            messages = messages,
+            systemChars = systemChars,
+            toolsChars = toolsChars,
+        )
     }
 
     /** 最新在前。 */
@@ -98,66 +182,40 @@ internal object AgentRequestSnapshot {
         return files.size
     }
 
-    private fun write(context: Context, request: ProviderRequest, now: Long) {
+    private fun write(context: Context, snapshot: Payload) {
         val dir = File(context.filesDir, DIR).apply { mkdirs() }
         val system = JSONArray()
         val tools = JSONArray()
         val messages = JSONArray()
-        var systemChars = 0
-        var toolsChars = 0
 
-        for (index in 0 until request.messages.length()) {
-            val message = request.messages.optJSONObject(index) ?: continue
-            val role = message.optString("role")
-            val content = message.optString("content")
-            if (role == "system") {
-                system.put(
-                    JSONObject()
-                        .put("i", index)
-                        .put("chars", content.length)
-                        .put("text", content),
-                )
-                systemChars += content.length
-            } else {
-                messages.put(JSONObject().put("role", role).put("chars", content.length))
-            }
+        snapshot.system.forEach { entry ->
+            system.put(
+                JSONObject()
+                    .put("i", entry.index)
+                    .put("chars", entry.chars)
+                    .put("text", entry.text),
+            )
         }
-
-        val effectiveTools = request.effectiveTools
-        for (index in 0 until effectiveTools.length()) {
-            val function = effectiveTools.optJSONObject(index)?.optJSONObject("function") ?: continue
-            val description = function.optString("description")
+        snapshot.tools.forEach { entry ->
             tools.put(
                 JSONObject()
-                    .put("name", function.optString("name"))
-                    .put("chars", description.length)
-                    .put("description", description),
+                    .put("name", entry.name)
+                    .put("chars", entry.chars)
+                    .put("description", entry.description),
             )
-            toolsChars += description.length
+        }
+        snapshot.messages.forEach { entry ->
+            messages.put(JSONObject().put("role", entry.role).put("chars", entry.chars))
         }
 
-        // 同一次对话里会混着不同工具集的请求（主对话 185 个、自动复盘 2 个、纯聊天 0 个）。
-        // 抓一个"配置指纹"，让对比只跟同配置的请求比，不会拿 185 个工具的去比 2 个工具的。
-        val signature = runCatching {
-            val joined = (0 until tools.length())
-                .map { tools.getJSONObject(it).optString("name") }
-                .sorted()
-                .joinToString(",")
-            java.security.MessageDigest.getInstance("SHA-256")
-                .digest((request.purpose.name + "|" + joined).toByteArray(Charsets.UTF_8))
-                .joinToString("") { byte -> "%02x".format(byte) }
-                .take(10)
-        }.getOrDefault("")
-
-        val config = request.effectiveConfig
         val json = JSONObject()
-            .put("at", now)
-            .put("signature", signature)
-            .put("session", request.sessionId)
-            .put("purpose", request.purpose.name)
-            .put("provider", config.providerType)
-            .put("model", config.model)
-            .put("endpoint", config.openAiEndpointMode)
+            .put("at", snapshot.at)
+            .put("signature", snapshot.signature)
+            .put("session", snapshot.sessionId)
+            .put("purpose", snapshot.purpose)
+            .put("provider", snapshot.provider)
+            .put("model", snapshot.model)
+            .put("endpoint", snapshot.endpoint)
             .put("system", system)
             .put("tools", tools)
             .put("messages", messages)
@@ -165,13 +223,13 @@ internal object AgentRequestSnapshot {
                 "counts",
                 JSONObject()
                     .put("system", system.length())
-                    .put("system_chars", systemChars)
+                    .put("system_chars", snapshot.systemChars)
                     .put("tools", tools.length())
-                    .put("tools_chars", toolsChars)
+                    .put("tools_chars", snapshot.toolsChars)
                     .put("messages", messages.length()),
             )
 
-        File(dir, "snapshot-$now.json").writeText(json.toString())
+        File(dir, "snapshot-${snapshot.at}.json").writeText(json.toString())
         prune(dir)
     }
 

@@ -65,7 +65,7 @@ class AgentFileReferenceGatewayTest {
     }
 
     @Test
-    fun mapPrimaryStorageDocument_acceptsPrimaryVolumeOnly() {
+    fun mapPrimaryStorageDocument_mapsPrimaryAndNonPrimaryVolumes() {
         assertEquals(
             "/storage/emulated/0/Download/report.txt",
             AgentFileReferenceGateway.mapPrimaryStorageDocument(
@@ -80,16 +80,34 @@ class AgentFileReferenceGatewayTest {
                 "primary:",
             ),
         )
+        // SD 卡 / 其它卷的 documentId 形如 1A1B-2C3D:Download/a.bin，必须映射到
+        // /storage/<volumeId>/<relativePath>，否则会掉进复制导入分支撞大小限制。
+        assertEquals(
+            "/storage/1A1B-2C3D/Download/a.bin",
+            AgentFileReferenceGateway.mapPrimaryStorageDocument(
+                AgentFileReferenceGateway.EXTERNAL_STORAGE_DOCUMENTS_AUTHORITY,
+                "1A1B-2C3D:Download/a.bin",
+            ),
+        )
+        assertEquals(
+            "/storage/1234-5678",
+            AgentFileReferenceGateway.mapPrimaryStorageDocument(
+                AgentFileReferenceGateway.EXTERNAL_STORAGE_DOCUMENTS_AUTHORITY,
+                "1234-5678:",
+            ),
+        )
+        // 非 externalstorage 授权的 documentId 不能当本地路径用。
         assertNull(
             AgentFileReferenceGateway.mapPrimaryStorageDocument(
                 "com.android.providers.downloads.documents",
                 "primary:Download/report.txt",
             )
         )
+        // 没有 ':' 分隔符就不是卷路径。
         assertNull(
             AgentFileReferenceGateway.mapPrimaryStorageDocument(
                 AgentFileReferenceGateway.EXTERNAL_STORAGE_DOCUMENTS_AUTHORITY,
-                "1234-5678:report.txt",
+                "1234-5678-report.txt",
             )
         )
     }
@@ -102,11 +120,54 @@ class AgentFileReferenceGatewayTest {
                 "primary:Download/../secret",
             )
         )
+        // 非 primary 卷同样要挡住 .. 穿越、卷名穿越与控制字符。
+        assertNull(
+            AgentFileReferenceGateway.mapPrimaryStorageDocument(
+                AgentFileReferenceGateway.EXTERNAL_STORAGE_DOCUMENTS_AUTHORITY,
+                "1A1B-2C3D:Download/../secret",
+            )
+        )
+        assertNull(
+            AgentFileReferenceGateway.mapPrimaryStorageDocument(
+                AgentFileReferenceGateway.EXTERNAL_STORAGE_DOCUMENTS_AUTHORITY,
+                "..:Download/secret",
+            )
+        )
+        assertNull(
+            AgentFileReferenceGateway.mapPrimaryStorageDocument(
+                AgentFileReferenceGateway.EXTERNAL_STORAGE_DOCUMENTS_AUTHORITY,
+                "1A1B-2C3D:/secret",
+            )
+        )
         assertNull(
             AgentFileReferenceGateway.mapPrimaryStorageDocument(
                 AgentFileReferenceGateway.EXTERNAL_STORAGE_DOCUMENTS_AUTHORITY,
                 "primary:Download/bad\nname",
             )
+        )
+    }
+
+    @Test
+    fun computeImportLimit_followsUsableSpaceWithSafetyMarginAndHardCap() {
+        val mib = 1L * 1024 * 1024
+        // 可用空间充足时，余量取「64 MiB 与可用空间 10% 的较大者」，上限随之放大。
+        assertEquals(
+            2_000L * mib - 200L * mib,
+            AgentFileReferenceGateway.computeImportLimit(2_000L * mib),
+        )
+        // 原 32 MiB 文件必须放行：上限不再写死常数。
+        assertTrue(
+            AgentFileReferenceGateway.computeImportLimit(2_000L * mib) > 32L * mib,
+        )
+        // 可用空间很小、10% 余量低于 64 MiB 时按 64 MiB 扣，且不低于下限。
+        assertEquals(
+            AgentFileReferenceGateway.MIN_IMPORT_BYTES,
+            AgentFileReferenceGateway.computeImportLimit(40L * mib),
+        )
+        // 硬上限防失控：可用空间被误读成超大值时封顶 4 GiB。
+        assertEquals(
+            AgentFileReferenceGateway.MAX_IMPORT_LIMIT_BYTES,
+            AgentFileReferenceGateway.computeImportLimit(16L * 1024L * mib),
         )
     }
 

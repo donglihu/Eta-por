@@ -14,6 +14,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.platform.LocalContext
 import io.github.mangi.eta.core.CrashRecorder
+import io.github.mangi.eta.core.SharedStorage
 import io.github.mangi.eta.data.datastore.SettingsDataStore
 import io.github.mangi.eta.data.db.ChunkedTextDao
 import io.github.mangi.eta.data.db.EtaDatabase
@@ -458,12 +459,12 @@ private suspend fun runSelfCheck(context: Context, probeRoot: Boolean): SelfChec
     )
 
     val storage = mutableListOf<SelfCheckItem>()
-    val shareDir = File("/storage/emulated/0/ai共享文件夹")
+    val shareDir = File(SharedStorage.BASE_DIR)
     val shareOk = shareDir.isDirectory && shareDir.canWrite()
     storage += SelfCheckItem(
         name = "共享目录",
         state = if (shareOk) STATE_OK else STATE_MISSING,
-        detail = if (shareOk) "/storage/emulated/0/ai共享文件夹 可读写" else "共享目录不存在或不可写",
+        detail = if (shareOk) "${SharedStorage.BASE_DIR} 可读写" else "共享目录不存在或不可写",
     )
 
     val database = runCatching { EtaDatabase.get(context) }.getOrNull()
@@ -514,13 +515,28 @@ private suspend fun runSelfCheck(context: Context, probeRoot: Boolean): SelfChec
             // 把这两轮新做的备份能力并进同一条：最近一个全量包多大、数据库到底进没进包。
             val packInfo = runCatching {
                 io.github.mangi.eta.data.repository.AutoBackupRunner
-                    .fullBackups(settings.autoBackupDirectory)
+                    .fullEntries(settings.autoBackupDirectory, settings.autoBackupTreeUri)
                     .firstOrNull()
-                    ?.let { file ->
-                        val mb = String.format(java.util.Locale.US, "%.1f", file.length() / 1048576.0)
-                        val hasDb = java.util.zip.ZipFile(file).use { zip ->
-                            zip.getEntry("private/databases/eta.db") != null
-                        }
+                    ?.let { entry ->
+                        val mb = String.format(java.util.Locale.US, "%.1f", entry.size / 1048576.0)
+                        // 备份目录可能是 SAF 授权目录，不能用 ZipFile(File) 随机访问，改用流式扫一遍条目。
+                        val hasDb = runCatching {
+                            val storage = io.github.mangi.eta.data.repository.AutoBackupRunner
+                                .storage(settings.autoBackupDirectory, settings.autoBackupTreeUri)
+                            storage?.openRead(entry.name)?.use { input ->
+                                java.util.zip.ZipInputStream(input).use { zip ->
+                                    var found = false
+                                    while (true) {
+                                        val next = zip.nextEntry ?: break
+                                        if (next.name == "private/databases/eta.db") {
+                                            found = true
+                                            break
+                                        }
+                                    }
+                                    found
+                                }
+                            } ?: false
+                        }.getOrDefault(false)
                         " · 最新全量包 $mb MB · 数据库${if (hasDb) "已含" else "缺失"}"
                     }
             }.getOrNull().orEmpty()
@@ -545,7 +561,7 @@ private suspend fun runSelfCheck(context: Context, probeRoot: Boolean): SelfChec
         )
     }.isSuccess
     val autoCount = runCatching {
-        File("/storage/emulated/0/ai共享文件夹/诊断包备份/自动")
+        File(SharedStorage.DIAGNOSTICS_AUTO_DIR)
             .listFiles()?.count { it.name.endsWith(".zip") } ?: 0
     }.getOrDefault(0)
     storage += SelfCheckItem(

@@ -75,6 +75,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.unit.DpSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.FileProvider
@@ -101,8 +102,11 @@ import io.github.mangi.eta.ui.app.rememberDeviceCapabilities
 import io.github.mangi.eta.ui.components.EtaArrowPreference
 import io.github.mangi.eta.ui.components.EtaDropdownPreference
 import androidx.compose.material.icons.rounded.Tune
+import io.github.mangi.eta.data.model.ProviderModel
+import io.github.mangi.eta.data.model.ProviderSetting
 import io.github.mangi.eta.data.model.ReasoningEffort
 import io.github.mangi.eta.data.model.enabledModel
+import io.github.mangi.eta.data.provider.ProviderSourceRegistry
 import io.github.mangi.eta.ui.components.EtaPreference
 import io.github.mangi.eta.ui.components.EtaPreferenceColors
 import io.github.mangi.eta.ui.components.EtaPreferenceDivider
@@ -114,12 +118,14 @@ import io.github.mangi.eta.ui.components.EtaWindowDialog
 import io.github.mangi.eta.ui.components.LanguagePreference
 import io.github.mangi.eta.ui.components.MiuixDialogActions
 import io.github.mangi.eta.ui.components.MiuixScaffoldPage
+import io.github.mangi.eta.ui.components.ModelBrandMark
+import io.github.mangi.eta.ui.components.OptionalModelPickerContent
+import io.github.mangi.eta.ui.model.AgentModelPickerProjector
 import io.github.mangi.eta.ui.navigation.AppRoute
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 import top.yukonga.miuix.kmp.basic.DropdownItem
 import top.yukonga.miuix.kmp.basic.Text
+import top.yukonga.miuix.kmp.overlay.OverlayBottomSheet
 import top.yukonga.miuix.kmp.theme.MiuixTheme
 
 /**
@@ -308,10 +314,17 @@ private fun SettingsPageContent(
     }
     val settingsNoHit = settingsKeyword.isNotEmpty() &&
         searchHaystacks.values.none { it.contains(settingsKeyword) }
+    var showToolReviewModelSheet by remember { mutableStateOf(false) }
 
     MiuixScaffoldPage(
         title = stringResource(R.string.ui_set_up_7debf9),
         onBack = onBack,
+        overlay = {
+            ToolReviewDecisionModelSheet(
+                show = showToolReviewModelSheet,
+                onDismiss = { showToolReviewModelSheet = false },
+            )
+        },
     ) {
 
             item(key = "settings_search") {
@@ -423,6 +436,12 @@ private fun SettingsPageContent(
                     )
 
                     EtaPreferenceDivider()
+                    ToolReviewModePref()
+
+                    EtaPreferenceDivider()
+                    ToolReviewDecisionModelPref(onOpenPicker = { showToolReviewModelSheet = true })
+
+                    EtaPreferenceDivider()
                     SwitchPref(
                         context = context,
                         prefs = agentPrefs,
@@ -445,14 +464,7 @@ private fun SettingsPageContent(
                     )
 
                     EtaPreferenceDivider()
-                    SwitchPref(
-                        context = context,
-                        prefs = agentPrefs,
-                        title = stringResource(R.string.settings_auto_compaction),
-                        key = Prefs.Keys.AGENT_AUTO_COMPACTION_ENABLED,
-                        icon = Icons.Rounded.Layers,
-                        iconTint = EtaPreferenceColors.Blue,
-                    )
+                    AutoCompactionThresholdPref(prefs = agentPrefs)
 
                     EtaPreferenceDivider()
                     EtaArrowPreference(
@@ -568,6 +580,17 @@ private fun SettingsPageContent(
                             )
                         },
                         onClick = { onNavigate(AppRoute.Characters) },
+                    )
+                    EtaPreferenceDivider()
+                    EtaArrowPreference(
+                        title = "专家",
+                        startAction = {
+                            EtaPreferenceIcon(
+                                icon = Icons.Rounded.AutoAwesome,
+                                tint = EtaPreferenceColors.Blue,
+                            )
+                        },
+                        onClick = { onNavigate(AppRoute.ExpertCenter) },
                     )
                 }
             }
@@ -891,6 +914,18 @@ private fun SettingsPageContent(
                     )
                     EtaPreferenceDivider()
                     EtaArrowPreference(
+                        title = "日志",
+                        summary = "实时日志 · 等级筛选 · 搜索 · 复制",
+                        startAction = {
+                            EtaPreferenceIcon(
+                                icon = Icons.Rounded.Terminal,
+                                tint = EtaPreferenceColors.Blue,
+                            )
+                        },
+                        onClick = { onNavigate(AppRoute.LogViewer) },
+                    )
+                    EtaPreferenceDivider()
+                    EtaArrowPreference(
                         title = stringResource(R.string.diag_patrol_title),
                         summary = stringResource(R.string.diag_patrol_entry_summary),
                         startAction = {
@@ -981,6 +1016,145 @@ private fun FluidPinnedPref() {
     )
 }
 
+/** 工具调用审查档位：只读 / 严格 / 标准 / 智能 / 自动。 */
+@Composable
+private fun ToolReviewModePref() {
+    val scope = rememberCoroutineScope()
+    val settings by SettingsDataStore.settingsFlow().collectAsState(initial = null)
+    val current = settings ?: return
+    val labels = listOf(
+        "只读（不改动任何状态）",
+        "严格（非只读一律先问）",
+        "标准（只拦高风险）",
+        "智能（由决策模型逐次裁决）",
+        "自动（全部放行）",
+    )
+    val keys = listOf("read_only", "strict", "standard", "smart", "auto")
+    val selected = keys.indexOf(io.github.mangi.eta.agent.tool.ToolReviewMode.normalized(current.toolReviewMode))
+        .coerceAtLeast(0)
+    EtaDropdownPreference(
+        title = "工具调用审查",
+        summary = "危险或改状态的操作在什么档位下先征求你确认",
+        items = labels.map { DropdownItem(text = it) },
+        selectedIndex = selected,
+        onSelectedIndexChange = { index ->
+            val key = keys.getOrNull(index) ?: return@EtaDropdownPreference
+            scope.launch {
+                SettingsDataStore.updateSettings { it.copy(toolReviewMode = key) }
+            }
+        },
+        startAction = { EtaPreferenceIcon(Icons.Rounded.GppMaybe, tint = EtaPreferenceColors.Green) },
+    )
+}
+
+/**
+ * 智能档的决策模型：默认跟随对话模型，可指定别的模型专门做审查裁决。
+ *
+ * 交互与「模型提供商」那行保持一致：普通设置行 + 模型品牌图标 + 右侧当前选择，
+ * 点开走标准模型选择面板（搜索 / 服务商筛选 / 分组列表），
+ * 不再把所有服务商的模型拍平成一个几十项的长下拉。
+ */
+@Composable
+private fun ToolReviewDecisionModelPref(onOpenPicker: () -> Unit) {
+    val settings by SettingsDataStore.settingsFlow().collectAsState(initial = null)
+    val current = settings ?: return
+    val providers by ProviderRepository.providersFlow().collectAsState(initial = emptyList())
+    val primaryProviderId by RuntimeConfigRepository.selectedProviderIdFlow()
+        .collectAsState(initial = null)
+    val primaryModelId by RuntimeConfigRepository.selectedModelIdFlow()
+        .collectAsState(initial = null)
+    val pickerState = remember(providers, primaryProviderId, primaryModelId) {
+        AgentModelPickerProjector.project(providers, primaryProviderId, primaryModelId)
+    }
+    val resolved = remember(providers, current.toolReviewDecisionModelId) {
+        resolveToolReviewModel(providers, current.toolReviewDecisionModelId)
+    }
+    val summary = resolved?.let { (provider, model) ->
+        "${provider.name} / ${model.displayName.ifBlank { model.modelId }}"
+    } ?: "跟随对话模型"
+    EtaArrowPreference(
+        title = "审查决策模型",
+        summary = summary,
+        startAction = {
+            ModelBrandMark(
+                modelId = resolved?.model?.modelId ?: pickerState.selectedModel?.modelId,
+                sourceType = resolved?.let { (provider, _) -> ProviderSourceRegistry.resolve(provider) }
+                    ?: pickerState.selectedModel?.providerSourceType,
+                size = 24.dp,
+            )
+        },
+        onClick = onOpenPicker,
+    )
+}
+
+/**
+ * 决策模型选择面板：与「对话标题模型」「子智能体模型」共用同一套选择器，
+ * 只把「跟随对话模型」换成本场景的文案。
+ */
+@Composable
+private fun ToolReviewDecisionModelSheet(show: Boolean, onDismiss: () -> Unit) {
+    val scope = rememberCoroutineScope()
+    val settings by SettingsDataStore.settingsFlow().collectAsState(initial = null)
+    val providers by ProviderRepository.providersFlow().collectAsState(initial = emptyList())
+    val primaryProviderId by RuntimeConfigRepository.selectedProviderIdFlow()
+        .collectAsState(initial = null)
+    val primaryModelId by RuntimeConfigRepository.selectedModelIdFlow()
+        .collectAsState(initial = null)
+    val pickerState = remember(providers, primaryProviderId, primaryModelId) {
+        AgentModelPickerProjector.project(providers, primaryProviderId, primaryModelId)
+    }
+    val storedId = settings?.toolReviewDecisionModelId.orEmpty()
+    val resolved = remember(providers, storedId) { resolveToolReviewModel(providers, storedId) }
+    val primaryName = pickerState.selectedModel?.displayName
+    val followSubtitle = if (primaryName.isNullOrBlank()) {
+        "智能档用当前对话的模型做裁决"
+    } else {
+        "智能档用 $primaryName 做裁决"
+    }
+    OverlayBottomSheet(
+        show = show,
+        title = "审查决策模型",
+        onDismissRequest = onDismiss,
+        insideMargin = DpSize(0.dp, 0.dp),
+    ) {
+        OptionalModelPickerContent(
+            pickerState = pickerState,
+            selectedSecondaryModelId = resolved?.model?.id,
+            followTitle = "跟随对话模型",
+            followSubtitle = followSubtitle,
+            onSelectModel = { modelId ->
+                onDismiss()
+                // 存内部 UUID：运行时 runtimeConfigFor 走 enabledModel()，按 Model.id 匹配。
+                scope.launch {
+                    SettingsDataStore.updateSettings { it.copy(toolReviewDecisionModelId = modelId.orEmpty()) }
+                }
+            },
+        )
+    }
+}
+
+/**
+ * 解析已保存的决策模型。
+ *
+ * 新值存 Model.id（UUID）；旧版本写的是对外 modelId，两种口径都认，
+ * 否则升级后老配置会静默回落到主对话模型。
+ */
+private fun resolveToolReviewModel(
+    providers: List<ProviderSetting>,
+    storedId: String,
+): ProviderModel? {
+    if (storedId.isBlank()) return null
+    providers.enabledModel(storedId)?.let { return it }
+    return providers.asSequence()
+        .filter { it.isEnabled }
+        .flatMap { provider ->
+            provider.models.asSequence()
+                .filter { it.isEnabled }
+                .map { model -> ProviderModel(provider, model) }
+        }
+        .firstOrNull { it.model.modelId == storedId }
+}
+
 /**
  * 流体云通知降级：把进度卡、锁屏胶囊这类通知退化成普通通知。
  *
@@ -1012,6 +1186,66 @@ private fun FluidDowngradePref() {
             }
         },
         startAction = { EtaPreferenceIcon(Icons.Rounded.Notifications, tint = EtaPreferenceColors.Orange) },
+    )
+}
+
+/**
+ * 自动压缩上下文阈值：用百分比档位替代原来的布尔开关。
+ *
+ * 0 = 关闭，只保留手动压缩；其余档位表示「上下文用掉这么多就自动摘要一次」。
+ * 写盘走 [Prefs.putAutoCompactionTriggerPercent]，同一次提交同步旧布尔键，
+ * 让仍在运行的旧 Hook 进程与新 Runtime 读到同一个口径。
+ */
+@Composable
+private fun AutoCompactionThresholdPref(prefs: SharedPreferences?) {
+    val context = LocalContext.current
+    val choices = Prefs.Keys.AUTO_COMPACTION_TRIGGER_PERCENT_CHOICES
+    val defaultPercent = Prefs.Keys.AUTO_COMPACTION_TRIGGER_PERCENT_DEFAULT
+    var percent by remember(prefs) {
+        mutableStateOf(
+            prefs?.let { Prefs.autoCompactionTriggerPercent(it) } ?: Prefs.autoCompactionTriggerPercent(),
+        )
+    }
+    DisposableEffect(prefs) {
+        val targetPrefs = prefs ?: return@DisposableEffect onDispose {}
+        val listener = SharedPreferences.OnSharedPreferenceChangeListener { changedPrefs, changedKey ->
+            if (changedKey == Prefs.Keys.AGENT_AUTO_COMPACTION_TRIGGER_PERCENT) {
+                percent = Prefs.autoCompactionTriggerPercent(changedPrefs)
+            }
+        }
+        targetPrefs.registerOnSharedPreferenceChangeListener(listener)
+        onDispose { targetPrefs.unregisterOnSharedPreferenceChangeListener(listener) }
+    }
+    val labels = choices.map { choice -> if (choice == 0) "关闭" else "$choice%" }
+    val selected = choices.indexOf(percent).takeIf { it >= 0 } ?: choices.indexOf(defaultPercent)
+    EtaDropdownPreference(
+        title = stringResource(R.string.settings_auto_compaction),
+        items = labels.map { label -> DropdownItem(text = label) },
+        selectedIndex = selected,
+        onSelectedIndexChange = { index ->
+            val target = choices.getOrNull(index) ?: return@EtaDropdownPreference
+            val targetPrefs = prefs ?: return@EtaDropdownPreference
+            if (Prefs.putAutoCompactionTriggerPercent(targetPrefs, target)) {
+                percent = target
+                if (Prefs.Keys.AGENT_AUTO_COMPACTION_ENABLED in Prefs.Keys.LOCAL_AGENT_KEYS) {
+                    Prefs.reconcileAgentPreferences(EtaApp.serviceInstance)
+                }
+            } else {
+                Toast.makeText(
+                    context.applicationContext,
+                    context.getString(R.string.settings_write_failed),
+                    Toast.LENGTH_SHORT,
+                ).show()
+            }
+        },
+        startAction = {
+            EtaPreferenceIcon(
+                icon = Icons.Rounded.Layers,
+                enabled = prefs != null,
+                tint = EtaPreferenceColors.Blue,
+            )
+        },
+        enabled = prefs != null,
     )
 }
 
@@ -1186,7 +1420,7 @@ private val SETTINGS_SEARCH_INDEX = listOf(
             R.string.ui_linux_tool_environment_314d22,
         ),
         labelsRaw = listOf("工具", "工具能力"),
-        keywords = "工具 工具能力 工具档 精简 standard 完整 全部 mcp 网页 搜索 读取 浏览器 browser 抓取 fetch 自动压缩 压缩 上下文长度 linux 发行版 debian 环境 apk 分析 工作区 共享文件夹",
+        keywords = "工具 工具能力 工具档 精简 standard 完整 全部 mcp 网页 搜索 读取 浏览器 browser 抓取 fetch 自动压缩 压缩 上下文长度 审查 工具调用审查 决策模型 审查决策模型 智能档 只读 严格 自动放行 linux 发行版 debian 环境 apk 分析 工作区 共享文件夹",
     ),
     SettingsSearchEntry(
         sectionKey = "section_extensions",

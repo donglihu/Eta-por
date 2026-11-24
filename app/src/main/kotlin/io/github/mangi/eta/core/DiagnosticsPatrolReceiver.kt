@@ -35,6 +35,16 @@ internal class DiagnosticsPatrolReceiver : BroadcastReceiver() {
                 }
             } catch (error: Throwable) {
                 AndroidAgentLogger.warn("Diagnostics patrol failed: type=${error.safeLogType()}")
+                // 跑挂了也要把下一次闹钟排回去：重排在 runOnce 末尾，一次异常就会把
+                // 整条周期链打断，之后只能等开机、改开关或手动巡检才能恢复。
+                runBlocking {
+                    runCatching { DiagnosticsPatrolAlarm.refresh(app) }
+                        .onFailure { refreshError ->
+                            AndroidAgentLogger.warn(
+                                "Diagnostics patrol alarm refresh failed: type=${refreshError.safeLogType()}",
+                            )
+                        }
+                }
             } finally {
                 pending.finish()
             }

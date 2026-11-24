@@ -221,13 +221,13 @@ internal object EtaBackupRepository {
                             phase = "restore_memory"
                             cancellation.ensureActive()
                             memoryWriteStarted = true
-                            AgentMemoryRepository.replaceAll(document.memoryMd)
+                            AgentMemoryRepository.restoreAll(document.memoryMd)
                             document.roleplay?.let { CharacterBackupTransfer.restoreMemories(appContext, it) }
                             cancellation.ensureActive()
                         }
                     } catch (failure: Throwable) {
                         if (memoryWriteStarted) {
-                            try { AgentMemoryRepository.replaceAll(previousMemory) } catch (restoreFailure: Throwable) {
+                            try { AgentMemoryRepository.restoreAll(previousMemory) } catch (restoreFailure: Throwable) {
                                 failure.addSuppressed(restoreFailure)
                             }
                             previousRoleMemories.forEach { (id, content) ->

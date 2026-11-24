@@ -604,6 +604,59 @@ class AgentTraceFormatterTest {
         assertTrue(summary.length < longOutput.length)
     }
 
+    /** MCP 工具名是运行期拼的 `mcp_<server 前 8 位>_<工具名>_<8 位摘要>`，只能露工具名。 */
+    @Test
+    fun mcpToolArgumentsShowOnlyTheToolNameWithoutServerOrDigest() {
+        val summary = formatter.summarizeArguments(
+            AgentModelClient.ToolCall(
+                "call_mcp",
+                "mcp_ab12cd34_search_repositories_9f3a2b1c",
+                """{"query":"private-query"}""",
+            ),
+        )
+
+        assertEquals("调用 MCP 工具 · search repositories", summary)
+        // server 标识与末尾摘要都不能漏出来，否则用户看到的是内部编码而不是工具用途。
+        assertFalse(summary, summary.contains("ab12cd34"))
+        assertFalse(summary, summary.contains("9f3a2b1c"))
+        assertFalse(summary, summary.contains("private-query"))
+    }
+
+    /** 过长的 MCP 工具名截断到 24 字符，避免折叠行被超长标识撑开。 */
+    @Test
+    fun mcpToolNameIsTruncatedToTwentyFourCharacters() {
+        val longName = "abcdefghijklmnopqrstuvwxyz1234"
+        val summary = formatter.summarizeArguments(
+            AgentModelClient.ToolCall("call_mcp", "mcp_ab12cd34_${longName}_9f3a2b1c", "{}"),
+        )
+
+        assertEquals("调用 MCP 工具 · abcdefghijklmnopqrstuvwx", summary)
+        assertEquals(24, summary.removePrefix("调用 MCP 工具 · ").length)
+    }
+
+    /** 未知工具兜底返回工具自己的名字，不再统一显示成「准备执行」。 */
+    @Test
+    fun unknownToolFallsBackToItsOwnNameInsteadOfPreparing() {
+        val summary = formatter.summarizeArguments(
+            AgentModelClient.ToolCall("call_unknown", "vendor_probe_v2", "{}"),
+        )
+
+        assertEquals("vendor_probe_v2", summary)
+        assertFalse(summary, summary.contains("准备执行"))
+        // 超长 vendor 工具名截到 24 字符，与 MCP 分支的折叠行宽度一致。
+        val longName = "vendor_experimental_probe_v2"
+        val truncated = formatter.summarizeArguments(
+            AgentModelClient.ToolCall("call_long_unknown", longName, "{}"),
+        )
+        assertEquals(longName.take(24), truncated)
+        assertEquals(24, truncated.length)
+        // 只有工具名本身为空时才用「准备执行」占位。
+        assertEquals(
+            "准备执行",
+            formatter.summarizeArguments(AgentModelClient.ToolCall("call_blank", "", "{}")),
+        )
+    }
+
     private data class RedactionCase(
         val toolName: String,
         val argumentsJson: String,

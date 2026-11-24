@@ -42,6 +42,16 @@ internal object RootDisplayCommandMain {
     private const val DISPLAY_WAKE_HOLD_MS = 60_000L
     private const val DISPLAY_WAKE_RENEW_MS = 20_000L
 
+    /**
+     * 只有这些动作才需要主屏醒着（它们会往灵屏里写状态或迁移任务）。
+     *
+     * 其余（observe／probe／tasks／lifecycle／host_surface／ime／close）都是只读或生命周期类请求：
+     * 熄屏时让它们照样可用，否则一次读屏就把整块灵屏判死。
+     */
+    private val ACTIONS_REQUIRE_AWAKE_SCREEN = setOf(
+        "tap", "swipe", "touch", "long_press", "text", "key", "back", "launch", "switch_task",
+    )
+
     /** 当前 display id 与 Eta 自身包名：finally 清理里面的任务时要用。 */
     private var activeDisplayId = 0
     private var selfPackage = ""
@@ -219,7 +229,14 @@ internal object RootDisplayCommandMain {
             Thread {
                 while (true) {
                     Thread.sleep(1000)
-                    if (idleTimer.expired()) Process.killProcess(Process.myPid())
+                    if (idleTimer.expired()) {
+                        // 先在 stderr 留一行可识别的原因：SIGKILL 自身只留 exitCode=137，
+                        // 事后分不清是系统回收、OOM 还是空闲超时（vscr.log 里那几次都只能靠猜）。
+                        System.err.println("ETA_HELPER_IDLE_TIMEOUT")
+                        System.err.flush()
+                        hlog("idle timeout，主动退出")
+                        Process.killProcess(Process.myPid())
+                    }
                 }
             }.apply { name = "eta-root-display-idle"; isDaemon = true; start() }
             val displayManager = context.getSystemService(DisplayManager::class.java)
@@ -520,7 +537,18 @@ internal object RootDisplayCommandMain {
                 }
                 try {
                     require(displayManager.getDisplay(id) != null) { "DISPLAY_GONE" }
-                    require(allowOff || (power.isInteractive && !mainScreenLocked(keyguard))) { "SCREEN_OFF_PERMISSION_REQUIRED" }
+                    /*
+                     * 熄屏/锁屏闸门只拦「会往屏里写」的动作。
+                     *
+                     * 早前这里是**每条请求**都 require，结果熄屏或锁屏期间连 observe／probe／lifecycle
+                     * 一起失败；App 侧又把这个错误当成致命错误把整块屏关掉，表现为「灵屏经常失败」
+                     * （vscr.log 里同一块屏刚建好就因为一次 observe 被销毁）。
+                     * 读屏、探活、看任务列表不该受主屏亮灭影响——它们不改变任何界面状态。
+                     */
+                    val needsAwakeScreen = request.optString("action") in ACTIONS_REQUIRE_AWAKE_SCREEN
+                    require(
+                        !needsAwakeScreen || allowOff || (power.isInteractive && !mainScreenLocked(keyguard))
+                    ) { "SCREEN_OFF_PERMISSION_REQUIRED" }
                     runCatching { syncShape() }
                     val result = when (request.getString("action")) {
                         "host_surface" -> {

@@ -65,12 +65,13 @@ internal object CrashRecorder {
         val target = File(dir, "crash-$stamp$EXTENSION")
         target.writeText(report(context, thread, error), Charsets.UTF_8)
         prune(dir)
-        // 崩溃现场顺手补一次巡检取证：独立线程，失败不影响记崩溃。
-        runCatching { DiagnosticsPatrol.captureNow(context, "崩溃即取证") }
+        // 崩溃路径只落这份轻量现场记录：进程随时被系统回收，全量巡检产物不在这里生成，
+        // 否则巡检跑到一半进程死了就留半截产物（有 json 无 md）。下一轮周期巡检会读
+        // 崩溃记录做增量判定，取证不丢，也不会留残文件。
         return target
     }
 
-    private fun prune(dir: File) {
+    internal fun prune(dir: File) {
         val cutoff = System.currentTimeMillis() - TimeUnit.DAYS.toMillis(RETENTION_DAYS.toLong())
         dir.listFiles { file: File -> file.isFile && file.name.endsWith(EXTENSION) }
             ?.sortedByDescending { it.name }

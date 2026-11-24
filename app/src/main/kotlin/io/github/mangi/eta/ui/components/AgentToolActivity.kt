@@ -53,6 +53,7 @@ import io.github.mangi.eta.agent.overlay.toolDisplayName
 import io.github.mangi.eta.agent.subagent.AgentSubagentToolCatalog
 import io.github.mangi.eta.agent.subagent.SubagentActivitySnapshot
 import io.github.mangi.eta.agent.subagent.SubagentRunRegistry
+import io.github.mangi.eta.ui.app.ToolRunStopwatch
 import io.github.mangi.eta.ui.model.ToolActivityMessageUi
 import io.github.mangi.eta.ui.model.ToolActivityStatusUi
 import kotlinx.coroutines.Dispatchers
@@ -107,7 +108,7 @@ internal fun ToolActivityRow(
     showTitle: Boolean = true,
 ) {
     val running = message.status == ToolActivityStatusUi.Running
-    val elapsedSeconds = rememberRunningSeconds(message.id, running)
+    val elapsedSeconds = rememberRunningSeconds(message)
     if (message.toolName == AgentSubagentToolCatalog.TOOL_NAME) {
         val snapshot = remember(message.command, message.argumentsSummary, message.resultSummary, message.status) {
             SubagentActivitySnapshot.decode(message.command) ?: SubagentActivitySnapshot(
@@ -405,17 +406,31 @@ private fun ToolActivityDetail(
 }
 
 /**
- * 运行计时只在工具执行中组合，每秒仅使这一小段文字重组。起点按条目身份保存，
- * 滚出视口再回来时继续计时；它是界面侧的近似值，不写入归档。
+ * 运行计时只在工具执行中组合，每秒仅使这一小段文字重组。
+ *
+ * 起点按「工具调用」而非「Composable」保存：进程内已有起点直接沿用，否则用消息落库的
+ * 起点（需过进程纪元判据）换算出单调起点，两者都没有才补记一次「现在」。
+ * 先前用 rememberSaveable(id) 现场取起点，切会话时组合销毁、记录丢失，正在执行的
+ * 工具会从 3 秒重新计时，看起来像「两百多秒跳回几秒」。
+ *
+ * 已用秒数取单调钟差值：旧实现拿墙钟做差，系统校时/NTP 会让秒数跳变或长时间卡在 0，
+ * `coerceAtLeast(0)` 只能兜住负数，兜不住「卡住不动」。
  */
 @Composable
-private fun rememberRunningSeconds(id: String, running: Boolean): Int? {
-    if (!running) return null
-    val startedAt = rememberSaveable(id) { SystemClock.elapsedRealtime() }
+private fun rememberRunningSeconds(message: ToolActivityMessageUi): Int? {
+    if (message.status != ToolActivityStatusUi.Running) return null
+    val id = message.id
+    // 组合期只注册一次（幂等）；返回值是单调钟起点，仅用作 effect key。
+    val startedAtElapsed = remember(id, message.startedAtMillis) {
+        ToolRunStopwatch.resolveElapsedStart(id, message.startedAtMillis)
+    }
     var seconds by remember(id) { mutableIntStateOf(0) }
-    LaunchedEffect(id, startedAt) {
+    LaunchedEffect(id, startedAtElapsed) {
         while (true) {
-            seconds = ((SystemClock.elapsedRealtime() - startedAt) / 1_000).toInt()
+            // 映射被清掉时退回组合期解析出的单调起点，同一时钟域，不会负也不会跳大。
+            val elapsedMillis = ToolRunStopwatch.elapsedSince(id)
+                ?: (SystemClock.elapsedRealtime() - startedAtElapsed)
+            seconds = (elapsedMillis / 1_000L).toInt().coerceAtLeast(0)
             delay(1_000)
         }
     }

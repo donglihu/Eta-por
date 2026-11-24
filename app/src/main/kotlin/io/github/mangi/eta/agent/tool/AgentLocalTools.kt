@@ -3,6 +3,9 @@ package io.github.mangi.eta.agent.tool
 import android.content.Context
 import android.graphics.Rect
 import io.github.mangi.eta.agent.automation.AgentTaskTools
+import io.github.mangi.eta.agent.expert.Expert
+import io.github.mangi.eta.agent.expert.ExpertCategory
+import io.github.mangi.eta.agent.expert.ExpertStore
 import io.github.mangi.eta.agent.display.VirtualScreenRoutingPolicy
 import io.github.mangi.eta.agent.display.VirtualScreenUiTools
 import io.github.mangi.eta.agent.display.MainScreenFallbackApproval
@@ -15,6 +18,7 @@ import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.SystemClock
+import io.github.mangi.eta.core.EtaTrace
 import io.github.mangi.eta.agent.browser.AgentBrowserSession
 import io.github.mangi.eta.agent.device.DeviceControlUnavailableException
 import io.github.mangi.eta.agent.device.RootAccess
@@ -23,6 +27,7 @@ import io.github.mangi.eta.agent.device.BoundedRootCommandExecutor
 import io.github.mangi.eta.agent.model.AgentModelClient
 import io.github.mangi.eta.agent.model.AgentHttpClient
 import io.github.mangi.eta.agent.device.LocalNetworkPermission
+import io.github.mangi.eta.agent.media.ModelImageBudget
 import io.github.mangi.eta.agent.web.AgentWebTools
 import io.github.mangi.eta.agent.web.WebHttpTransport
 import io.github.mangi.eta.agent.model.AgentScreenObservationContract
@@ -57,6 +62,7 @@ import io.github.mangi.eta.agent.terminal.SharedFolderMounts
 import io.github.mangi.eta.config.Prefs
 import io.github.mangi.eta.core.AgentLogger
 import io.github.mangi.eta.core.HookSupport
+import io.github.mangi.eta.data.repository.AgentMemoryCorePolicy
 import io.github.mangi.eta.data.repository.AgentMemoryException
 import io.github.mangi.eta.data.repository.AgentMemoryMutation
 import io.github.mangi.eta.data.repository.AgentMemoryRepository
@@ -111,12 +117,20 @@ internal class AgentLocalTools(
     private val rootAvailable: () -> Boolean = { RootAccess.isGranted },
     private val skillAuthoringService: SkillAuthoringService? = null,
     private val virtualScreenSettings: () -> Settings = { runBlocking { SettingsDataStore.settings() } },
+    private val toolReviewModeProvider: () -> ToolReviewMode = {
+        // 读进程内缓存，不再 runBlocking 读 DataStore：工具执行链同步调用，每个工具多一次
+        // 落盘读会累积成可感知卡顿（一轮 5–10 个工具）。缓存由 settingsFlow 每次发射时刷新。
+        ToolReviewMode.fromKey(SettingsDataStore.cachedToolReviewMode())
+    },
+    private val toolReviewArbiter: ((String, JSONObject) -> Boolean?)? = null,
     private val virtualUiExecutor: ((String, JSONObject) -> AgentModelClient.ToolResult)? = null,
     private val fallbackApproval: ((String, String) -> MainScreenFallbackDecision)? = null,
     private val onMainScreenFallback: () -> Unit = {},
     private val onVirtualTaskCancelled: () -> Unit = {},
     private val virtualScreenOwner: String = browserRunId,
     private val isRunCancelled: () -> Boolean = { false },
+    /* 上游 36b1c77f：read_image 按渠道预算编码（Anthropic 3.5 MB / 其它 8 MB），默认取 STANDARD。 */
+    private val imageBudgetProvider: () -> ModelImageBudget = { ModelImageBudget.DEFAULT },
 ) : AgentModelClient.ToolExecutor, AutoCloseable {
 
     private val closed = AtomicBoolean(false)
@@ -136,7 +150,7 @@ internal class AgentLocalTools(
         root = rootCommandExecutor,
         rootAvailable = rootAvailable,
     )
-    private val imageTools = AgentImageTools(context, rootCommandExecutor, rootAvailable)
+    private val imageTools = AgentImageTools(context, rootCommandExecutor, rootAvailable, imageBudgetProvider)
     private val webTools = AgentWebTools(
         transport = WebHttpTransport(AgentHttpClient.client),
         localNetworkAccess = { LocalNetworkPermission.accessState(context).name.lowercase(Locale.ROOT) },
@@ -246,30 +260,75 @@ internal class AgentLocalTools(
             .put("display", "primary").put("requires_observation", true)
             .put("message", "用户已通过通知允许本次任务改用主屏。刚才的操作没有重放；需要时重新启动应用，并调用 observe_screen 获取主屏的新观察后再操作。").toString())
 
+    /** 专家唯一标识：与 miniAI 的 `experts/<name>.md` 命名规则一致。 */
+    private val EXPERT_NAME_PATTERN = Regex("^[a-z0-9][a-z0-9-]{0,63}$")
+
+    /** 专家提示词上限；类体内不允许 `const val`，这里用普通常量兜住。 */
+    private val maxExpertPromptChars = 8_000
+
     /** 会真的落到屏幕上的点击类工具：主屏分支必须过审批闸门。 */
     private val primaryGuardedTools = setOf(
         "tap", "tap_area", "tap_smart", "tap_element", "long_press", "long_press_element",
     )
 
-    override fun execute(toolCall: AgentModelClient.ToolCall): AgentModelClient.ToolResult =
-        runCatching {
+    override fun execute(toolCall: AgentModelClient.ToolCall): AgentModelClient.ToolResult {
+        // 计时起点必须在 runCatching 之外：下面的 .let 是它的兄弟作用域，
+        // 定义在 lambda 里就到不了那里（之前就是这么挂的）。
+        val execStartedAt = SystemClock.elapsedRealtime()
+        return runCatching {
             if (closed.get()) return@runCatching textResult(errorResult("DISPLAY_CANCELLED", "任务已结束，本次工具未执行"))
             val args = JSONObject(toolCall.argumentsJson.ifBlank { "{}" })
-            // 非 GUI 的高危动作同样要先过审批：删系统目录、格式化、改 /system 这些
-            // 破坏力不比误点「确认支付」小，而它们原先完全绕过了审批。
-            io.github.mangi.eta.agent.display.dashboard.AgentConfirmGuard
-                .inspectTool(context, toolCall.name, args, browserRunId)
-                ?.let { draft ->
-                    return@runCatching textResult(
-                        io.github.mangi.eta.agent.display.dashboard.AgentConfirmGuard.blockedResult(draft),
-                    )
+            // 工具调用审查五档：只读 / 严格 / 标准 / 智能 / 自动。
+            // 唯一策略入口是 AgentToolReviewPolicy.decide()，这里不再手写 when 分支——
+            // 之前两边各写一份，策略对象形同虚设（零调用点），口径迟早漂移。
+            val reviewMode = toolReviewModeProvider()
+            val reviewStartedAt = SystemClock.elapsedRealtime()
+            val reviewOutcome = AgentToolReviewPolicy.decide(
+                mode = reviewMode,
+                toolName = toolCall.name,
+                args = args,
+                riskDetector = {
+                    io.github.mangi.eta.agent.display.dashboard.AgentConfirmGuard
+                        .inspectTool(context, toolCall.name, args, browserRunId)
+                },
+                arbiter = toolReviewArbiter,
+            )
+            // 智能档在这里可能同步等一次决策模型（最长 10s），必须单独可见。
+            EtaTrace.log(
+                "perf.review.decide",
+                "name=${toolCall.name} mode=${reviewMode.key} " +
+                    "ms=${SystemClock.elapsedRealtime() - reviewStartedAt} " +
+                    "outcome=${reviewOutcome::class.simpleName}",
+            )
+            when (reviewOutcome) {
+                is ToolReviewOutcome.Reject ->
+                    return@runCatching textResult(errorResult(reviewOutcome.code, reviewOutcome.message))
+                is ToolReviewOutcome.Ask -> {
+                    // 需要用户确认：把策略层判出的草稿挂成审批卡，卡留在会话里等用户裁决。
+                    val registered = io.github.mangi.eta.agent.display.dashboard.AgentConfirmGuard
+                        .registerDraft(
+                            context = context,
+                            draft = reviewOutcome.draft,
+                            target = reviewTarget(toolCall.name, args),
+                            action = toolCall.name,
+                            runId = browserRunId,
+                            toolName = toolCall.name,
+                            toolArgs = args.toString(),
+                        )
+                    if (registered != null) {
+                        return@runCatching textResult(
+                            io.github.mangi.eta.agent.display.dashboard.AgentConfirmGuard.blockedResult(registered),
+                        )
+                    }
                 }
+                ToolReviewOutcome.Delegate -> Unit
+            }
             val virtualSettings = if (toolCall.name in VirtualScreenRoutingPolicy.uiTools) virtualScreenSettings() else null
             val virtualUi = virtualRouting.shouldRoute(toolCall.name, virtualSettings?.virtualScreenEnabled == true)
             // 主屏 GUI 点击原先完全不过审批：inspectTool 只认 terminal/write_file，
             // 而按屏上文本判定的 inspect() 只挂在灵屏那两个入口上。
             // 主屏回退（或灵屏关闭）时模型可以直接点「确认支付」——这里补同口径闸门。
-            if (!virtualUi && toolCall.name in primaryGuardedTools) {
+            if (reviewMode != ToolReviewMode.AUTO && !virtualUi && toolCall.name in primaryGuardedTools) {
                 val guard = io.github.mangi.eta.agent.display.dashboard.AgentConfirmGuard
                 val target = when (toolCall.name) {
                     "tap_area" -> guard.labelAt(
@@ -393,6 +452,7 @@ internal class AgentLocalTools(
                 in AgentFileToolCatalog.names -> textResult(terminalTool { terminalController.fileTool(toolCall.name, args) })
                 "memory_get" -> textResult(memoryGet(args))
                 "memory_write" -> textResult(memoryWrite(args))
+                io.github.mangi.eta.agent.model.AgentExpertToolCatalog.TOOL_NAME -> textResult(expertManage(args))
                 "skills_list" -> textResult(skillsList(args))
                 "skills_manage" -> textResult(skillsManage(args))
                 "skills_read" -> textResult(skillsRead(args))
@@ -419,12 +479,19 @@ internal class AgentLocalTools(
                 )
             )
         }.let { result ->
+            // 工具自身耗时（不含上面的审查与闸门等待），以及返回给模型的体量。
+            EtaTrace.log(
+                "perf.tool.exec",
+                "name=${toolCall.name} ms=${SystemClock.elapsedRealtime() - execStartedAt} " +
+                    "chars=${result.content.length} sensitive=${result.sensitive}",
+            )
             if (result.sensitive || !AgentSensitiveToolPolicy.isSensitive(toolCall.name)) {
                 result
             } else {
                 result.copy(sensitive = true)
             }
         }
+    }
 
     private fun deviceToolPermissionError(
         toolName: String,
@@ -473,7 +540,39 @@ internal class AgentLocalTools(
         )
     }
 
-    private fun memoryGet(args: JSONObject): String = try {
+    /**
+     * 记忆读取分流：`scope=notes` 走非核心笔记文件，默认读 MEMORY.md。
+     * 两条通道分开，避免「查笔记」把整个核心记忆也拉进上下文。
+     */
+    private fun memoryGet(args: JSONObject): String =
+        if (args.optString("scope").equals("notes", ignoreCase = true)) {
+            try {
+                val result = AgentMemoryRepository.readNotes(
+                    query = args.optString("query").takeIf(String::isNotBlank),
+                    startLine = args.optInt("start_line", 1),
+                    maxChars = args.optInt("max_chars", 12_000),
+                )
+                JSONObject()
+                    .put("ok", true)
+                    .put("scope", "notes")
+                    .put("file", io.github.mangi.eta.data.repository.AgentMemoryStore.NOTES_FILE_NAME)
+                    .put("revision", result.snapshot.revision)
+                    .put("bytes", result.snapshot.byteSize)
+                    .put("line_count", result.snapshot.lineCount)
+                    .put("start_line", result.startLine ?: JSONObject.NULL)
+                    .put("end_line", result.endLine ?: JSONObject.NULL)
+                    .put("matched_lines", result.matchedLines)
+                    .put("has_more", result.hasMore)
+                    .put("content", result.content)
+                    .toString()
+            } catch (failure: AgentMemoryException) {
+                errorResult(failure.code, failure.message ?: "笔记读取失败")
+            }
+        } else {
+            memoryGetCore(args)
+        }
+
+    private fun memoryGetCore(args: JSONObject): String = try {
         val result = AgentMemoryRepository.read(
             query = args.optString("query").takeIf(String::isNotBlank),
             startLine = args.optInt("start_line", 1),
@@ -494,9 +593,76 @@ internal class AgentLocalTools(
         errorResult(failure.code, failure.message ?: "记忆读取失败")
     }
 
-    private fun memoryWrite(args: JSONObject): String = try {
-        val revision = args.getString("revision")
-        val mutation = when (args.getString("mode")) {
+    /**
+     * 记忆写入分流：`scope=notes` 追加到 NOTES.md（不进注入预算），默认写 MEMORY.md 并受核心预算闸门约束。
+     */
+    private fun memoryWrite(args: JSONObject): String =
+        if (args.optString("scope").equals("notes", ignoreCase = true)) {
+            try {
+                val snapshot = AgentMemoryRepository.appendNote(args.requiredText("content"))
+                JSONObject()
+                    .put("ok", true)
+                    .put("scope", "notes")
+                    .put("file", io.github.mangi.eta.data.repository.AgentMemoryStore.NOTES_FILE_NAME)
+                    .put("bytes", snapshot.byteSize)
+                    .put("line_count", snapshot.lineCount)
+                    .toString()
+            } catch (failure: AgentMemoryException) {
+                errorResult(failure.code, failure.message ?: "笔记写入失败")
+            }
+        } else {
+            memoryWriteDefault(args)
+        }
+
+    /**
+     * 缺省 scope 的写入：先判内容归属，再决定落哪个文件。
+     *
+     * 显式传了 scope（哪怕 core）就按调用方意图走，只受预算闸门约束；
+     * 没传 scope 且是追加，才用确定性判据兜底——这条路径才是「无脑写入 memory」的入口。
+     */
+    private fun memoryWriteDefault(args: JSONObject): String {
+        if (args.optString("scope").isNotBlank()) return memoryWriteCore(args)
+        if (args.optString("mode") != "append") return memoryWriteCore(args)
+        val content = args.optString("content")
+        val reason = AgentMemoryCorePolicy.nonCoreReason(content) ?: return memoryWriteCore(args)
+        return try {
+            val snapshot = AgentMemoryRepository.appendNote(content)
+            JSONObject()
+                .put("ok", true)
+                .put("scope", "notes")
+                .put("routed_from", "core")
+                .put("route_reason", reason)
+                .put("file", io.github.mangi.eta.data.repository.AgentMemoryStore.NOTES_FILE_NAME)
+                .put("bytes", snapshot.byteSize)
+                .put("line_count", snapshot.lineCount)
+                .put(
+                    "hint",
+                    "缺省 scope 的追加内容被判为非核心（$reason），已改写入 NOTES.md，不占核心注入预算；" +
+                        "确属长期约束／稳定偏好时显式传 scope=core。",
+                )
+                .toString()
+        } catch (failure: AgentMemoryException) {
+            errorResult(failure.code, failure.message ?: "笔记写入失败")
+        }
+    }
+
+    private fun memoryWriteCore(args: JSONObject): String = try {
+        val revision = args.optString("revision")
+        if (revision.length != 64) {
+            throw AgentMemoryException(
+                "MEMORY_REVISION_REQUIRED",
+                "写入 MEMORY.md 需要 64 位 revision（取自最近一次 memory_write/memory_get 或会话快照）；" +
+                    "写项目进展等非核心内容请改用 scope=notes，不需要 revision。",
+            )
+        }
+        val mode = args.optString("mode")
+        if (mode.isBlank()) {
+            throw AgentMemoryException(
+                "MEMORY_MODE_REQUIRED",
+                "写入需要 mode：append / replace_range / clear",
+            )
+        }
+        val mutation = when (mode) {
             "replace_range" -> AgentMemoryMutation.ReplaceRange(
                 revision = revision,
                 startLine = args.getInt("start_line"),
@@ -1166,6 +1332,145 @@ internal class AgentLocalTools(
         }
     }
 
+    // ==================== Expert tools ====================
+
+    /**
+     * 专家管理：会话里一句话就能建专家，不再把用户打发去设置页手动填表。
+     *
+     * 写入的是 [io.github.mangi.eta.agent.expert.ExpertStore]（Prefs，JSON 数组），
+     * 与专家中心界面共用同一份数据，所以建完立刻能在召唤列表看到。
+     */
+    private fun expertManage(args: JSONObject): String {
+        if (!memoryWritable) return errorResult("EXPERT_READ_ONLY", "角色会话不能改写专家定义")
+        val action = args.optString("action").trim().lowercase()
+        return when (action) {
+            "list" -> expertListResult()
+            "create", "update" -> expertUpsertResult(args, updating = action == "update")
+            "delete" -> expertDeleteResult(args)
+            "summon" -> expertSummonResult(args)
+            "dismiss" -> {
+                ExpertStore.dismiss()
+                JSONObject().put("ok", true)
+                    .put("message", "已取消召唤专家，本会话恢复为普通身份。")
+                    .toString()
+            }
+            else -> errorResult(
+                "EXPERT_ACTION_INVALID",
+                "action 只支持 list / create / update / delete / summon / dismiss",
+            )
+        }
+    }
+
+    private fun expertListResult(): String {
+        val experts = ExpertStore.loadExperts()
+        val items = JSONArray()
+        experts.forEach { expert ->
+            items.put(
+                JSONObject()
+                    .put("name", expert.name)
+                    .put("displayName", expert.title)
+                    .put("description", expert.description)
+                    .put("category", expert.category.key)
+                    .put("enabled", expert.enabled)
+                    .put("pinned", expert.pinned)
+                    .put("model", expert.modelSummary())
+                    .put("tools", expert.toolSummary())
+                    .put("skills", JSONArray(expert.skills))
+            )
+        }
+        val active = ExpertStore.active()
+        return JSONObject()
+            .put("ok", true)
+            .put("count", experts.size)
+            .put("items", items)
+            .put("activeExpert", active?.name ?: JSONObject.NULL)
+            .toString()
+    }
+
+    private fun expertUpsertResult(args: JSONObject, updating: Boolean): String {
+        val name = args.optString("name").trim()
+        if (name.isEmpty()) return errorResult("EXPERT_NAME_REQUIRED", "缺少 name：专家唯一标识（建议英文小写短横线）")
+        if (!EXPERT_NAME_PATTERN.matches(name)) {
+            return errorResult("EXPERT_NAME_INVALID", "name 只允许小写字母、数字与短横线，例如 code-reviewer")
+        }
+        val existing = ExpertStore.find(name)
+        if (updating && existing == null) {
+            return errorResult("EXPERT_NOT_FOUND", "没有名为 $name 的专家；改主意要新建请用 action=create")
+        }
+        // 未提供的字段沿用旧值：只改提示词时不能把分类/技能/置顶全清空。
+        val base = existing ?: Expert(name = name)
+        val prompt = if (args.has("prompt")) args.optString("prompt") else base.prompt
+        if (prompt.isBlank() && !args.has("prompt")) {
+            return errorResult("EXPERT_PROMPT_REQUIRED", "缺少 prompt：专家提示词正文是效果的关键，不能为空")
+        }
+        val expert = Expert(
+            name = name,
+            displayName = args.optString("display_name").trim().ifBlank { base.displayName },
+            description = args.optString("description").trim().ifBlank { base.description },
+            category = if (args.has("category")) {
+                ExpertCategory.fromLabel(args.optString("category"))
+            } else {
+                base.category
+            },
+            skills = args.stringListOrNull("skills") ?: base.skills,
+            prompt = prompt.trim().take(maxExpertPromptChars),
+            enabled = args.optBoolean("enabled", base.enabled),
+            pinned = args.optBoolean("pinned", base.pinned),
+            source = base.source,
+            providerId = args.optString("provider_id").trim().ifBlank { base.providerId },
+            modelId = args.optString("model_id").trim().ifBlank { base.modelId },
+            tools = args.stringListOrNull("tools") ?: base.tools,
+            disallowedTools = args.stringListOrNull("disallowed_tools") ?: base.disallowedTools,
+            inject = args.stringListOrNull("inject") ?: base.inject,
+        )
+        val written = ExpertStore.upsert(expert).any { it.name == name }
+        if (!written) return errorResult("EXPERT_SAVE_FAILED", "专家定义写入失败，请稍后重试")
+        return JSONObject()
+            .put("ok", true)
+            .put("name", name)
+            .put("displayName", expert.title)
+            .put("category", expert.category.key)
+            .put("model", expert.modelSummary())
+            .put("tools", expert.toolSummary())
+            .put(
+                "summary",
+                "已${if (existing != null) "更新" else "创建"}专家「${expert.title}」" +
+                    "（${expert.category.key}，${expert.modelSummary()}）。" +
+                    "需要的话用 action=summon 让当前会话以这个身份作答。",
+            )
+            .toString()
+    }
+
+    private fun expertDeleteResult(args: JSONObject): String {
+        val name = args.optString("name").trim()
+        if (name.isEmpty()) return errorResult("EXPERT_NAME_REQUIRED", "缺少 name：要删除的专家标识")
+        if (ExpertStore.find(name) == null) return errorResult("EXPERT_NOT_FOUND", "没有名为 $name 的专家")
+        ExpertStore.delete(name)
+        return JSONObject().put("ok", true)
+            .put("message", "已删除专家 $name。")
+            .toString()
+    }
+
+    private fun expertSummonResult(args: JSONObject): String {
+        val name = args.optString("name").trim()
+        if (name.isEmpty()) return errorResult("EXPERT_NAME_REQUIRED", "缺少 name：要召唤的专家标识")
+        val expert = ExpertStore.find(name)
+            ?: return errorResult("EXPERT_NOT_FOUND", "没有名为 $name 的专家")
+        if (!expert.enabled) return errorResult("EXPERT_DISABLED", "专家「${expert.title}」已停用，请先启用")
+        ExpertStore.summon(name)
+        return JSONObject().put("ok", true)
+            .put("name", name)
+            .put("message", "已召唤专家「${expert.title}」；从下一轮起本会话以该身份作答。")
+            .toString()
+    }
+
+    private fun JSONObject.stringListOrNull(key: String): List<String>? {
+        val array = optJSONArray(key) ?: return null
+        return (0 until array.length()).mapNotNull { index ->
+            array.optString(index).takeIf { it.isNotBlank() }
+        }
+    }
+
     // ==================== Skills tools ====================
 
     private fun skillsManage(args: JSONObject): String {
@@ -1614,6 +1919,12 @@ internal class AgentLocalTools(
         errorResult(failure.code, failure.message ?: "GitHub Skill 请求失败")
     }
 
+    /** 审批卡上显示的「这次要动什么」：命令类显示命令，其余显示路径。 */
+    private fun reviewTarget(toolName: String, args: JSONObject): String = when (toolName) {
+        "terminal", "terminal_job", "terminal_daemon" -> args.optString("command").take(40)
+        else -> args.optString("path").take(40)
+    }
+
     private fun errorResult(code: String, message: String): String =
         JSONObject()
             .put("ok", false)
@@ -1669,6 +1980,9 @@ internal class AgentLocalTools(
     )
 
     private companion object {
+        /** 唯一事实源在 [Expert.MAX_PROMPT_CHARS]，这里只做别名，避免两处口径漂移。 */
+        const val MAX_EXPERT_PROMPT_CHARS = Expert.MAX_PROMPT_CHARS
+
         val DEVICE_DIRECT_TOOL_NAMES = io.github.mangi.eta.agent.model.AgentPhoneToolCatalog.direct + setOf(
             "virtual_screen",
             "set_alarm",

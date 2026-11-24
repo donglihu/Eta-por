@@ -2,23 +2,60 @@ package io.github.mangi.eta.agent.tool
 
 import io.github.mangi.eta.agent.model.AgentToolCatalog
 import io.github.mangi.eta.agent.roleplay.CharacterMemoryTools
+import io.github.mangi.eta.agent.subagent.AgentSubagentToolCatalog
 import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
-import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class AgentToolRequirementsTest {
     @Test
     fun everyRegisteredToolHasExactlyOneRequirement() {
-        val tools = catalog(root = true).also { CharacterMemoryTools.appendSchemas(it) }
+        // 子智能体与角色记忆工具由 Runtime 侧追加（见 AgentRuntimeRunExecutor.runTools），
+        // 不在 AgentToolCatalog 里，这里一并补上再比对，否则两份目录永远对不上。
+        val tools = catalog(root = true).also {
+            CharacterMemoryTools.appendSchemas(it)
+            AgentSubagentToolCatalog.appendSchemas(it)
+        }
         val executionOnly = setOf("input_text", "replace_text", "clear_text", "paste_text")
         assertEquals(AgentToolRequirements.toolNames - executionOnly, tools.names())
         executionOnly.forEach { name -> assertFalse("$name 仅保留执行兼容，不再向模型暴露", name in tools.names()) }
         assertEquals(tools.length(), tools.names().size)
         assertFalse(tools.toString().contains("rootRequirement"))
+    }
+
+    /**
+     * 子智能体派发工具必须登记在能力目录里。
+     *
+     * 不登记的后果：设置页「工具白名单」列不出它，
+     * 而白名单一旦是 ALLOW_LIST 模式，AgentToolPolicy.filterTools() 会把它从请求的
+     * tools 数组里滤掉 —— 模型一调就回 TOOL_NOT_AVAILABLE（2026-11-20 实测）。
+     */
+    @Test
+    fun subagentToolsAreRegisteredSoTheyCanBeWhitelisted() {
+        assertTrue("subagent" in AgentToolRequirements.toolNames)
+        assertTrue("subagent_profile" in AgentToolRequirements.toolNames)
+        assertEquals(RootRequirement.NONE, AgentToolRequirements.rootRequirement("subagent"))
+        assertEquals(RootRequirement.NONE, AgentToolRequirements.rootRequirement("subagent_profile"))
+        // 不需要 Root：缺 Root 时也不该被 project() 滤掉。
+        // 子智能体工具由 Runtime 侧追加（additionalTools），这里照样追加一份再投影。
+        val withSubagent = catalog(root = false).also { AgentSubagentToolCatalog.appendSchemas(it) }
+        val projected = AgentToolRequirements.project(withSubagent, rootAvailable = false)
+        assertTrue("subagent" in projected.names())
+        assertTrue("subagent_profile" in projected.names())
+    }
+
+    @Test
+    fun expertManageIsRegisteredSoEveryRunCanBuildTools() {
+        // 不登记的后果：AgentToolRequirements.project() 对每个声明工具调 rootRequirement()，
+        // 抛 "Missing tool requirements: expert_manage"，整轮运行在拼工具阶段就报错（2026-11-20 实测）。
+        assertTrue("expert_manage" in AgentToolRequirements.toolNames)
+        assertEquals(RootRequirement.NONE, AgentToolRequirements.rootRequirement("expert_manage"))
+        // 不需要 Root：缺 Root 时也不该被 project() 滤掉，也不该被改写成受限身份。
+        val projected = AgentToolRequirements.project(catalog(root = false), rootAvailable = false)
+        assertTrue("expert_manage" in projected.names())
     }
 
     @Test
@@ -27,11 +64,19 @@ class AgentToolRequirementsTest {
     }
 
     @Test
-    fun unknownToolCannotEnterTheModelCatalog() {
-        val unknown = JSONArray().put(JSONObject().put("function", JSONObject().put("name", "new_tool")))
-        assertThrows(IllegalArgumentException::class.java) {
-            AgentToolRequirements.project(unknown, rootAvailable = true)
-        }
+    fun unregisteredToolIsDroppedAndReportedInsteadOfFailingTheWholeRun() {
+        // 2026-11-20 实测：expert_manage 漏登记时 project() 直接抛 IllegalArgumentException，
+        // 界面变成「运行出错，请重试。（代码：Missing tool requirements: expert_manage）」，
+        // 普通对话和手动压缩一起不可用。漏登记只能影响那一个工具，不能拖垮整轮。
+        val tools = JSONArray()
+            .put(JSONObject().put("function", JSONObject().put("name", "new_tool")))
+            .put(JSONObject().put("function", JSONObject().put("name", "memory_get")))
+        val projected = AgentToolRequirements.project(tools, rootAvailable = true)
+        assertEquals(setOf("memory_get"), projected.names())
+        assertEquals(setOf("new_tool"), AgentToolRequirements.lastSkippedTools)
+        // 执行侧同样不能抛：未登记工具一律按「需要 Root」拒绝执行。
+        assertTrue(AgentToolRequirements.rootDenied("new_tool", JSONObject(), rootAvailable = false))
+        assertFalse(AgentToolRequirements.rootDenied("new_tool", JSONObject(), rootAvailable = true))
     }
 
     @Test

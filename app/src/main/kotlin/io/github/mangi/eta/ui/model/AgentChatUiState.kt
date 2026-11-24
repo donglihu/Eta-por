@@ -89,6 +89,8 @@ internal data class AgentChatUiState(
     val planSteps: List<PlanStepUi> = emptyList(),
     val pendingImages: List<PendingImageUi> = emptyList(),
     val pendingFileReferences: List<PendingFileReferenceUi> = emptyList(),
+    /** 技能引用：长按技能栏加入，发送时把 SKILL.md 正文块拼在用户消息前；发送后清空。 */
+    val pendingSkillRefs: List<SkillReferenceUi> = emptyList(),
     val queuedMessages: List<QueuedMessageUi> = emptyList(),
     val inputSyncVersion: Int = 0,
     val appliedRuntimeRunIds: List<String> = emptyList(),
@@ -310,6 +312,14 @@ data class ToolActivityMessageUi(
     val command: String? = null,
     val resultSummary: String? = null,
     val imageCount: Int = 0,
+    /**
+     * 该工具调用的开始时刻（墙钟毫秒），只在 [ToolActivityStatusUi.Running] 期间有值。
+     *
+     * 运行计时必须以这个字段为准：它跟着消息状态一起落库，切会话回来仍能接着算。
+     * 早先计时起点挂在 Composable 的 rememberSaveable 上，切会话时组合被销毁，
+     * 正在执行的工具卡片就会从 0 重新计时。
+     */
+    val startedAtMillis: Long? = null,
 ) : AgentChatMessageUi
 
 enum class ToolActivityStatusUi {
@@ -343,6 +353,19 @@ data class PendingFileReferenceUi(
 )
 
 @Immutable
+data class SkillReferenceUi(
+    val skillId: String,
+    val name: String,
+    /** 预格式化的 <skill_command> 块：长按时加载正文并格式化，发送时直接拼接，避免发送路径做异步 IO。 */
+    val promptBlock: String,
+    /** 引用类型：技能或 MCP 服务器（同一套引用条与发送通道）。 */
+    val kind: SkillReferenceKind = SkillReferenceKind.Skill,
+)
+
+@Immutable
+enum class SkillReferenceKind { Skill, McpServer }
+
+@Immutable
 internal data class QueuedMessageUi(
     val id: String,
     val content: String,
@@ -357,6 +380,10 @@ data class MessageEditUiState(
     val previousInput: String,
     val previousImages: List<PendingImageUi>,
     val previousFileReferences: List<PendingFileReferenceUi>,
+    /** 编辑前已挂上的技能引用：取消编辑要原样还回去，避免用户选的技能凭空消失。 */
+    val previousSkillRefs: List<SkillReferenceUi> = emptyList(),
+    /** 被编辑消息里原本带的技能引用：回填到输入条，再次发送时继续生效。 */
+    val editingSkillRefs: List<SkillReferenceUi> = emptyList(),
     val hasLaterTurns: Boolean,
     val preserveFollowingMessages: Boolean = false,
 )

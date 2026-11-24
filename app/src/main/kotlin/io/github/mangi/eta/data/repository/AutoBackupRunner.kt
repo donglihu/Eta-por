@@ -1,6 +1,7 @@
 package io.github.mangi.eta.data.repository
 
 import android.content.Context
+import android.net.Uri
 import android.os.Environment
 import io.github.mangi.eta.core.AndroidAgentLogger
 import io.github.mangi.eta.core.safeLogType
@@ -23,6 +24,20 @@ internal sealed interface AutoBackupResult {
     data class Done(val fileName: String, val conversationCount: Int, val kept: Int) : AutoBackupResult
     data class Skipped(val reason: String) : AutoBackupResult
     data class Failed(val message: String) : AutoBackupResult
+}
+
+/**
+ * 备份目录的判定结果。
+ *
+ * 必须区分「用户填的路径」与「实际落盘路径」：旧实现只会静默回落到默认目录，
+ * 用户填了 `/storage/emulated/0/ETA` 会以为设置成功，实际一直写在别处。
+ */
+internal sealed interface BackupDirectoryCheck {
+    /** 目录确实可用；[created] 表示这次判定顺手新建了它。 */
+    data class Usable(val path: String, val created: Boolean) : BackupDirectoryCheck
+
+    /** 目录不可用；[reason] 给原因，[suggestion] 给可直接照做的替代方案。 */
+    data class Unusable(val path: String, val reason: String, val suggestion: String) : BackupDirectoryCheck
 }
 
 /**
@@ -53,38 +68,231 @@ internal object AutoBackupRunner {
     /** 同一时刻只允许一次备份在跑。 */
     private val mutex = Mutex()
 
-    /** 默认备份目录（忽略自定义配置）。 */
-    fun defaultDirectory(): File = File(Environment.getExternalStorageDirectory(), DIR_NAME)
-
     /**
-     * 备份目录：自定义路径优先——绝对路径直接用，相对路径按内部存储根解析；为空时用默认目录。
-     * 默认参数取 [SettingsDataStore.cachedAutoBackupDirectory]，供界面等非挂起调用使用。
+     * 默认备份目录：应用专属外部目录 `/storage/emulated/0/Android/data/<pkg>/files/Eta备份`。
+     *
+     * 旧默认值是公共存储根目录下的 `/storage/emulated/0/ETA`。Android 11 起分区存储禁止应用
+     * 在公共根目录新建目录，于是每次备份都以「无法创建备份目录」失败；应用专属目录不需要
+     * 任何存储权限，也不需要 MANAGE_EXTERNAL_STORAGE。
      */
-    fun directory(customDirectory: String = SettingsDataStore.cachedAutoBackupDirectory()): File {
-        val trimmed = customDirectory.trim()
-        if (trimmed.isEmpty()) return defaultDirectory()
-        return if (trimmed.startsWith("/")) File(trimmed)
-        else File(Environment.getExternalStorageDirectory(), trimmed)
+    fun defaultDirectory(): File {
+        val context = SettingsDataStore.appContextOrNull()
+            ?: return File(Environment.getExternalStorageDirectory(), DIR_NAME)
+        val externalRoot = context.getExternalFilesDir(null) ?: context.filesDir
+        return File(externalRoot, DIR_NAME)
     }
 
-    /** 已存在的自动备份文件，最新在前。 */
-    fun backups(customDirectory: String = SettingsDataStore.cachedAutoBackupDirectory()): List<File> = directory(customDirectory)
-        .listFiles { file: File ->
-            file.isFile && file.name.startsWith(FILE_PREFIX) && file.name.endsWith(FILE_SUFFIX)
-        }
-        ?.sortedByDescending { it.name }
-        .orEmpty()
+    /** 相对路径的解析根：优先应用专属外部目录，拿不到上下文才退回公共存储根。 */
+    private fun relativeRoot(): File {
+        val context = SettingsDataStore.appContextOrNull()
+        return context?.getExternalFilesDir(null) ?: context?.filesDir
+            ?: Environment.getExternalStorageDirectory()
+    }
 
-    /** 已存在的全量包（.eta-fullbackup.zip），最新在前。 */
-    fun fullBackups(customDirectory: String = SettingsDataStore.cachedAutoBackupDirectory()): List<File> =
-        directory(customDirectory)
-            .listFiles { file: File -> file.isFile && EtaFullBackupArchive.isFullBackup(file.name) }
-            ?.sortedByDescending { it.name }
-            .orEmpty()
+    /**
+     * 备份目录：自定义路径优先——绝对路径直接用，相对路径按应用专属外部目录解析；为空时用默认目录。
+     *
+     * 关键：配置的目录不可写时自动回落到默认目录。旧配置 `/storage/emulated/0/ETA/` 在分区存储下
+     * 永远不可写，如果只在写入时回退、读列表还用配置路径，界面就会「备份成功但列表永远为空」。
+     * 这里把解析收敛到一处，读、写、展示三边看到的是同一个真实目录。
+     */
+    /**
+     * 用户配置真正指向的目录（不做可写性回落）。
+     *
+     * 界面要用它告诉用户「你填的是这个」，[directory] 用它告诉写入方「实际写这个」，
+     * 两者不一致时就是需要提示的场景，而不是悄悄覆盖掉用户的输入。
+     */
+    fun configuredDirectory(customDirectory: String = SettingsDataStore.cachedAutoBackupDirectory()): File {
+        val trimmed = customDirectory.trim()
+        return when {
+            trimmed.isEmpty() -> defaultDirectory()
+            trimmed.startsWith("/") -> File(trimmed)
+            else -> File(relativeRoot(), trimmed)
+        }
+    }
+
+    /**
+     * 备份目录：自定义路径优先——绝对路径直接用，相对路径按应用专属外部目录解析；为空时用默认目录。
+     *
+     * 关键：配置的目录不可写时自动回落到默认目录。旧配置 `/storage/emulated/0/ETA/` 在分区存储下
+     * 永远不可写，如果只在写入时回退、读列表还用配置路径，界面就会「备份成功但列表永远为空」。
+     * 这里把解析收敛到一处，读、写、展示三边看到的是同一个真实目录。
+     *
+     * 注意：回落只解决「还能不能备份」，不解决「用户以为设好了」。设置页必须在保存前用
+     * [checkDirectory] 明确告知不可写，不要靠这个回落吞掉用户的输入。
+     */
+    fun directory(customDirectory: String = SettingsDataStore.cachedAutoBackupDirectory()): File {
+        val preferred = configuredDirectory(customDirectory)
+        return if (canUseDirectory(preferred)) preferred else defaultDirectory()
+    }
+
+    /** 配置路径是否真的生效（false 说明已被回落到默认目录）。供界面打标用，不产生写操作。 */
+    fun isConfiguredDirectoryEffective(customDirectory: String = SettingsDataStore.cachedAutoBackupDirectory()): Boolean {
+        if (customDirectory.trim().isEmpty()) return true
+        return configuredDirectory(customDirectory).absolutePath == directory(customDirectory).absolutePath
+    }
+
+    /**
+     * 保存设置前的真实判定：会建目录、会写探针文件，必须在 IO 线程调用。
+     *
+     * 只靠 [File.canWrite] 不够：分区存储下 FUSE 会在真正写的那一刻才拒绝，
+     * 所以这里补一次「建目录 + 写 0 字节探针 + 立刻删除」的端到端探测，
+     * 让设置页能在保存前就给出确定结论，而不是保存完再在备份时失败。
+     */
+    fun checkDirectory(customDirectory: String = SettingsDataStore.cachedAutoBackupDirectory()): BackupDirectoryCheck {
+        val target = configuredDirectory(customDirectory)
+        val path = target.absolutePath
+        val suggestion = "留空使用默认目录 " + defaultDirectory().absolutePath + "（应用专属目录，不需要任何存储权限）"
+
+        if (target.exists() && !target.isDirectory) {
+            return BackupDirectoryCheck.Unusable(path, "该路径是一个文件，不是文件夹", suggestion)
+        }
+        val created = !target.exists()
+        if (created && !target.mkdirs() && !target.isDirectory) {
+            val parent = target.parentFile
+            val reason = when {
+                parent == null -> "路径不合法，无法解析上级目录"
+                !parent.exists() -> "上级目录不存在：" + parent.absolutePath
+                !parent.canWrite() -> "上级目录不可写：" + parent.absolutePath +
+                    "（Android 11+ 分区存储不允许应用在公共存储根目录新建目录）"
+                else -> "创建目录被系统拒绝：" + path
+            }
+            return BackupDirectoryCheck.Unusable(path, reason, suggestion)
+        }
+        if (!target.canWrite()) {
+            // 不能用 canWrite() 直接判定失败：分区存储下 FUSE 的 access(W_OK) 与实际 open(O_CREAT)
+            // 不是同一套判定（授权刚打开时尤其明显），这里以探针写入为准，canWrite 只用于补充原因。
+            val probe = File(target, ".eta-write-probe-" + System.nanoTime())
+            val writable = runCatching {
+                probe.outputStream().use { it.write(0) }
+                probe.length() == 0L
+            }.getOrDefault(false)
+            probe.delete()
+            return if (writable) {
+                BackupDirectoryCheck.Usable(path, created)
+            } else {
+                BackupDirectoryCheck.Unusable(
+                    path,
+                    "目录存在但写入被拒绝（多为其他应用在公共存储根目录创建的文件夹，权限 0770；" +
+                        "可改用「选择文件夹」授权，或开启所有文件访问权限）",
+                    suggestion,
+                )
+            }
+        }
+        val probe = File(target, ".eta-write-probe-" + System.nanoTime())
+        val writable = runCatching {
+            probe.outputStream().use { it.write(0) }
+            probe.length() == 0L
+        }.getOrDefault(false)
+        probe.delete()
+        if (!writable) {
+            return BackupDirectoryCheck.Unusable(path, "探针写入失败，目录不接受本应用的写入", suggestion)
+        }
+        return BackupDirectoryCheck.Usable(path, created)
+    }
+
+    /**
+     * 只判断可用性、不建目录：这个函数会被界面组合读取（展示路径、列备份列表），
+     * 不该在主线程产生写操作。真正的 mkdir 交给 [resolveWritableDirectory]。
+     *
+     * 注意：**不能用 canWrite() 否决已存在的目录**。分区存储下 FUSE 的 access(W_OK) 与实际
+     * open(O_CREAT) 不是同一套判定，canWrite 为 false 时写入往往照样成功；用 canWrite 当闸门
+     * 会让用户填了完全可写的目录（例如 /storage/emulated/0/ETA）也被判不可用并静默回落默认目录。
+     * 真实可写性交给 [checkDirectory] 的探针与写入时的失败提示。
+     */
+    private fun canUseDirectory(dir: File): Boolean =
+        dir.isDirectory || (!dir.exists() && dir.parentFile?.let { it.isDirectory && it.canWrite() } == true)
+
+    private fun isWritableDirectory(dir: File): Boolean =
+        dir.isDirectory || dir.mkdirs() || dir.isDirectory
+
+    /**
+     * 真正用来落盘的目录：解析后的目录再兜一层应用内部目录。
+     * 返回 null 表示连应用内部目录都不可写，调用点据此给出可操作的失败提示。
+     */
+    fun resolveWritableDirectory(customDirectory: String = SettingsDataStore.cachedAutoBackupDirectory()): File? {
+        val candidates = buildList {
+            add(directory(customDirectory))
+            SettingsDataStore.appContextOrNull()?.let { context -> add(File(context.filesDir, DIR_NAME)) }
+        }.distinct()
+        return candidates.firstOrNull { isWritableDirectory(it) }
+    }
+
+    /**
+     * 当前生效的落点：SAF 授权目录优先，其次是自定义/默认 File 目录，最后兜到应用内部目录。
+     * 授权目录失效（用户撤销授权、文件夹被删）时返回 null，让调用点明确报错，不静默换目录。
+     */
+    fun storage(
+        customDirectory: String = SettingsDataStore.cachedAutoBackupDirectory(),
+        treeUri: String = SettingsDataStore.cachedAutoBackupTreeUri(),
+    ): BackupStorage? {
+        if (treeUri.isNotBlank()) return safStorage(treeUri)
+        return resolveWritableDirectory(customDirectory)?.let { FileBackupStorage(it) }
+    }
+
+    /** SAF 授权目录落点；未授权、URI 不合法或授权已失效时返回 null。 */
+    fun safStorage(
+        treeUri: String,
+        context: Context? = SettingsDataStore.appContextOrNull(),
+    ): BackupStorage? {
+        if (treeUri.isBlank() || context == null) return null
+        val uri = runCatching { Uri.parse(treeUri) }.getOrNull() ?: return null
+        val storage = SafBackupStorage(context, uri, safTreeDisplayName(context, uri))
+        return if (storage.isAccessible()) storage else null
+    }
+
+    private fun suggestionText(): String =
+        "留空使用默认目录 " + defaultDirectory().absolutePath + "（应用专属目录，不需要任何存储权限）"
+
+    /**
+     * 保存 SAF 目录前的真实判定：建探针文件写 0 字节再删掉。
+     * 与 [checkDirectory] 同理——授权状态正常也可能在真正写入的那一刻被拒。
+     */
+    fun checkTreeDirectory(context: Context, treeUri: String): BackupDirectoryCheck {
+        val uri = runCatching { Uri.parse(treeUri) }.getOrNull()
+            ?: return BackupDirectoryCheck.Unusable(treeUri, "文件夹授权地址不合法", suggestionText())
+        val label = safTreeDisplayName(context, uri).ifBlank { treeUri }
+        val storage = SafBackupStorage(context, uri, label)
+        if (!storage.isAccessible()) {
+            return BackupDirectoryCheck.Unusable(
+                label,
+                "系统没有授予这个文件夹的读写权限（可能已撤销授权或文件夹被删除）",
+                suggestionText(),
+            )
+        }
+        val handle = storage.create(".eta-write-probe-" + System.nanoTime())
+            ?: return BackupDirectoryCheck.Unusable(label, "无法在该文件夹里创建文件", suggestionText())
+        val written = runCatching { handle.openOutput()?.use { it.write(0) } != null }.getOrDefault(false)
+        handle.delete()
+        if (!written) {
+            return BackupDirectoryCheck.Unusable(label, "探针写入失败，文件夹不接受本应用的写入", suggestionText())
+        }
+        return BackupDirectoryCheck.Usable(label, created = false)
+    }
+
+    /** 已存在的自动备份条目（JSON），最新在前。 */
+    fun entries(
+        customDirectory: String = SettingsDataStore.cachedAutoBackupDirectory(),
+        treeUri: String = SettingsDataStore.cachedAutoBackupTreeUri(),
+    ): List<BackupEntry> = storage(customDirectory, treeUri)?.entries().orEmpty()
+        .filter { it.name.startsWith(FILE_PREFIX) && it.name.endsWith(FILE_SUFFIX) }
+        .sortedByDescending { it.name }
+
+    /** 已存在的全量包条目（.eta-fullbackup.zip），最新在前。 */
+    fun fullEntries(
+        customDirectory: String = SettingsDataStore.cachedAutoBackupDirectory(),
+        treeUri: String = SettingsDataStore.cachedAutoBackupTreeUri(),
+    ): List<BackupEntry> = storage(customDirectory, treeUri)?.entries().orEmpty()
+        .filter { EtaFullBackupArchive.isFullBackup(it.name) }
+        .sortedByDescending { it.name }
 
     /** JSON 备份 + 全量包，按文件名倒序（两套命名的时间戳格式一致，可以直接混排）。 */
-    fun allBackups(customDirectory: String = SettingsDataStore.cachedAutoBackupDirectory()): List<File> =
-        (backups(customDirectory) + fullBackups(customDirectory)).sortedByDescending { it.name }
+    fun allEntries(
+        customDirectory: String = SettingsDataStore.cachedAutoBackupDirectory(),
+        treeUri: String = SettingsDataStore.cachedAutoBackupTreeUri(),
+    ): List<BackupEntry> =
+        (entries(customDirectory, treeUri) + fullEntries(customDirectory, treeUri))
+            .sortedByDescending { it.name }
 
     /**
      * 目录里真实存在的最新一份备份。
@@ -92,28 +300,17 @@ internal object AutoBackupRunner {
      * 界面显示「最近备份」时必须用它，而不是直接用设置里记的文件名：
      * 文件可能被用户清理掉、或换过备份目录，光看记录会显示一个根本不存在的文件。
      */
-    fun latestBackup(customDirectory: String = SettingsDataStore.cachedAutoBackupDirectory()): File? =
-        allBackups(customDirectory).firstOrNull()
-
-    /** 上次记录的文件名如果确实还在磁盘上就返回它，否则回落到目录里最新的一份。 */
-    fun resolveLastBackup(
+    fun resolveLastEntry(
         recordedName: String,
         customDirectory: String = SettingsDataStore.cachedAutoBackupDirectory(),
-    ): File? {
-        val all = allBackups(customDirectory)
+        treeUri: String = SettingsDataStore.cachedAutoBackupTreeUri(),
+    ): BackupEntry? {
+        val all = allEntries(customDirectory, treeUri)
         if (recordedName.isNotBlank()) {
             all.firstOrNull { it.name == recordedName }?.let { return it }
         }
         return all.firstOrNull()
     }
-
-    /** 目录里残留的 `.part`（上次导出被杀留下的），下次跑之前顺手清掉。 */
-    private fun staleTempFiles(customDirectory: String): List<File> = directory(customDirectory)
-        .listFiles { file: File ->
-            file.isFile && file.name.startsWith(FILE_PREFIX) && file.name.endsWith(TEMP_SUFFIX)
-        }
-        .orEmpty()
-        .toList()
 
     /**
      * 到点且内容有变化才执行；[force] 为 true 时忽略开关、周期与指纹（手动「立即备份一次」）。
@@ -159,7 +356,9 @@ internal object AutoBackupRunner {
             keep = AutoBackupKeepCount.normalize(settings.autoBackupKeepCount),
             fingerprint = fingerprint,
             customDirectory = settings.autoBackupDirectory,
+            treeUri = settings.autoBackupTreeUri,
             format = settings.autoBackupFormat,
+            includeLinux = settings.autoBackupIncludeLinux,
             now = now,
         )
     }
@@ -178,70 +377,91 @@ internal object AutoBackupRunner {
         keep: Int,
         fingerprint: String,
         customDirectory: String,
+        treeUri: String,
         format: String,
+        includeLinux: Boolean,
         now: Long,
     ): AutoBackupResult {
-        val dir = directory(customDirectory)
-        if (!dir.exists() && !dir.mkdirs()) {
-            return fail(now, "无法创建备份目录 " + dir.absolutePath)
-        }
-        if (!dir.isDirectory || !dir.canWrite()) {
-            return fail(now, "备份目录不可写 " + dir.absolutePath)
+        val storage = storage(customDirectory, treeUri)
+        if (storage == null) {
+            val targetLabel = if (treeUri.isNotBlank()) {
+                runCatching { safTreeDisplayName(context, Uri.parse(treeUri)) }
+                    .getOrDefault("")
+                    .ifBlank { treeUri }
+            } else {
+                directory(customDirectory).absolutePath
+            }
+            return fail(
+                now,
+                "无法使用备份文件夹 " + targetLabel +
+                    "（授权可能已失效：请在「备份文件夹」里重新选择，或留空使用默认目录）",
+            )
         }
         // 上一次导出被系统杀掉留下的临时文件，先清掉，免得越积越多。
-        staleTempFiles(customDirectory).forEach { it.delete() }
+        // 全量包的临时文件是 `Eta-全量备份-…part`，只按 JSON 前缀匹配会漏掉，白占几个 GB。
+        storage.entries()
+            .filter { entry ->
+                entry.name.endsWith(TEMP_SUFFIX) &&
+                    (entry.name.startsWith(FILE_PREFIX) || entry.name.startsWith(FULL_PREFIX))
+            }
+            .forEach { storage.deleteName(it.name) }
 
-        val full = io.github.mangi.eta.data.model.AutoBackupFormat.isFull(format)
+        // 勾了「含完整 Linux 环境」就必须产全量包：否则用户以为备份了容器，实际只有一份 JSON。
+        val full = io.github.mangi.eta.data.model.AutoBackupFormat.isFull(format) || includeLinux
         val stamp = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date(now))
-        val target = if (full) File(dir, "$FULL_PREFIX$stamp$FULL_SUFFIX")
-        else File(dir, "$FILE_PREFIX$stamp$FILE_SUFFIX")
-        val temp = File(dir, target.name + TEMP_SUFFIX)
+        val targetName = if (full) {
+            "$FULL_PREFIX$stamp$FULL_SUFFIX"
+        } else {
+            "$FILE_PREFIX$stamp$FILE_SUFFIX"
+        }
+        val tempName = targetName + TEMP_SUFFIX
+        // SAF 目录里 createDocument 遇到同名会自动加 " (1)" 后缀，先删掉同名残留保证名字稳定。
+        storage.deleteName(tempName)
+        storage.deleteName(targetName)
+        val handle = storage.create(tempName)
+            ?: return fail(now, "备份文件创建失败：" + storage.label)
         return try {
-            val conversationCount = temp.outputStream().use { stream ->
-                if (full) EtaFullBackupArchive.export(context, stream).conversationCount
+            val output = handle.openOutput()
+            if (output == null) {
+                handle.delete()
+                return fail(now, "备份文件不可写：" + storage.label)
+            }
+            val conversationCount = output.use { stream ->
+                if (full) EtaFullBackupArchive.export(context, stream, includeLinuxEnvironment = includeLinux).conversationCount
                 else EtaBackupRepository.export(context, stream).conversationCount
             }
-            if (!commit(temp, target)) {
-                temp.delete()
-                return fail(now, "备份文件落盘失败 " + target.absolutePath)
+            // 全量包是流式写的 zip：导出中途被杀会留下「没有中央目录」的残包，
+            // 旧实现直接改名成正式文件，界面显示成功、实际导入必失败。落正式名之前先验一次结构。
+            if (full) {
+                val check = handle.verifyFullBackup(context)
+                if (!check.ok) {
+                    AndroidAgentLogger.warn("Full backup incomplete: entries=" + check.entries + " bytes=" + check.bytes)
+                    handle.delete()
+                    return fail(now, "全量包不完整：" + check.reason + "；已丢弃，未写入备份目录")
+                }
             }
-            val kept = prune(keep, customDirectory, full)
+            if (!handle.renameTo(targetName)) {
+                handle.delete()
+                return fail(now, "备份文件落盘失败 " + storage.label + "/" + targetName)
+            }
+            val kept = prune(keep, storage, full)
             runCatching {
                 SettingsDataStore.setAutoBackupState(
                     lastAt = System.currentTimeMillis(),
                     fingerprint = fingerprint,
-                    fileName = target.name,
+                    fileName = targetName,
                 )
             }
-            AutoBackupResult.Done(target.name, conversationCount, kept)
+            AutoBackupResult.Done(targetName, conversationCount, kept)
         } catch (error: Throwable) {
             if (error is CancellationException) throw error
-            temp.delete()
+            handle.delete()
             AndroidAgentLogger.warn("Auto backup failed: type=${error.safeLogType()}")
             fail(
                 now,
                 error.message?.takeIf { it.isNotBlank() } ?: error.javaClass.simpleName,
             )
         }
-    }
-
-    /**
-     * 把临时文件改名成正式备份文件。
-     *
-     * 同目录 rename 在共享存储上是原子的；个别机型/ROM 的 FUSE 实现会拒绝跨 UID 的改名
-     * （例如应用重装后 UID 变了，目录里的旧文件属主还是上一个 UID），这时退化成直接复制一份，
-     * 保证备份本身不因为改名失败而丢掉。
-     */
-    private fun commit(temp: File, target: File): Boolean {
-        if (target.exists()) target.delete()
-        if (temp.renameTo(target)) return true
-        return runCatching {
-            temp.inputStream().use { input ->
-                target.outputStream().use { output -> input.copyTo(output, DEFAULT_BUFFER_SIZE * 8) }
-            }
-            temp.delete()
-            target.length() > 0L
-        }.getOrDefault(false)
     }
 
     private suspend fun fail(now: Long, message: String): AutoBackupResult {
@@ -260,13 +480,18 @@ internal object AutoBackupRunner {
         return AutoBackupResult.Failed(message)
     }
 
-    private fun prune(keep: Int, customDirectory: String, full: Boolean): Int {
-        val pool = if (full) fullBackups(customDirectory) else backups(customDirectory)
+    private fun prune(keep: Int, storage: BackupStorage, full: Boolean): Int {
+        fun belongs(name: String): Boolean = if (full) {
+            EtaFullBackupArchive.isFullBackup(name)
+        } else {
+            name.startsWith(FILE_PREFIX) && name.endsWith(FILE_SUFFIX)
+        }
+        val pool = storage.entries().map { it.name }.filter { belongs(it) }.sortedDescending()
         pool.drop(keep.coerceAtLeast(1)).forEach { stale ->
-            if (!stale.delete()) {
-                AndroidAgentLogger.warn("Auto backup prune skipped: ~" + stale.length() + "B")
+            if (!storage.deleteName(stale)) {
+                AndroidAgentLogger.warn("Auto backup prune skipped: name-length=" + stale.length)
             }
         }
-        return (if (full) fullBackups(customDirectory) else backups(customDirectory)).size
+        return storage.entries().count { belongs(it.name) }
     }
 }

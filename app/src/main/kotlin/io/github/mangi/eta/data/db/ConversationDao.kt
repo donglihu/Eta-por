@@ -42,8 +42,26 @@ internal interface ConversationDao : ChunkedTextDao {
     @Query("SELECT id, title, created_at, updated_at FROM conversations")
     suspend fun conversationIdentities(): List<ConversationIdentity>
 
+    /**
+     * 每个会话的**首条用户消息**（只取 id 与存储列，正文按需还原）。
+     *
+     * 只给「旧库脏标题自愈」用：标题被写脏的会话要靠这条消息重算一次。
+     * 用相关子查询限定 sort_index 最小，避免把整库消息拉进内存。
+     */
+    @Query(
+        "SELECT m.conversation_id AS conversation_id, m.id AS id, m.content AS content " +
+            "FROM conversation_messages m WHERE m.type = 'user' AND m.conversation_id IN (:conversationIds) " +
+            "AND m.sort_index = (SELECT MIN(sort_index) FROM conversation_messages " +
+            "WHERE conversation_id = m.conversation_id AND type = 'user')"
+    )
+    suspend fun firstUserMessages(conversationIds: List<String>): List<ConversationFirstUserMessage>
+
     @Query("UPDATE conversations SET title = :title, updated_at = :updatedAt WHERE id = :conversationId")
     suspend fun updateConversationTitle(conversationId: String, title: String, updatedAt: Long)
+
+    /** 只改标题，不动 updated_at：脏标题自愈不能让会话在列表里往上跳。 */
+    @Query("UPDATE conversations SET title = :title WHERE id = :conversationId")
+    suspend fun updateConversationTitleOnly(conversationId: String, title: String)
 
     @Query(
         "SELECT id, title, thinking_enabled, reasoning_effort, " +

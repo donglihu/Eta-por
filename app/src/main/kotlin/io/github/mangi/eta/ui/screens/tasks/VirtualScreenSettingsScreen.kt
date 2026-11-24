@@ -20,6 +20,7 @@ import androidx.compose.ui.res.stringResource
 import io.github.mangi.eta.R
 import io.github.mangi.eta.agent.display.MainScreenFallbackApproval
 import io.github.mangi.eta.agent.display.VirtualScreenSession
+import io.github.mangi.eta.core.SharedStorage
 import io.github.mangi.eta.data.datastore.SettingsDataStore
 import io.github.mangi.eta.data.model.Settings
 import io.github.mangi.eta.ui.components.EtaPreferenceDivider
@@ -129,7 +130,7 @@ internal fun VirtualScreenSettingsScreen(onBack: () -> Unit) {
         }
         item {
             Text(
-                text = "导出目录：/sdcard/ai共享文件夹/灵屏日志/（固定副本 lingscreen-latest.log）",
+                text = "导出目录：${SharedStorage.LINGSCREEN_LOG_DIR}/（固定副本 lingscreen-latest.log）",
                 modifier = Modifier.padding(horizontal = EtaPreferenceDefaults.SidePadding, vertical = 4.dp),
                 style = MiuixTheme.textStyles.footnote1,
                 color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
@@ -185,8 +186,8 @@ internal fun VirtualScreenSettingsScreen(onBack: () -> Unit) {
                             val stamp = java.text.SimpleDateFormat("yyyyMMdd-HHmmss", java.util.Locale.US)
                                 .format(java.util.Date())
                             // 导出到共享产物目录：文件管理器、Eta 工作区、其他 App 都能直接看到。
-                            val dir = java.io.File("/sdcard/ai共享文件夹/灵屏日志")
-                            if (!dir.exists()) dir.mkdirs()
+                            val dir = java.io.File(SharedStorage.LINGSCREEN_LOG_DIR)
+                            if (!SharedStorage.ensureDirectory(dir)) error("无法创建灵屏日志目录")
                             val dst = java.io.File(dir, "lingscreen-log-$stamp.log")
                             val latest = java.io.File(dir, "lingscreen-latest.log")
                             src.copyTo(dst, overwrite = true)

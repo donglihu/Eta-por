@@ -30,7 +30,6 @@
     <uses-permission android:name="android.permission.USE_EXACT_ALARM" />
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
-    <uses-permission android:name="android.permission.ACCESS_BACKGROUND_LOCATION" />
     <uses-permission android:name="android.permission.PACKAGE_USAGE_STATS"
         tools:ignore="ProtectedPermissions" />
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
@@ -40,6 +39,7 @@
         tools:ignore="QueryAllPackagesPermission" />
     <uses-permission android:name="android.permission.VIBRATE" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
 
     <permission
@@ -133,10 +133,6 @@
         <activity android:name=".agent.display.TakeoverActivity" android:exported="false"
             android:theme="@style/Theme.EtaTakeover" android:configChanges="orientation|screenSize|screenLayout|keyboardHidden"
             android:windowSoftInputMode="adjustResize" />
-        <activity android:name=".agent.runtime.SupplementActivity" android:exported="false"
-            android:theme="@style/Theme.EtaTakeover" android:excludeFromRecents="true"
-            android:taskAffinity="" android:launchMode="singleInstance"
-            android:noHistory="true" android:windowSoftInputMode="adjustResize|stateVisible" />
         <activity android:name=".agent.display.dashboard.AgentConfirmActivity" android:exported="false"
             android:theme="@style/Theme.Eta" android:windowSoftInputMode="adjustResize" />
 <activity android:name=".agent.display.VirtualScreenHomeActivity" android:exported="false"
@@ -208,6 +204,13 @@
             <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
                 android:value="User-configured event trigger monitoring for saved assistant tasks" />
         </service>
+        <service android:name=".agent.automation.AgentKeepaliveService"
+            android:exported="false" android:foregroundServiceType="specialUse">
+            <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="User-opted optional keepalive so saved automation tasks and long-running sessions survive background cleanup" />
+        </service>
+        <service android:name=".agent.automation.AgentKeepaliveJobService"
+            android:exported="true" android:permission="android.permission.BIND_JOB_SERVICE" />
         <receiver android:name=".agent.automation.AgentTaskReceiver" android:exported="false">
             <intent-filter>
                 <action android:name="android.intent.action.BOOT_COMPLETED" />

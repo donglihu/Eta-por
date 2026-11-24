@@ -259,13 +259,16 @@ internal fun SharedFoldersScreen(
                         removeTarget = null
                         refreshSources(updated)
                         coroutineScope.launch(Dispatchers.IO) {
-                            // 清理空的挂载点目录；仍有会话占用时 rmdir 失败，无副作用。
+                            // 清理挂载点：仍被会话占用的 bind 目录 rmdir 会失败，无副作用；
+                            // workspace 内的源是符号链接，用 rm -f 移除，避免在 mounts 下留悬空链接。
+                            val mountPoint = shellQuote(
+                                "${SharedFolderMounts.ANDROID_MOUNTS_ROOT}/${target.name}"
+                            )
                             runOneShotShell(
                                 processSupervisor = shellSupervisor,
                                 identity = TerminalRuntime.defaultIdentity(TerminalEnvironment.ANDROID),
-                                command = "rmdir " +
-                                    shellQuote("${SharedFolderMounts.ANDROID_MOUNTS_ROOT}/${target.name}") +
-                                    " 2>/dev/null",
+                                command = "if [ -L $mountPoint ]; then rm -f $mountPoint; " +
+                                    "elif [ -d $mountPoint ]; then rmdir $mountPoint; fi 2>/dev/null",
                                 timeoutSeconds = 10,
                             )
                         }

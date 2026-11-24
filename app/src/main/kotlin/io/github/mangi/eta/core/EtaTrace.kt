@@ -43,8 +43,14 @@ internal object EtaTrace {
         log("app", "onCreate")
     }
 
-    fun log(area: String, message: String) {
+    fun log(area: String, message: String, level: AppLogLevel = AppLogLevel.INFO) {
+        // 2026-11-23 诊断打点关闭：perf.* 一律不落盘（阶段名 + 毫秒那套已撤，避免日志膨胀）。
+        if (area.startsWith("perf")) return
         val context = appContext ?: return
+        // 同一份内容也写进日志文件：日志页读文件，不再依赖 logcat 的 2 分钟缓冲。
+        // 等级不靠调用方逐个标注（几百个调用点不可能都改），这里按事件名与措辞推断：
+        // 没有分层的话，日志页的等级过滤和着色就是摆设，全是同一个颜色。
+        runCatching { AppLogFiles.log(level.takeUnless { it == AppLogLevel.INFO } ?: inferLevel(area, message), area, message) }
         val now = Date()
         val line = buildString {
             append(timeFormat.format(now))
@@ -63,6 +69,36 @@ internal object EtaTrace {
             }
         }
     }
+
+    /**
+     * 按事件名与措辞推断等级。
+     *
+     * 只做保守判断：明确的失败/异常归 ERROR，需要留意的归 WARN，其余 INFO。
+     * 宁可少标，也不要把正常流程刷成一片红。
+     *
+     * **只看 message，不看 area**：area 是事件路由名（`completion.skip`、
+     * `heavy.start`），里面的 `skip` 表示「这一步被有意跳过」，不是严重度。
+     * 早先把 area 拼进去一起匹配，结果「前台且在看该会话，所以不弹通知」这种
+     * 完全正常的分支被记成 WARN——日志里 38 条 WARN 全是它，等级筛选形同虚设。
+     */
+    internal fun inferLevel(area: String, message: String): AppLogLevel {
+        val lower = message.lowercase()
+        if (ERROR_MARKERS.any { lower.contains(it) }) return AppLogLevel.ERROR
+        if (WARN_MARKERS.any { lower.contains(it) }) return AppLogLevel.WARN
+        return AppLogLevel.INFO
+    }
+
+    /** 真失败：带 fail/error/exception/失败/异常/崩溃 等字样。 */
+    private val ERROR_MARKERS = listOf(
+        "fail", "error", "exception", "crash", "timeout", "timedout",
+        "失败", "异常", "崩溃", "超时", "错误",
+    )
+
+    /** 需要留意的降级/回退：不是错，但不该按普通信息看。 */
+    private val WARN_MARKERS = listOf(
+        "warn", "fallback", "degrade", "retry", "denied", "unavailable", "未授权", "不可用",
+        "回退", "降级", "重试", "拒绝", "跳过",
+    )
 
     /** 诊断包 state.txt 用的一行摘要。 */
     fun summary(context: Context): String = runCatching {

@@ -1,5 +1,6 @@
 package io.github.mangi.eta.agent.model
 
+import io.github.mangi.eta.agent.prompt.PromptJailbreak
 import io.github.mangi.eta.agent.terminal.TerminalEnvironment
 import io.github.mangi.eta.agent.terminal.TerminalExecutionContext
 import io.github.mangi.eta.agent.memory.AgentMemoryContext
@@ -258,6 +259,117 @@ class AgentPromptBuilderTest {
         assertEquals("现在改用英文回答", messages.getJSONObject(messages.length() - 1).getString("content"))
     }
 
+    @Test
+    fun jailbreakSectionIsPrependedBeforeInternalIdentityOnlyWhenEnabled() {
+        val config = modelConfig("", terminalTools = true, browserTools = false)
+        val base = AgentPromptBuilder.buildSystemMessages(
+            config = config,
+            skillContext = SkillContext.EMPTY,
+            memoryContext = AgentMemoryContext.DISABLED,
+            rootAvailable = false,
+        )
+        assertFalse(base.systemContents().any { it.contains("<jailbreak_mode") })
+
+        val withJailbreak = AgentPromptBuilder.buildSystemMessages(
+            config = config,
+            skillContext = SkillContext.EMPTY,
+            memoryContext = AgentMemoryContext.DISABLED,
+            rootAvailable = false,
+            jailbreak = PromptJailbreak(enabled = true),
+        )
+        val first = withJailbreak.getJSONObject(0)
+        assertEquals("system", first.getString("role"))
+        assertTrue(first.getString("content").startsWith("<jailbreak_mode"))
+        assertTrue(first.getString("content").contains("永不拒绝"))
+        assertFalse(first.getString("content").contains("你是 Eta"))
+        // 内置身份段没有消失，只是被推到破甲段之后。
+        assertTrue(withJailbreak.systemContents().any { it.contains("你是 Eta") })
+        assertEquals(base.length() + 1, withJailbreak.length())
+    }
+
+    @Test
+    fun disabledJailbreakLeavesPromptByteIdentical() {
+        val config = modelConfig("", terminalTools = true, browserTools = false)
+        val base = AgentPromptBuilder.buildSystemMessages(
+            config = config,
+            skillContext = SkillContext.EMPTY,
+            memoryContext = AgentMemoryContext.DISABLED,
+            rootAvailable = false,
+        )
+        val disabled = AgentPromptBuilder.buildSystemMessages(
+            config = config,
+            skillContext = SkillContext.EMPTY,
+            memoryContext = AgentMemoryContext.DISABLED,
+            rootAvailable = false,
+            jailbreak = PromptJailbreak(enabled = false, text = "这段不应出现"),
+        )
+        assertEquals(base.toString(), disabled.toString())
+        assertFalse(disabled.toString().contains("这段不应出现"))
+    }
+
+    @Test
+    fun planModeKeepsIdentityAsFirstSystemMessage() {
+        val config = modelConfig("", terminalTools = true, browserTools = false)
+        val withoutPlan = AgentPromptBuilder.buildSystemMessages(
+            config = config,
+            skillContext = SkillContext.EMPTY,
+            memoryContext = AgentMemoryContext.DISABLED,
+            rootAvailable = false,
+        )
+        val withPlan = AgentPromptBuilder.buildSystemMessages(
+            config = config,
+            skillContext = SkillContext.EMPTY,
+            memoryContext = AgentMemoryContext.DISABLED,
+            rootAvailable = false,
+            planMode = true,
+        )
+
+        // 顺序为 [Plan, 身份…]：Plan 在前，但原来的第一条身份段没有被顶掉，只是后移一位。
+        // 注意：本条用例名沿用约定表述；二.1 指定的排序里 Plan 确实位于 index0。
+        val first = withPlan.getJSONObject(0)
+        assertEquals("system", first.getString("role"))
+        assertEquals(AgentPromptBuilder.PLAN_MODE_INSTRUCTION, first.getString("content"))
+        assertFalse(first.getString("content").contains("你是 Eta"))
+        val identity = withPlan.getJSONObject(1)
+        assertEquals("system", identity.getString("role"))
+        assertTrue(identity.getString("content").contains("你是 Eta"))
+        assertEquals(1, withPlan.systemContents().count { it == AgentPromptBuilder.PLAN_MODE_INSTRUCTION })
+        assertEquals(withoutPlan.length() + 1, withPlan.length())
+        assertEquals(
+            withoutPlan.systemContents(),
+            withPlan.systemContents().filterNot { it == AgentPromptBuilder.PLAN_MODE_INSTRUCTION },
+        )
+    }
+
+    @Test
+    fun jailbreakAndPlanOrderIsJailbreakThenPlan() {
+        val config = modelConfig("", terminalTools = true, browserTools = false)
+        fun build(planMode: Boolean, jailbreak: PromptJailbreak) = AgentPromptBuilder.buildSystemMessages(
+            config = config,
+            skillContext = SkillContext.EMPTY,
+            memoryContext = AgentMemoryContext.DISABLED,
+            rootAvailable = false,
+            planMode = planMode,
+            jailbreak = jailbreak,
+        )
+        val jailbreak = PromptJailbreak(enabled = true)
+        val planOnly = build(planMode = true, jailbreak = PromptJailbreak())
+        val both = build(planMode = true, jailbreak = jailbreak)
+
+        val jailbreakContent = both.getJSONObject(0).getString("content")
+        assertTrue(jailbreakContent.startsWith("<jailbreak_mode"))
+        assertTrue(jailbreakContent.endsWith("</jailbreak_mode>"))
+        assertEquals(AgentPromptBuilder.PLAN_MODE_INSTRUCTION, both.getJSONObject(1).getString("content"))
+        // 身份段排在破甲与 Plan 之后，顺序为 [破甲, Plan, 身份…]。
+        assertEquals("system", both.getJSONObject(2).getString("role"))
+        assertTrue(both.getJSONObject(2).getString("content").contains("你是 Eta"))
+        assertEquals(planOnly.length() + 1, both.length())
+        assertEquals(
+            build(planMode = false, jailbreak = jailbreak).systemContents(),
+            both.systemContents().filterNot { it == AgentPromptBuilder.PLAN_MODE_INSTRUCTION },
+        )
+    }
+
     private fun modelConfig(
         systemPrompt: String,
         terminalTools: Boolean,
@@ -271,6 +383,28 @@ class AgentPromptBuilderTest {
             terminalTools = terminalTools,
             browserTools = browserTools,
         )
+
+    /**
+     * 编排型专家（小组长）与通用 subagent 段的口径冲突回归锁。
+     *
+     * 通用段原写「简单直接的单步查询优先直接调用对应工具，不必绕经 subagent」，
+     * 与小组长「第一个动作必须派发」直接矛盾；实测表现为召唤 dev-team 后它自己动手、
+     * 一个子智能体都不派。这里锁定：subagent 段必须显式声明专家要求优先。
+     */
+    @Test
+    fun subagentPromptDefersToOrchestratingExpertInsteadOfSkippingDispatch() {
+        val config = modelConfig("", terminalTools = true, browserTools = false)
+            .copy(subagentTools = true)
+        val subagentSection = AgentPromptBuilder.buildSystemMessages(
+            config = config,
+            skillContext = SkillContext.EMPTY,
+            memoryContext = AgentMemoryContext.DISABLED,
+            rootAvailable = false,
+        ).systemContents().single { it.contains("subagent") && it.contains("派发") }
+        assertTrue(subagentSection.contains("本轮已注入 <expert> 段"))
+        assertTrue(subagentSection.contains("派发是强制流程而不是可选优化"))
+        assertTrue(subagentSection.contains("不得以"))
+    }
 
     private fun JSONArray.roles(): List<String> =
         (0 until length()).map { index -> getJSONObject(index).getString("role") }

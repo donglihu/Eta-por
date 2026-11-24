@@ -13,12 +13,14 @@ import io.github.mangi.eta.data.datastore.SettingsDataStore
 import io.github.mangi.eta.data.db.EtaDatabase
 import io.github.mangi.eta.data.db.TextStoreMaintenance
 import io.github.mangi.eta.data.model.AutoBackupInterval
+import io.github.mangi.eta.data.model.Settings
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 
 /**
@@ -66,13 +68,17 @@ internal object DiagnosticsPatrolInterval {
  *  3. 留档：写一份人可读报告 + 一份机器可读结论 JSON，可选再落一份诊断包 zip，
  *     并按保留份数滚动清理（只动自己目录，绝不碰手动存的诊断包）。
  *
- * 不做常驻：由 [DiagnosticsPatrolAlarm] 排一次精确闹钟，跑完再排下一次；
- * 崩溃现场由 [captureNow] 立刻补一次（不需要等下一个周期）。
+ * 不做常驻：由 [DiagnosticsPatrolAlarm] 排一次精确闹钟，跑完再排下一次。
+ * 崩溃现场不在崩溃路径跑全量巡检：进程随时被回收，跑一半就是半截产物；
+ * 崩溃记录由 [CrashRecorder] 轻量落盘，下一轮巡检读记录做增量判定，取证不丢。
  */
 internal object DiagnosticsPatrol {
 
     /** 只在这里滚动保留；手动存的诊断包一个都不碰。 */
-    const val BASE_DIR = "/storage/emulated/0/ai共享文件夹/诊断包备份/巡检"
+    const val BASE_DIR = SharedStorage.DIAGNOSTICS_PATROL_DIR
+
+    /** 回落时用的子目录名（与公共目录下的巡检子目录同名）。 */
+    private const val PATROL_DIR_NAME = "诊断包备份/巡检"
 
     private const val FILE_PREFIX = "Eta-巡检-"
     private const val REPORT_SUFFIX = ".md"
@@ -134,7 +140,9 @@ internal object DiagnosticsPatrol {
             val app = context.applicationContext
             val settings = runCatching { SettingsDataStore.settings() }.getOrNull()
             val now = System.currentTimeMillis()
-            val dir = File(BASE_DIR).apply { runCatching { mkdirs() } }
+            // 公共目录不可写时回落应用专属目录：撤销「所有文件访问权限」后巡检仍要能出报告。
+            val dir = SharedStorage.writableDir(app, PATROL_DIR_NAME) ?: File(BASE_DIR)
+            if (!dir.isDirectory) SharedStorage.ensureDirectory(dir)
             val baseline = readBaseline(dir)
             val findings = mutableListOf<Finding>()
             val metrics = linkedMapOf<String, String>()
@@ -329,7 +337,7 @@ internal object DiagnosticsPatrol {
             // 8) 目录规模
             runCatching {
                 val patrol = dirSize(dir)
-                val backupDir = File("/storage/emulated/0/ai共享文件夹/数据备份记录")
+                val backupDir = File(SharedStorage.BACKUP_RECORD_DIR)
                 val backupSize = if (backupDir.isDirectory) dirSize(backupDir) else 0L
                 metrics["巡检目录体积"] = bytes(patrol)
                 metrics["自动备份目录体积"] = bytes(backupSize)
@@ -479,15 +487,34 @@ internal object DiagnosticsPatrol {
             report
         }
 
-    /** 崩溃现场立刻补一次取证：不等下一个周期，且不导出诊断包（够快、够轻）。 */
-    fun captureNow(context: Context, reason: String) {
-        val app = context.applicationContext
-        runCatching {
-            Thread {
-                runCatching { runBlocking { runOnce(app, reason = reason, exportBundle = false) } }
-            }.apply { isDaemon = true }.start()
+    /**
+     * 启动 / 回到前台的到期补偿：与自动备份的 [io.github.mangi.eta.data.repository.AutoBackupRunner.maybeRun]
+     * 同口径。开关关闭或未到周期直接跳过；错过周期（或从未跑过）就补跑一次，
+     * 跑完由 [runOnce] 末尾的重排把下一次闹钟排回去。
+     * 任何失败只记日志不抛出，避免影响启动或闹钟回调；同一时刻只允许一个补跑。
+     */
+    suspend fun maybeRun(context: Context): Boolean = withContext(Dispatchers.IO) {
+        catchUpMutex.withLock {
+            val settings = runCatching { SettingsDataStore.settings() }.getOrNull()
+            if (!shouldCatchUp(settings, System.currentTimeMillis())) return@withLock false
+            val reason = if ((settings?.diagPatrolLastAt ?: 0L) > 0L) "错过周期补跑" else "首次巡检补跑"
+            runCatching { runOnce(context, reason = reason) }
+                .onFailure { AndroidAgentLogger.warn("Diagnostics patrol catch-up failed: type=${it.safeLogType()}") }
+                .isSuccess
         }
     }
+
+    /**
+     * 是否需要补跑巡检（纯函数，便于单测）：开关开着，且从未跑过（lastAt=0，
+     * 与 [DiagnosticsPatrolAlarm.refresh] 把空 lastAt 视为到期的口径一致）或距上次巡检已满一个周期。
+     */
+    internal fun shouldCatchUp(settings: Settings?, now: Long): Boolean {
+        if (settings == null || !settings.diagPatrolEnabled) return false
+        val intervalMs = DiagnosticsPatrolInterval.millis(settings.diagPatrolIntervalMinutes)
+        return settings.diagPatrolLastAt <= 0L || now - settings.diagPatrolLastAt >= intervalMs
+    }
+
+    private val catchUpMutex = Mutex()
 
     /** 最近一次巡检结论的文件（给界面用）。 */
     fun latestReport(): File? = File(BASE_DIR).listFiles()

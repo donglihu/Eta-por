@@ -17,15 +17,21 @@ import io.github.mangi.eta.EtaApp
 import io.github.mangi.eta.R
 import io.github.mangi.eta.agent.device.AgentFileReferenceGateway
 import io.github.mangi.eta.agent.device.RootAccess
+import io.github.mangi.eta.agent.media.AgentChatImageStore
 import io.github.mangi.eta.agent.media.AgentImageCodec
 import io.github.mangi.eta.agent.model.AgentSkillCommandPromptCodec
 import io.github.mangi.eta.agent.skill.SkillRuntime
 import io.github.mangi.eta.agent.model.AgentFileReference
 import io.github.mangi.eta.agent.model.AgentFileReferenceKind
 import io.github.mangi.eta.agent.model.ConversationTitleGenerator
+import io.github.mangi.eta.agent.model.ConversationTitlePolicy
 import io.github.mangi.eta.agent.model.AgentFileReferencePolicy
 import io.github.mangi.eta.agent.model.AgentFileReferencePromptCodec
 import io.github.mangi.eta.agent.model.AgentModelClient
+import io.github.mangi.eta.agent.model.ModelTestDetail
+import io.github.mangi.eta.agent.model.ModelTestResult
+import io.github.mangi.eta.agent.model.ModelTestRunner
+import io.github.mangi.eta.agent.model.ModelTestState
 import io.github.mangi.eta.agent.roleplay.RoleplayBinding
 import io.github.mangi.eta.agent.roleplay.CharacterMacros
 import io.github.mangi.eta.agent.roleplay.CharacterCardCodec
@@ -52,6 +58,8 @@ import io.github.mangi.eta.data.model.ProviderSetting
 import io.github.mangi.eta.data.model.ReasoningEffort
 import io.github.mangi.eta.data.model.enabledModel
 import io.github.mangi.eta.data.repository.EtaBackupRepository
+import io.github.mangi.eta.data.repository.EtaFullBackupArchive
+import io.github.mangi.eta.data.repository.EtaFullBackupSummary
 import io.github.mangi.eta.data.repository.EtaBackupSummary
 import io.github.mangi.eta.data.repository.ProviderRepository
 import io.github.mangi.eta.data.repository.RuntimeConfigRepository
@@ -63,6 +71,7 @@ import io.github.mangi.eta.ui.model.AgentMessageUi
 import io.github.mangi.eta.ui.model.BranchNodeUi
 import io.github.mangi.eta.ui.model.AgentModelPickerProjector
 import io.github.mangi.eta.ui.model.AgentModelPickerUiState
+import io.github.mangi.eta.ui.model.AgentModelOptionUi
 import io.github.mangi.eta.ui.model.AgentCommand
 import io.github.mangi.eta.ui.model.AgentCommandInput
 import io.github.mangi.eta.ui.model.AgentCommandKind
@@ -80,6 +89,8 @@ import io.github.mangi.eta.ui.model.PlanStepUi
 import io.github.mangi.eta.ui.model.PlanStepsCodec
 import io.github.mangi.eta.ui.model.MessageEditUiState
 import io.github.mangi.eta.ui.model.PendingFileReferenceUi
+import io.github.mangi.eta.ui.model.SkillReferenceUi
+import io.github.mangi.eta.ui.model.SkillReferenceKind
 import io.github.mangi.eta.ui.model.PendingImageUi
 import io.github.mangi.eta.ui.model.QueuedMessageUi
 import io.github.mangi.eta.ui.model.SystemNoticeCode
@@ -98,6 +109,7 @@ import io.github.mangi.eta.ui.model.parseAgentCommand
 import java.io.InputStream
 import java.io.OutputStream
 import java.util.UUID
+import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
@@ -255,6 +267,19 @@ internal class AgentAppState(
         private set
 
     var modelPickerState by mutableStateOf(AgentModelPickerUiState())
+        private set
+
+    /**
+     * 每个模型各自的测速状态（key = AgentModelOptionUi.id）。
+     *
+     * miniAI 把结果直接回写在模型行上，因此这里按模型分桶：一次只允许一条在跑，
+     * 结果留在行上直到用户重测或换掉模型列表。
+     */
+    var modelTestStates by mutableStateOf<Map<String, ModelTestState>>(emptyMap())
+        private set
+
+    /** 点红色感叹号要看的失败详情；null 表示没有弹层。 */
+    var modelTestDetail by mutableStateOf<ModelTestDetail?>(null)
         private set
 
     var conversationPaneState by mutableStateOf(
@@ -498,6 +523,10 @@ internal class AgentAppState(
 
     suspend fun exportBackup(output: OutputStream): EtaBackupSummary =
         EtaBackupRepository.export(appContext, output)
+
+    /** 手动全量导出：与自动备份共用 [EtaFullBackupArchive]，把 Linux 容器一起打进包。 */
+    suspend fun exportFullBackup(output: OutputStream, includeLinux: Boolean): EtaFullBackupSummary =
+        EtaFullBackupArchive.export(appContext, output, includeLinuxEnvironment = includeLinux)
 
     suspend fun importBackup(input: InputStream): EtaBackupSummary {
         val locallyBusy = withContext(Dispatchers.Main.immediate) {
@@ -1027,6 +1056,57 @@ internal class AgentAppState(
      * 运行中也能切：当前 run 在启动时已快照模型，这里改的是会话绑定，从下一轮生效。
      * 以前 isStreaming 直接 return，用户只能干等任务结束才能换模型，表现就是「选不了」。
      */
+    fun testModel(model: AgentModelOptionUi) {
+        if (modelTestStates.values.any { it.running }) return
+        modelTestStates = modelTestStates + (model.id to ModelTestState(running = true))
+        val provider = providers.firstOrNull { it.id == model.providerId }
+        if (provider == null) {
+            modelTestStates = modelTestStates + (
+                model.id to ModelTestState(
+                    running = false,
+                    result = ModelTestResult(
+                        success = false,
+                        latencyMs = 0,
+                        message = "未找到模型供应商配置",
+                        errorDetail = "providerId=${model.providerId}",
+                    ),
+                )
+                )
+            return
+        }
+        scope.launch(Dispatchers.IO) {
+            val result = ModelTestRunner.run(provider, model.modelId)
+            withContext(Dispatchers.Main) {
+                modelTestStates = modelTestStates + (model.id to ModelTestState(running = false, result = result))
+            }
+        }
+    }
+
+    /** 点行内红色感叹号：带上模型名打开失败详情，方便一眼看出是哪个模型挂了。 */
+    fun showModelTestDetail(model: AgentModelOptionUi) {
+        val result = modelTestStates[model.id]?.result ?: return
+        modelTestDetail = ModelTestDetail(modelName = model.displayName, result = result)
+    }
+
+    fun dismissModelTestDetail() {
+        modelTestDetail = null
+    }
+
+    /**
+     * 召唤/取消专家后同步 UI 状态。
+     *
+     * 专家本身由 [io.github.mangi.eta.agent.expert.ExpertStore] 落 Prefs，每轮请求开头会重新读，
+     * 所以这里只需要递增一个版本号触发重组，让输入栏图标与会话提示立刻反映新专家，
+     * 不用等下一轮消息回来。
+     */
+    fun refreshExpertBinding() {
+        expertBindingVersion += 1
+    }
+
+    /** 输入栏专家图标的刷新信号；没有实际数据，只用来触发重组。 */
+    var expertBindingVersion by mutableStateOf(0)
+        private set
+
     fun selectModel(modelId: String, notifyNextTurn: Boolean = true) {
         if (
             modelPickerState.isChanging ||
@@ -1469,6 +1549,94 @@ internal class AgentAppState(
         )
     }
 
+    /** 长按技能栏加入会话引用：异步加载 SKILL.md 正文并预格式化成 <skill_command> 块，发送时直接拼接。 */
+    fun attachSkillReference(skillId: String, name: String) {
+        val current = homeState.pendingSkillRefs
+        if (current.any { it.skillId == skillId }) return
+        scope.launch {
+            val block = withContext(Dispatchers.IO) {
+                runCatching {
+                    val entry = SkillRuntime.createIndexService(appContext)
+                        .listSkillsForManagement()
+                        .firstOrNull { it.id == skillId && it.installed }
+                        ?: return@runCatching null
+                    val resolved = SkillRuntime.createLoader(appContext)
+                        .load(entry, "用户长按技能栏加入会话引用")
+                        ?: return@runCatching null
+                    val body = resolved.bodyMarkdown.trim()
+                    val truncated = body.length > AgentSkillCommandPromptCodec.BodyLimit
+                    AgentSkillCommandPromptCodec.format(
+                        skillId = entry.id,
+                        skillName = entry.name,
+                        skillPath = entry.skillFilePath,
+                        body = if (truncated) body.take(AgentSkillCommandPromptCodec.BodyLimit) else body,
+                        truncated = truncated,
+                        request = "",
+                    )
+                }.getOrNull()
+            }
+            if (block == null) {
+                Toast.makeText(
+                    appContext,
+                    appContext.getString(R.string.agent_command_skill_load_failed, name),
+                    Toast.LENGTH_SHORT,
+                ).show()
+                return@launch
+            }
+            val refs = homeState.pendingSkillRefs
+            updateCurrentConversation(
+                homeState.copy(pendingSkillRefs = refs + SkillReferenceUi(skillId, name, block)),
+            )
+            Toast.makeText(
+                appContext,
+                "已把「$name」加入会话引用",
+                Toast.LENGTH_SHORT,
+            ).show()
+        }
+    }
+
+    /** 长按 MCP 服务器加入会话引用：把服务器与可用工具渲染成 <mcp_server> 块，发送时拼在最前。 */
+    fun attachMcpReference(serverId: String, name: String) {
+        if (homeState.pendingSkillRefs.any { it.skillId == serverId && it.kind == SkillReferenceKind.McpServer }) return
+        scope.launch {
+            val block = withContext(Dispatchers.IO) {
+                runCatching {
+                    val server = io.github.mangi.eta.data.repository.McpServerRepository.serverById(serverId)
+                        ?: return@runCatching null
+                    AgentSkillCommandPromptCodec.formatMcpServerReference(
+                        serverId = server.id,
+                        serverName = server.name,
+                        toolNames = server.activeTools.map { it.name },
+                        request = "",
+                    )
+                }.getOrNull()
+            }
+            if (block == null) {
+                Toast.makeText(appContext, "无法读取 MCP 服务器「$name」", Toast.LENGTH_SHORT).show()
+                return@launch
+            }
+            updateCurrentConversation(
+                homeState.copy(
+                    pendingSkillRefs = homeState.pendingSkillRefs + SkillReferenceUi(
+                        skillId = serverId,
+                        name = name,
+                        promptBlock = block,
+                        kind = SkillReferenceKind.McpServer,
+                    ),
+                ),
+            )
+            Toast.makeText(appContext, "已把 MCP「$name」加入会话引用", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    fun removeSkillReference(skillId: String) {
+        val current = homeState.pendingSkillRefs
+        if (current.none { it.skillId == skillId }) return
+        updateCurrentConversation(
+            homeState.copy(pendingSkillRefs = current.filterNot { it.skillId == skillId }),
+        )
+    }
+
     private fun buildMessageReferenceBlock(
         references: List<MessageReferenceUi>,
         messages: List<AgentChatMessageUi>,
@@ -1773,6 +1941,7 @@ internal class AgentAppState(
             pendingImages = emptyList(),
             pendingFileReferences = emptyList(),
             pendingMessageRefs = emptyList(),
+            pendingSkillRefs = emptyList(),
             queuedMessages = emptyList(),
             messageEdit = null,
             isStreaming = false,
@@ -2273,10 +2442,14 @@ internal class AgentAppState(
         }
         // @ 引用：把被引用的历史消息以摘录形式放在正文前面，明确标出是谁说的第几条。
         val referenceBlock = buildMessageReferenceBlock(homeState.pendingMessageRefs, homeState.messages)
-        val prompt = (referenceBlock + typedPrompt).trim()
+        // 技能引用：把长按加入的 SKILL.md 正文块拼在最前。
+        val skillBlock = homeState.pendingSkillRefs.joinToString("\n\n") { it.promptBlock }.trim()
+        val prompt = listOf(skillBlock, referenceBlock, typedPrompt).filter { it.isNotBlank() }
+            .joinToString("\n\n").trim()
         val pendingImages = homeState.pendingImages
         val pendingFileReferences = homeState.pendingFileReferences
-        if (prompt.isBlank() && pendingImages.isEmpty() && pendingFileReferences.isEmpty()) {
+        val pendingSkillRefs = homeState.pendingSkillRefs
+        if (prompt.isBlank() && pendingImages.isEmpty() && pendingFileReferences.isEmpty() && pendingSkillRefs.isEmpty()) {
             return
         }
         homeState.messageEdit?.takeIf { it.preserveFollowingMessages }?.let { edit ->
@@ -2285,6 +2458,7 @@ internal class AgentAppState(
                 input = edit.previousInput,
                 pendingImages = edit.previousImages,
                 pendingFileReferences = edit.previousFileReferences,
+                pendingSkillRefs = edit.previousSkillRefs,
                 messageEdit = null,
             ))
             refreshConversationSummaries()
@@ -2450,7 +2624,7 @@ internal class AgentAppState(
         }
         val userHistoryMessage = AgentModelClient.buildUserHistoryMessage(
             // 正文只在当轮注入：历史里压成一行标记，避免之后每轮都重复几 k 字符。
-            text = AgentSkillCommandPromptCodec.compactForHistory(runtimePrompt),
+            text = AgentFileReferencePromptCodec.compactForHistory(runtimePrompt),
             images = pendingImages.toHistoryImages(),
         ).copy(messageId = userMessage.id)
 
@@ -2505,6 +2679,7 @@ internal class AgentAppState(
                 pendingImages = emptyList(),
                 pendingFileReferences = emptyList(),
                 pendingMessageRefs = emptyList(),
+                pendingSkillRefs = emptyList(),
                 messageEdit = null,
             ),
             reasoningEffort = state.reasoningEffort,
@@ -2543,16 +2718,29 @@ internal class AgentAppState(
                 reference = reference,
             )
         }
+        // 被编辑消息里原本带的技能块要回填到输入条，否则「编辑后重新发送」会把技能悄悄丢掉。
+        val editingSkillRefs = AgentSkillCommandPromptCodec.parseReferenceBlocks(parsedPrompt.request)
+            .filter { it.kind == AgentSkillCommandPromptCodec.ReferenceBlockKind.Skill }
+            .map { block ->
+                SkillReferenceUi(
+                    skillId = block.id,
+                    name = block.name.ifBlank { block.id },
+                    promptBlock = block.raw,
+                )
+            }
         updateCurrentConversation(
             homeState.copy(
                 input = parsedPrompt.request,
                 pendingImages = images,
                 pendingFileReferences = fileReferences,
+                pendingSkillRefs = editingSkillRefs,
                 messageEdit = MessageEditUiState(
                     targetMessageId = boundary.userMessage.id,
                     previousInput = homeState.input,
                     previousImages = homeState.pendingImages,
                     previousFileReferences = homeState.pendingFileReferences,
+                    previousSkillRefs = homeState.pendingSkillRefs,
+                    editingSkillRefs = editingSkillRefs,
                     hasLaterTurns = boundary.laterTurnCount > 0,
                 ),
             )
@@ -2567,6 +2755,7 @@ internal class AgentAppState(
                 input = edit.previousInput,
                 pendingImages = edit.previousImages,
                 pendingFileReferences = edit.previousFileReferences,
+                pendingSkillRefs = edit.previousSkillRefs,
                 messageEdit = null,
             )
         )
@@ -2651,7 +2840,7 @@ internal class AgentAppState(
         }
         val runId = "run-${UUID.randomUUID()}"
         val userHistoryMessage = AgentModelClient.buildUserHistoryMessage(
-            text = AgentSkillCommandPromptCodec.compactForHistory(boundary.userMessage.content),
+            text = AgentFileReferencePromptCodec.compactForHistory(boundary.userMessage.content),
             images = images.toHistoryImages(),
         )
         if (boundary.contextWasCompacted) showCompactedRevisionNotice()
@@ -2860,10 +3049,13 @@ internal class AgentAppState(
 
     private fun List<PendingImageUi>.toHistoryImages(): List<AgentModelClient.ModelImage> =
         map { image ->
+            // 路径引用（落盘后的历史消息回填）必须先物化成 provider 引用：
+            // AgentConversationCodec.userMessage 要求 http/data 引用，路径直接进去会抛异常。
+            val reference = AgentChatImageStore.toProviderDataUrl(appContext, image.dataUrl)
             AgentModelClient.ModelImage(
-                reference = image.dataUrl,
+                reference = reference,
                 mimeType = image.mimeType,
-                bytes = image.dataUrl.length,
+                bytes = reference.length,
                 source = image.uri,
             )
         }
@@ -2873,22 +3065,21 @@ internal class AgentAppState(
             ?.substringAfter("data:")
             ?.substringBefore(';')
             ?.takeIf { it.startsWith("image/") }
-            ?: "image/jpeg"
+            // 落盘后的路径引用按扩展名反推，拿不到就按 JPEG 兜底。
+            ?: AgentChatImageStore.mimeForReference(this)
 
-    private fun String.defaultConversationTitle(): String =
-        lineSequence().firstOrNull().orEmpty().trim().take(MAX_TITLE_CHARS)
-
+    /**
+     * 标题派生统一走 [ConversationTitlePolicy]：先剥掉文件引用块与斜杠命令注入的技能块，
+     * 再取首行截断。历史上这里直接对原始 prompt 取首行，`/pua …` 的标题就变成
+     * `<skill_command id="pua"` 这种标签残片。
+     */
     private fun defaultConversationTitle(
         request: String,
         references: List<AgentFileReference>,
-    ): String = AgentFileReferencePolicy
-        .titleSource(request, references)
-        .defaultConversationTitle()
+    ): String = ConversationTitlePolicy.fromPrompt(request, references)
 
-    private fun String.defaultConversationTitleFromMessage(): String {
-        val parsed = AgentFileReferencePromptCodec.parse(this)
-        return defaultConversationTitle(parsed.request, parsed.references)
-    }
+    private fun String.defaultConversationTitleFromMessage(): String =
+        ConversationTitlePolicy.fromMessage(this)
 
     private fun showCompactedRevisionNotice() {
         Toast.makeText(
@@ -2914,12 +3105,49 @@ internal class AgentAppState(
     fun attachImage(uri: String) {
         scope.launch(Dispatchers.IO) {
             try {
-                val image = AgentImageCodec.fromReference(
+                val staged = AgentImageCodec.stageAttachment(
                     context = appContext,
                     value = uri,
                     source = "user_attach",
                 )
-                if (image == null) {
+                val image = when (staged) {
+                    is AgentImageCodec.StageResult.Success -> staged.image
+                    AgentImageCodec.StageResult.InsufficientStorage -> {
+                        io.github.mangi.eta.core.EtaTrace.log(
+                            "image.attach",
+                            "action=stage_failed reason=insufficient_storage source=user_attach",
+                        )
+                        withContext(Dispatchers.Main) {
+                            Toast.makeText(
+                                appContext,
+                                appContext.getString(R.string.capability_import_insufficient_storage),
+                                Toast.LENGTH_SHORT,
+                            ).show()
+                        }
+                        return@launch
+                    }
+                    AgentImageCodec.StageResult.InvalidImage -> {
+                        io.github.mangi.eta.core.EtaTrace.log(
+                            "image.attach",
+                            "action=stage_failed reason=invalid_image source=user_attach",
+                        )
+                        withContext(Dispatchers.Main) {
+                            Toast.makeText(
+                                appContext,
+                                appContext.getString(R.string.state_ui_unable_to_read_this_image_please_try_again_or_us_d94978),
+                                Toast.LENGTH_SHORT,
+                            ).show()
+                        }
+                        return@launch
+                    }
+                }
+                val preview = AgentImageCodec.previewFromReference(appContext, image)
+                if (preview == null) {
+                    deleteStagedAttachmentIfLocal(image.reference)
+                    io.github.mangi.eta.core.EtaTrace.log(
+                        "image.attach",
+                        "action=preview_failed bytes=${image.bytes} size=${image.width}x${image.height}",
+                    )
                     withContext(Dispatchers.Main) {
                         Toast.makeText(
                             appContext,
@@ -2929,10 +3157,15 @@ internal class AgentAppState(
                     }
                     return@launch
                 }
-                val preview = AgentImageCodec.previewFromReference(appContext, image) ?: image
+                io.github.mangi.eta.core.EtaTrace.log(
+                    "image.attach",
+                    "action=staged bytes=${image.bytes} size=${image.width}x${image.height} " +
+                        "preview_bytes=${preview.bytes} preview_size=${preview.width}x${preview.height}",
+                )
                 val pending = PendingImageUi(
                     id = "img-${UUID.randomUUID()}",
-                    // 后续发送使用首次读取后的稳定引用，不再依赖 ROM Photo Picker URI 的授权生命周期。
+                    // 后续发送直接对私有暂存文件开只读 fd 零拷贝传输，既脱离 Photo Picker URI 生命周期，
+                    // 也不在 UI 堆内存中囤积整张原图的 Base64。
                     uri = image.reference,
                     dataUrl = preview.reference,
                     mimeType = image.mimeType,
@@ -2951,6 +3184,23 @@ internal class AgentAppState(
                     }
                 }
             }
+        }
+    }
+
+    /** 暂存回滚：只删私有暂存目录里的文件，URI、远程引用与其它路径原样不动。 */
+    private fun deleteStagedAttachmentIfLocal(reference: String) {
+        // 用父目录 canonical 比对，而不是恒真的 startsWith("/")：只有暂存目录里的文件才归回滚管。
+        val stagingDirectory = runCatching {
+            java.io.File(appContext.filesDir, "agent-attachments/images").canonicalFile
+        }.getOrNull() ?: return
+        val target = runCatching { java.io.File(reference).canonicalFile }.getOrNull() ?: return
+        if (target.parentFile != stagingDirectory) return
+        runCatching { target.delete() }.onFailure { failure ->
+            // 回滚删不掉只留日志：不静默吞掉，但也不能盖掉真正的暂存失败原因。
+            io.github.mangi.eta.core.EtaTrace.log(
+                "image.attach",
+                "action=rollback_delete_failed type=${failure.javaClass.simpleName}",
+            )
         }
     }
 
@@ -3020,7 +3270,7 @@ internal class AgentAppState(
                 (resolution as? AgentFileReferenceGateway.Resolution.Success)?.reference
             }
             val failures = resolutions.mapNotNull { resolution ->
-                (resolution as? AgentFileReferenceGateway.Resolution.Failure)?.error
+                resolution as? AgentFileReferenceGateway.Resolution.Failure
             }
             withContext(Dispatchers.Main) {
                 if (ownerVersion != fileAttachmentOwnerVersion) {
@@ -3075,8 +3325,8 @@ internal class AgentAppState(
         }
     }
 
-    private val AgentFileReferenceGateway.Error.userMessage: String
-        get() = when (this) {
+    private val AgentFileReferenceGateway.Resolution.Failure.userMessage: String
+        get() = when (error) {
             AgentFileReferenceGateway.Error.UnsupportedDocumentProvider ->
                 appContext.getString(R.string.capability_import_denied)
             AgentFileReferenceGateway.Error.InvalidPath -> appContext.getString(R.string.state_ui_please_enter_a_valid_absolute_path_6afeb4)
@@ -3086,7 +3336,10 @@ internal class AgentAppState(
             AgentFileReferenceGateway.Error.RootUnavailable -> appContext.getString(R.string.state_ui_root_is_not_available_and_the_path_cannot_be_ver_fc4c81)
             AgentFileReferenceGateway.Error.AccessDenied -> appContext.getString(R.string.capability_import_denied)
             AgentFileReferenceGateway.Error.ImportFailed -> appContext.getString(R.string.capability_import_failed)
-            AgentFileReferenceGateway.Error.ImportTooLarge -> appContext.getString(R.string.capability_import_too_large)
+            AgentFileReferenceGateway.Error.ImportTooLarge -> appContext.getString(
+                R.string.capability_import_too_large,
+                formatImportLimit(limitBytes),
+            )
             AgentFileReferenceGateway.Error.ValidationTimedOut -> appContext.getString(R.string.state_ui_path_verification_timed_out_please_try_again_703687)
         }
 
@@ -3103,6 +3356,17 @@ internal class AgentAppState(
     /** 停止指定 run；非当前会话的 run 也能停。 */
     private fun stopRun(runId: String) {
         if (!stopRequestedRunIds.add(runId)) return
+        // 用户主动停止必须留痕：applyRunResult 里 explicitlyStoppedByUser = userStoppedRunIds.remove(runId)，
+        // 以前这个集合只有声明和 remove、从来没有 add，判据恒 false，
+        // 停止后队列补发／摘要分支只能靠错误字符串猜，容易判错。显式标记比字符串比较可靠。
+        userStoppedRunIds.add(runId)
+        // 乐观回落：停止是用户明确动作，界面必须立刻给反馈。运行时侧已经改成「一收到 MSG_CANCEL
+        // 就发布终态」（见 Service.cancelRun），但回执还要走一条 Binder + 主线程，这期间按钮和
+        // 骨架继续挂在「运行中」，体感就是点了没反应。这里只改流式标记：消息内容、runId 归属、
+        // stopRequestedRunIds 的补发逻辑都不动，真结果回来后 applyRunResult 负责最终对齐。
+        // 先把攒着的增量刷掉，避免这次回落吃掉还没上屏的文本。
+        flushPendingRunDelta(runId)
+        setConversationStreaming(runId, false)
         scope.launch(Dispatchers.IO) {
             AgentRuntimeClient(appContext, AndroidAgentLogger).cancelRun(runId)
         }
@@ -3214,8 +3478,9 @@ internal class AgentAppState(
             is AgentEvent.UserSupplementReceived ->
                 insertSupplementMessage(runId, event.index, event.text, persist = persistSupplement)
             // 计划清单跟着产出走：只更新状态，不推进会话时间戳（和流式增量同级）。
-            // 空清单是「新一轮开始，上一轮作废」的显式信号（运行中插话时会下发），必须照收，
-            // 否则面板会一直挂着上一轮的旧步骤，看着像开关没生效。
+            // 空清单＝上一轮作废（旧版本运行时兼容信号），照收防止面板挂旧步骤。
+            // 运行中插话不再下发空清单（2026-11-20：插话会抹掉用户正在看的执行清单），
+            // 旧清单等新一轮 update_plan 自然替换。
             is AgentEvent.PlanUpdated -> conversationIdForRun(runId)?.let { id ->
                 val steps = PlanStepsCodec.decode(event.stepsJson)
                 val existing = conversationsById[id]
@@ -3549,6 +3814,13 @@ internal class AgentAppState(
         retainPendingSupplements: Boolean = snapshot != null,
     ) {
         val conversationId = conversationIdForRun(runId) ?: return
+        // 归属判定：只有「该会话当前登记的 run」才能把自己的 transcript 并进 history。
+        // 点停止后 isStreaming 被乐观置假，用户立刻发下一条就登记了新 run，
+        // 旧 run 的迟到结果若照常落入，AgentRuntimeHistoryReducer.apply 会走
+        // state.history + additions，把旧 transcript 追加到新 user 消息之后（顺序错乱）。
+        // 与 setConversationStreaming 用同一个 gate，两处口径一致。
+        val owner = conversationRuns.runIdOf(conversationId)
+        if (owner != null && owner != runId) return
         val state = conversationsById[conversationId] ?: return
         val outcome = AgentRuntimeHistoryReducer.apply(state, runId, additions, snapshot, retainPendingSupplements)
         if (!outcome.alreadyApplied) updateConversation(conversationId, outcome.state)
@@ -3618,8 +3890,19 @@ internal class AgentAppState(
     }
 
     private fun setConversationStreaming(runId: String, isStreaming: Boolean) {
-        if (!isStreaming) RunControl.clearRun(runId, "ui.finished")
         val conversationId = conversationIdForRun(runId) ?: return
+        if (!isStreaming) {
+            // 归属判定：旧 run 的迟到结果不能把「已经接管这个会话」的新 run 的流式位清掉，
+            // 否则按钮从停止变回发送、用户再发就又起第三个 run；取消路径上
+            // contextSnapshot 缺失时 AgentRuntimeHistoryReducer.apply 还会走
+            // state.history + additions，把旧 transcript 追加到新 user 消息之后（顺序错乱）。
+            // 同一时刻只让「该会话当前登记的 run」自己收尾。
+            val owner = conversationRuns.runIdOf(conversationId)
+            if (owner != null && owner != runId) return
+            // 只清自己这一个 run 的控制位：符合 RunControl「写入只发生在执行侧」的契约，
+            // 也不再无条件清（旧写法会把新 run 的暂停/归属记录一起抹掉）。
+            RunControl.clearRun(runId, "ui.finished")
+        }
         val state = conversationsById[conversationId] ?: return
         updateConversation(conversationId, state.copy(isStreaming = isStreaming, isCompacting = state.isCompacting && isStreaming))
     }
@@ -3850,7 +4133,6 @@ internal class AgentAppState(
 
     private companion object {
         const val MAX_PINNED_CONVERSATIONS = 3
-        const val MAX_TITLE_CHARS = 24
         const val MAX_PREVIEW_CHARS = 48
         const val LEGACY_STOPPED_ERROR = "已停止"
         const val SYNTHETIC_STATUS_STOPPED = "eta_status:stopped"
@@ -3910,3 +4192,20 @@ private const val MessageReferenceInlineLimit = 800
 
 /** 一次最多引用几条，避免把上下文塞满。 */
 private const val MessageReferenceLimit = 3
+
+private const val ImportLimitMibBytes = 1L * 1024 * 1024
+private const val ImportLimitGibBytes = 1L * 1024 * 1024 * 1024
+
+/**
+ * 把导入上限的字节数渲染成可直接进文案的可读体积。
+ *
+ * 上限现在按工作区分区可用空间算（见 [AgentFileReferenceGateway.computeImportLimit]），
+ * 所以文案里不能再写死固定体积，只能把本次算出来的上限显示出来，让用户知道是空间不够而不是
+ * 有个常数阈值。`limitBytes` 只在超限分支上一定非空，为空时给 0 值占位，不改变文案结构。
+ */
+private fun formatImportLimit(limitBytes: Long?): String = when {
+    limitBytes == null || limitBytes < ImportLimitMibBytes -> "0 MiB"
+    limitBytes >= ImportLimitGibBytes ->
+        String.format(Locale.US, "%.1f GiB", limitBytes.toDouble() / ImportLimitGibBytes)
+    else -> String.format(Locale.US, "%.0f MiB", limitBytes.toDouble() / ImportLimitMibBytes)
+}

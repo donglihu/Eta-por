@@ -109,6 +109,8 @@ class AgentSkillCommandTest {
             request = "记住这次的坑",
         )
         assertTrue(content.contains("<skill_command"))
+        assertTrue(content.contains("先按其契约进入该技能规定的工作模式"))
+        assertTrue(content.contains("不得省略它声明的强制条款"))
         assertEquals("记住这次的坑", AgentSkillCommandPromptCodec.strip(content))
     }
 

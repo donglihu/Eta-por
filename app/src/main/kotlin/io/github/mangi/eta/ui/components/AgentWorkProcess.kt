@@ -150,15 +150,17 @@ private fun AgentWorkHeader(
     expanded: Boolean,
     onClick: () -> Unit,
 ) {
-    val runningTool = messages.lastOrNull { message ->
-        message is ToolActivityMessageUi && message.status == ToolActivityStatusUi.Running
-    } as? ToolActivityMessageUi
+    // 一次遍历同时拿到「正在跑的那次调用」和「第 N 步」，不再各扫一遍列表。
+    // 序号按轮单调递增（见 runningStepSummary）：并行批次里先完成的调用不会把数字往回拖。
+    val step = remember(messages) { messages.runningStepSummary() }
+    val runningTool = step.running
+    val runningStepOrdinal = step.ordinal
     val summary = remember(messages) { messages.workSummary() }
     val text = when {
         runningTool != null -> pluralStringResource(
             R.plurals.work_processing_step,
-            summary.toolCount,
-            summary.toolCount,
+            runningStepOrdinal,
+            runningStepOrdinal,
         ) + " · " + runningTool.argumentsSummary.ifBlank { toolDisplayName(runningTool.toolName) }
         working -> stringResource(R.string.work_analyzing)
         else -> workSummaryText(summary)

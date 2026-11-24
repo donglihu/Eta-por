@@ -27,10 +27,19 @@ sealed interface AppRoute : NavKey {
     data object Skills : AppRoute
 
     @Serializable
+    data object SkillStore : AppRoute
+
+    @Serializable
     data object Subagents : AppRoute
 
     @Serializable
     data object Characters : AppRoute
+
+    @Serializable
+    data object ExpertCenter : AppRoute
+
+    @Serializable
+    data class ExpertDetail(val expertName: String) : AppRoute
 
     @Serializable
     data class CharacterDetail(val characterId: String) : AppRoute
@@ -87,6 +96,9 @@ sealed interface AppRoute : NavKey {
 
     @Serializable
     data object DiagnosticsCenter : AppRoute
+
+    @Serializable
+    data object LogViewer : AppRoute
 
     @Serializable
     data object DiagnosticsPatrol : AppRoute
