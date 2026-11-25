@@ -12,6 +12,7 @@ import androidx.compose.material.icons.rounded.IosShare
 import androidx.compose.material.icons.rounded.Terminal
 import androidx.compose.material.icons.rounded.ViewAgenda
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -25,6 +26,7 @@ import io.github.mangi.eta.R
 import io.github.mangi.eta.agent.model.AgentRequestSnapshot
 import io.github.mangi.eta.agent.model.AgentSnapshotAnalysis
 import io.github.mangi.eta.agent.model.SegmentChangeState
+import io.github.mangi.eta.agent.model.SnapshotDiff
 import io.github.mangi.eta.agent.model.SystemSegmentKind
 import io.github.mangi.eta.ui.components.EtaArrowPreference
 import io.github.mangi.eta.ui.components.EtaActionPreference
@@ -38,6 +40,8 @@ import io.github.mangi.eta.ui.components.MiuixScaffoldPage
 import top.yukonga.miuix.kmp.basic.Text
 import top.yukonga.miuix.kmp.theme.MiuixTheme
 import java.io.File
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 
 /**
  * 快照详情：概览 → 与基准的差异 → system 分段 → 工具清单。
@@ -50,48 +54,101 @@ internal fun PromptSnapshotDetailScreen(
     onBack: () -> Unit,
 ) {
     val context = LocalContext.current
-    val file = remember(fileName) { AgentRequestSnapshot.list().firstOrNull { it.name == fileName } }
-    val json = remember(fileName) { file?.let(AgentRequestSnapshot::read) }
+    // 当前快照与基准差异：全部在后台线程计算（list/read 是磁盘 IO + 全树 JSON 解析，单份约 107KB），
+    // 避免 Activity 重建（SAF 文档选择器打开期间旋转/暗色切换/系统回收）后主线程重算阻塞导致「跳转文件夹卡住」。
+    var file by remember { mutableStateOf<File?>(null) }
+    var json by remember { mutableStateOf<org.json.JSONObject?>(null) }
+    var baseJson by remember { mutableStateOf<org.json.JSONObject?>(null) }
+    var diff by remember { mutableStateOf<SnapshotDiff?>(null) }
+    var loaded by remember { mutableStateOf(false) }
     var baseName by remember { mutableStateOf(AgentRequestSnapshot.baseName()) }
     var expandedSegment by remember { mutableStateOf<Int?>(null) }
     var showTools by remember { mutableStateOf(false) }
     // 导出目标只用文件名持有，跨 Activity 重建（SAF 文档选择器可能触发）不丢；
     // 重建后文件本体可能已被 prune 淘汰，回调时重新按名取，取不到则按失败处理。
     var pendingExportName by rememberSaveable { mutableStateOf<String?>(null) }
+    // SAF 选择器返回的 uri：先暂存，交给 LaunchedEffect 在 suspend 环境里执行 IO 复制，
+    // 避免在 rememberLauncherForActivityResult 的普通回调里直接调用 suspend 的 withContext。
+    var pendingExportUri by remember { mutableStateOf<android.net.Uri?>(null) }
+
+    // 后台加载当前快照 + 基准；baseName 变化（点「设为基准/清除」）时因 key 变化自动重算。
+    LaunchedEffect(fileName, baseName) {
+        val result = withContext(Dispatchers.Default) {
+            val current = AgentRequestSnapshot.list().firstOrNull { it.name == fileName }
+            val currentJson = current?.let(AgentRequestSnapshot::read)
+            val base = if (baseName == null || baseName == fileName || currentJson == null) {
+                null
+            } else {
+                AgentRequestSnapshot.list().firstOrNull { it.name == baseName }?.let(AgentRequestSnapshot::read)
+            }
+            val diffResult = if (base != null && currentJson != null) {
+                AgentSnapshotAnalysis.diff(base, currentJson)
+            } else {
+                null
+            }
+            SnapshotDetailData(current, currentJson, base, diffResult)
+        }
+        file = result.file
+        json = result.json
+        baseJson = result.baseJson
+        diff = result.diff
+        loaded = true
+    }
 
     val exportLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.CreateDocument("application/json"),
     ) { uri ->
+        // 只暂存 uri，实际导出交给 LaunchedEffect(pendingExportUri) 在协程里做 IO，不阻塞主线程。
+        pendingExportUri = uri
+    }
+
+    // 导出执行器：suspend 环境，取文件（Default）→ 流式复制（IO）→ 回主线程 toast。
+    LaunchedEffect(pendingExportUri) {
+        val uri = pendingExportUri ?: return@LaunchedEffect
         val targetName = pendingExportName
         pendingExportName = null
-        if (uri == null || targetName == null) return@rememberLauncherForActivityResult
-        val target = AgentRequestSnapshot.list().firstOrNull { it.name == targetName }
-            ?: run {
-                toast(context, context.getString(R.string.prompt_snapshot_export_failed))
-                return@rememberLauncherForActivityResult
-            }
+        pendingExportUri = null
+        if (targetName == null) {
+            toast(context, context.getString(R.string.prompt_snapshot_export_failed))
+            return@LaunchedEffect
+        }
+        // 重建后文件本体可能已被 prune 淘汰，重新按名取（后台线程，避免主线程 IO）。
+        val target = withContext(Dispatchers.Default) {
+            AgentRequestSnapshot.list().firstOrNull { it.name == targetName }
+        }
+        if (target == null) {
+            toast(context, context.getString(R.string.prompt_snapshot_export_failed))
+            return@LaunchedEffect
+        }
         val ok = runCatching {
             val output = context.contentResolver.openOutputStream(uri)
             if (output == null) {
                 false
             } else {
-                // 流式复制：避免 readBytes() 在主线程一次性分配整个文件的 byte[]。
-                target.inputStream().use { input -> output.use { input.copyTo(it) } }
+                // 流式复制在 IO 线程：避免主线程分配/复制整个文件的 byte[]，也避免阻塞 SAF 返回后的界面。
+                withContext(Dispatchers.IO) {
+                    target.inputStream().use { input -> output.use { input.copyTo(it) } }
+                }
                 true
             }
         }.getOrDefault(false)
         toast(context, context.getString(if (ok) R.string.prompt_snapshot_exported else R.string.prompt_snapshot_export_failed))
     }
 
-    val baseJson = remember(baseName, fileName) {
-        if (baseName == null || baseName == fileName) {
-            null
-        } else {
-            AgentRequestSnapshot.list().firstOrNull { it.name == baseName }?.let(AgentRequestSnapshot::read)
+    if (!loaded) {
+        MiuixScaffoldPage(title = stringResource(R.string.prompt_snapshot_detail_title), onBack = onBack) {
+            item(key = "loading") {
+                EtaPreferenceGroup(modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp)) {
+                    Text(
+                        text = stringResource(R.string.prompt_snapshot_loading),
+                        style = MiuixTheme.textStyles.footnote2,
+                        color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                        modifier = Modifier.padding(16.dp),
+                    )
+                }
+            }
         }
-    }
-    val diff = remember(baseJson, json) {
-        if (baseJson != null && json != null) AgentSnapshotAnalysis.diff(baseJson, json) else null
+        return
     }
 
     if (json == null) {
@@ -109,10 +166,12 @@ internal fun PromptSnapshotDetailScreen(
         }
         return
     }
+    // json 是 delegated property，不能 smart cast；用本地非空引用，编译器才能推断 JSONObject。
+    val jsonData = json ?: return
 
-    val counts = json.optJSONObject("counts")
-    val system = json.optJSONArray("system")
-    val tools = json.optJSONArray("tools")
+    val counts = jsonData.optJSONObject("counts")
+    val system = jsonData.optJSONArray("system")
+    val tools = jsonData.optJSONArray("tools")
 
     MiuixScaffoldPage(
         title = stringResource(R.string.prompt_snapshot_detail_title),
@@ -127,15 +186,15 @@ internal fun PromptSnapshotDetailScreen(
                     Text(
                         text = stringResource(
                             R.string.prompt_snapshot_row_title,
-                            formatPromptTime(json.optLong("at")),
-                            kindLabel(AgentSnapshotAnalysis.kindOf(json)),
+                            formatPromptTime(jsonData.optLong("at")),
+                            kindLabel(AgentSnapshotAnalysis.kindOf(jsonData)),
                         ),
                         style = MiuixTheme.textStyles.body2,
                     )
                     Text(
                         text = stringResource(
                             R.string.prompt_snapshot_overview_meta,
-                            json.optString("model"),
+                            jsonData.optString("model"),
                             counts?.optInt("system") ?: 0,
                             counts?.optInt("system_chars") ?: 0,
                             counts?.optInt("tools") ?: 0,
@@ -185,6 +244,8 @@ internal fun PromptSnapshotDetailScreen(
         }
 
         if (diff != null) {
+            // diff 是 delegated property，不能 smart cast；用本地非空引用（外层 if 已保证非空）。
+            val diffData = diff!!
             item(key = "diff_title") {
                 EtaPreferenceGroupTitle(stringResource(R.string.prompt_snapshot_diff_group))
             }
@@ -194,14 +255,14 @@ internal fun PromptSnapshotDetailScreen(
                         Text(
                             text = stringResource(
                                 R.string.prompt_snapshot_diff_headline,
-                                diff.systemCountAfter - diff.systemCountBefore,
-                                diff.systemCharsAfter - diff.systemCharsBefore,
-                                diff.toolsAfter - diff.toolsBefore,
+                                diffData.systemCountAfter - diffData.systemCountBefore,
+                                diffData.systemCharsAfter - diffData.systemCharsBefore,
+                                diffData.toolsAfter - diffData.toolsBefore,
                             ),
                             style = MiuixTheme.textStyles.body2,
                             color = EtaPreferenceColors.Blue,
                         )
-                        if (diff.identical) {
+                        if (diffData.identical) {
                             Text(
                                 text = stringResource(R.string.prompt_snapshot_diff_same),
                                 style = MiuixTheme.textStyles.footnote2,
@@ -209,7 +270,7 @@ internal fun PromptSnapshotDetailScreen(
                                 modifier = Modifier.padding(top = 4.dp),
                             )
                         }
-                        diff.systemChanges.forEach { change ->
+                        diffData.systemChanges.forEach { change ->
                             Text(
                                 text = stringResource(
                                     R.string.prompt_snapshot_diff_segment,
@@ -227,27 +288,27 @@ internal fun PromptSnapshotDetailScreen(
                                 modifier = Modifier.padding(top = 4.dp),
                             )
                         }
-                        if (diff.unchangedSegments > 0) {
+                        if (diffData.unchangedSegments > 0) {
                             Text(
-                                text = stringResource(R.string.prompt_snapshot_diff_unchanged, diff.unchangedSegments),
+                                text = stringResource(R.string.prompt_snapshot_diff_unchanged, diffData.unchangedSegments),
                                 style = MiuixTheme.textStyles.footnote2,
                                 color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
                                 modifier = Modifier.padding(top = 4.dp),
                             )
                         }
                     }
-                    if (diff.toolsRemoved.isNotEmpty()) {
+                    if (diffData.toolsRemoved.isNotEmpty()) {
                         EtaPreferenceDivider(hasLeading = true)
                         Column(modifier = Modifier.fillMaxWidth().padding(16.dp)) {
                             Text(
-                                text = stringResource(R.string.prompt_snapshot_diff_tools_removed, diff.toolsRemoved.size),
+                                text = stringResource(R.string.prompt_snapshot_diff_tools_removed, diffData.toolsRemoved.size),
                                 style = MiuixTheme.textStyles.body2,
                                 color = EtaPreferenceColors.Orange,
                             )
                             Text(
-                                text = diff.toolsRemoved.take(NAME_LIMIT).joinToString("、") +
-                                    if (diff.toolsRemoved.size > NAME_LIMIT) {
-                                        " 等 ${diff.toolsRemoved.size} 个"
+                                text = diffData.toolsRemoved.take(NAME_LIMIT).joinToString("、") +
+                                    if (diffData.toolsRemoved.size > NAME_LIMIT) {
+                                        " 等 ${diffData.toolsRemoved.size} 个"
                                     } else {
                                         ""
                                     },
@@ -257,34 +318,34 @@ internal fun PromptSnapshotDetailScreen(
                             )
                         }
                     }
-                    if (diff.toolsAdded.isNotEmpty()) {
+                    if (diffData.toolsAdded.isNotEmpty()) {
                         EtaPreferenceDivider(hasLeading = true)
                         Column(modifier = Modifier.fillMaxWidth().padding(16.dp)) {
                             Text(
-                                text = stringResource(R.string.prompt_snapshot_diff_tools_added, diff.toolsAdded.size),
+                                text = stringResource(R.string.prompt_snapshot_diff_tools_added, diffData.toolsAdded.size),
                                 style = MiuixTheme.textStyles.body2,
                                 color = EtaPreferenceColors.Green,
                             )
                             Text(
-                                text = diff.toolsAdded.take(NAME_LIMIT).joinToString("、"),
+                                text = diffData.toolsAdded.take(NAME_LIMIT).joinToString("、"),
                                 style = MiuixTheme.textStyles.footnote2,
                                 color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
                                 modifier = Modifier.padding(top = 4.dp),
                             )
                         }
                     }
-                    if (diff.toolDescRewritten.isNotEmpty()) {
+                    if (diffData.toolDescRewritten.isNotEmpty()) {
                         EtaPreferenceDivider(hasLeading = true)
                         Column(modifier = Modifier.fillMaxWidth().padding(16.dp)) {
                             Text(
                                 text = stringResource(
                                     R.string.prompt_snapshot_diff_tools_rewritten,
-                                    diff.toolDescRewritten.size,
+                                    diffData.toolDescRewritten.size,
                                 ),
                                 style = MiuixTheme.textStyles.body2,
                             )
                             val rewrittenParts = mutableListOf<String>()
-                            for (change in diff.toolDescRewritten.take(NAME_LIMIT)) {
+                            for (change in diffData.toolDescRewritten.take(NAME_LIMIT)) {
                                 rewrittenParts += stringResource(
                                     R.string.prompt_snapshot_diff_tools_rewritten_item,
                                     change.name,
@@ -383,5 +444,12 @@ private fun systemText(system: org.json.JSONArray?): String = buildString {
         append("\n\n")
     }
 }
+
+private data class SnapshotDetailData(
+    val file: File?,
+    val json: org.json.JSONObject?,
+    val baseJson: org.json.JSONObject?,
+    val diff: SnapshotDiff?,
+)
 
 private const val NAME_LIMIT = 10

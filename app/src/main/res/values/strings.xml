@@ -2128,6 +2128,7 @@
   <string name="prompt_snapshot_manage">管理与清理</string>
   <string name="prompt_snapshot_manage_summary">当前 %1$d 份 · 保留上限 %2$d 份</string>
   <string name="prompt_snapshot_missing">这份快照已被清理或不存在</string>
+  <string name="prompt_snapshot_loading">正在读取快照…</string>
   <string name="prompt_snapshot_open">请求快照</string>
   <string name="prompt_snapshot_open_summary">看每轮真正发出的 system 与工具描述，可对比切换预设前后</string>
   <string name="prompt_snapshot_overview_group">概览</string>
