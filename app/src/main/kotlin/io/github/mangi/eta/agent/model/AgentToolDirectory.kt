@@ -1,6 +1,7 @@
 package io.github.mangi.eta.agent.model
 
 import io.github.mangi.eta.agent.prompt.AgentToolPolicy
+import io.github.mangi.eta.agent.tool.AgentToolAvailability
 import io.github.mangi.eta.agent.tool.AgentToolCapabilities
 import org.json.JSONArray
 
@@ -28,6 +29,8 @@ internal object AgentToolDirectory {
         additionalTools: JSONArray? = null,
         restrictedToolNames: Set<String>? = null,
         rewriteReply: Boolean = false,
+        /** 工具能力页关掉的工具名；默认空集合（= 全开），调用方按需传 Prefs.disabledTools()。 */
+        disabledTools: Set<String> = emptySet(),
     ): JSONArray {
         if (rewriteReply) return JSONArray()
         // 纯聊天档不声明任何工具，请求里也不会带 tools 字段。
@@ -44,10 +47,15 @@ internal object AgentToolDirectory {
             memoryWritable = memoryWritable,
             capabilities = capabilities,
             localWebSearch = localWebSearch,
+            disabledTools = disabledTools,
         )
         if (additionalTools != null) {
+            // additionalTools（子智能体、角色记忆、MCP 与宿主托管工具）同样要过逐工具开关：
+            // 之前这里无条件 put，等于给被关掉的工具留了一条从目录直通请求的侧门。
             for (index in 0 until additionalTools.length()) {
-                tools.put(additionalTools.opt(index))
+                val tool = additionalTools.optJSONObject(index) ?: continue
+                val name = tool.optJSONObject("function")?.optString("name").orEmpty()
+                if (AgentToolAvailability.isToolEnabled(name, disabledTools)) tools.put(tool)
             }
         }
         val policyTools = policy.filterTools(tools)

@@ -15,6 +15,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
@@ -54,16 +55,30 @@ internal fun PromptSnapshotDetailScreen(
     var baseName by remember { mutableStateOf(AgentRequestSnapshot.baseName()) }
     var expandedSegment by remember { mutableStateOf<Int?>(null) }
     var showTools by remember { mutableStateOf(false) }
-    var pendingExport by remember { mutableStateOf<File?>(null) }
+    // 导出目标只用文件名持有，跨 Activity 重建（SAF 文档选择器可能触发）不丢；
+    // 重建后文件本体可能已被 prune 淘汰，回调时重新按名取，取不到则按失败处理。
+    var pendingExportName by rememberSaveable { mutableStateOf<String?>(null) }
 
     val exportLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.CreateDocument("application/json"),
     ) { uri ->
-        val target = pendingExport
-        pendingExport = null
-        if (uri == null || target == null) return@rememberLauncherForActivityResult
+        val targetName = pendingExportName
+        pendingExportName = null
+        if (uri == null || targetName == null) return@rememberLauncherForActivityResult
+        val target = AgentRequestSnapshot.list().firstOrNull { it.name == targetName }
+            ?: run {
+                toast(context, context.getString(R.string.prompt_snapshot_export_failed))
+                return@rememberLauncherForActivityResult
+            }
         val ok = runCatching {
-            context.contentResolver.openOutputStream(uri)?.use { output -> output.write(target.readBytes()) } != null
+            val output = context.contentResolver.openOutputStream(uri)
+            if (output == null) {
+                false
+            } else {
+                // 流式复制：避免 readBytes() 在主线程一次性分配整个文件的 byte[]。
+                target.inputStream().use { input -> output.use { input.copyTo(it) } }
+                true
+            }
         }.getOrDefault(false)
         toast(context, context.getString(if (ok) R.string.prompt_snapshot_exported else R.string.prompt_snapshot_export_failed))
     }
@@ -162,7 +177,7 @@ internal fun PromptSnapshotDetailScreen(
                     startAction = { EtaPreferenceIcon(icon = Icons.Rounded.IosShare, tint = EtaPreferenceColors.Orange) },
                     onClick = {
                         val target = file ?: return@EtaActionPreference
-                        pendingExport = target
+                        pendingExportName = target.name
                         exportLauncher.launch(target.name)
                     },
                 )

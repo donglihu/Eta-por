@@ -13,6 +13,7 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import io.github.mangi.eta.R
 import io.github.mangi.eta.agent.memory.AgentMemoryContext
+import io.github.mangi.eta.config.Prefs
 import io.github.mangi.eta.agent.model.AgentPromptBuilder
 import io.github.mangi.eta.agent.model.AgentToolCatalog
 import io.github.mangi.eta.agent.model.AgentConversationToolCatalog
@@ -150,6 +151,8 @@ internal suspend fun buildEffectivePreview(
         localProfile = LocalToolProfileStore.current(config.providerId, config.model),
         policy = policy,
         additionalTools = additionalTools,
+        // 预览要与真实请求同口径：工具能力页关掉的工具在这里也必须消失，否则「预览 34 个、实发 30 个」。
+        disabledTools = Prefs.disabledTools(),
     )
     EffectivePreview(system = system, tools = tools, model = config.model)
 }.getOrNull()

@@ -32,7 +32,7 @@ internal object AgentPromptBuilder {
         /** 召唤的专家：定义会话的身份与方法论，紧跟破甲/计划段之后注入；默认无专家。 */
         expert: Expert? = null,
     ): JSONArray {
-        val messages = buildSystemMessages(config, skillContext, memoryContext, rootAvailable, roleplayContext, executionContext, virtualScreenEnabled, virtualScreenFallbackEnabled, customization, planMode, jailbreak, expert, extraSystemContext)
+        val messages = buildSystemMessages(config, skillContext, memoryContext, rootAvailable, roleplayContext, executionContext, virtualScreenEnabled, virtualScreenFallbackEnabled, customization, planMode, jailbreak, expert)
         val chatOnly = LocalToolProfileStore.current(config.providerId, config.model) == LocalToolProfile.CHAT
         history.forEach { item ->
             val json = runCatching { AgentConversationCodec.toJsonObject(item) }.getOrNull() ?: return@forEach
@@ -65,7 +65,6 @@ internal object AgentPromptBuilder {
         jailbreak: PromptJailbreak = PromptJailbreak(),
         /** 召唤的专家：身份与方法论，紧跟破甲/计划段之后；只影响主代理。 */
         expert: Expert? = null,
-        extraSystemContext: String = "",
     ): JSONArray {
         val messages = JSONArray()
         val custom = customization.takeIf { it.active }
@@ -277,10 +276,6 @@ internal object AgentPromptBuilder {
         expert?.takeIf { it.isActivePrompt() }?.let { active -> ordered = insertSystemFirst(ordered, expertBody(active, skillContext)) }
         if (planMode) ordered = insertSystemFirst(ordered, PLAN_MODE_INSTRUCTION)
         if (jailbreak.active) ordered = insertSystemFirst(ordered, jailbreakBody(jailbreak))
-        // 定时任务注入的额外系统上下文：追加在技能之后、计划/破甲之前。
-        if (extraSystemContext.isNotBlank()) {
-            ordered.put(systemMessage(extraSystemContext))
-        }
         return ordered
     }
 

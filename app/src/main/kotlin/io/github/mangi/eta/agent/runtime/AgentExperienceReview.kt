@@ -8,6 +8,7 @@ import io.github.mangi.eta.agent.skill.SkillAuthoringService
 import io.github.mangi.eta.agent.skill.SkillContext
 import io.github.mangi.eta.agent.skill.SkillRuntime
 import io.github.mangi.eta.agent.tool.AgentLocalTools
+import io.github.mangi.eta.agent.tool.AgentToolGuard
 import io.github.mangi.eta.core.AndroidAgentLogger
 import io.github.mangi.eta.core.safeLogType
 import io.github.mangi.eta.data.datastore.SettingsDataStore
@@ -152,6 +153,9 @@ internal object AgentExperienceReview {
                             planToolsEnabled = false,
                             toolExecutor = AgentModelClient.ToolExecutor { call ->
                                 checkCurrent()
+                                // 复盘走的是同一条执行链，逐工具开关同样生效：复盘只允许写记忆/技能，
+                                // 但被用户在能力页关掉的工具也不该借复盘跑起来。
+                                AgentToolGuard.rejectionOrNull(call.name)?.let { return@ToolExecutor it }
                                 if (++calls > 12) {
                                     controller.cancel(); controller.throwIfCancelled()
                                 }

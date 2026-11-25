@@ -788,7 +788,17 @@ internal fun AgentConversationMessages(
     // 审批卡：AI 被拦下来的一步。挂在列表末尾跟消息一起滚，不另占浮层。
     val pendingApprovals by AgentConfirmGuard.pendings.collectAsState()
     val confirmContext = LocalContext.current
-    val bottomItemIndex = timelineEntries.size
+    // 底部目标 = timelineEntries + 本会话待答卡 + 其他会话卡 + 底部 sentinel。
+    // 早先只取 timelineEntries.size（不含审批卡 item），滑动到底触发跟随后，
+    // 跟随决策会把视图拽回「卡的上一项」，提问卡多选时用户滚到卡底部
+    // 找「确认(N 项)」会被弹回选项处，永远点不到确认（2026-11-25 修复）。
+    val visibleApprovalCount = pendingApprovals.count {
+        !it.expired() && (it.conversationKey.isBlank() || it.conversationKey == conversationKey)
+    }
+    val elsewhereApprovalCount = pendingApprovals.count {
+        !it.expired() && it.conversationKey.isNotBlank() && it.conversationKey != conversationKey
+    }
+    val bottomItemIndex = timelineEntries.size + visibleApprovalCount + elsewhereApprovalCount
     // 进入/切换会话后落到最新一条：从胶囊、通知跳进来时也能直接看到最新回复，
     // 不用再手动点那个"到底部"箭头。只在进入时跳一次，之后用户往上翻历史不会被拽回来。
     var didJumpToLatest by remember { mutableStateOf(false) }

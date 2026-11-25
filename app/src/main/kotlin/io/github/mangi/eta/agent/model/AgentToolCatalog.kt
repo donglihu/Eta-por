@@ -1,6 +1,7 @@
 package io.github.mangi.eta.agent.model
 
 import org.json.JSONArray
+import io.github.mangi.eta.agent.tool.AgentToolAvailability
 import io.github.mangi.eta.agent.tool.AgentToolCapabilities
 
 /** 声明模型可见的工具及其 JSON Schema；不包含任何执行逻辑。 */
@@ -17,8 +18,10 @@ internal object AgentToolCatalog {
         memoryWritable: Boolean = true,
         capabilities: AgentToolCapabilities = AgentToolCapabilities(rootAvailable = true),
         localWebSearch: Boolean = true,
-    ): JSONArray =
-        capabilities.project(JSONArray().also { tools ->
+        /** 工具能力页关掉的工具名；空集合表示全开。 */
+        disabledTools: Set<String> = emptySet(),
+    ): JSONArray {
+        val projected = capabilities.project(JSONArray().also { tools ->
             // 工具档只剩「正常」与「纯聊天」：纯聊天在 AgentToolDirectory 里已直接返回空数组，
             // 走到这里的都是正常档，全部工具原样声明，不再按档位删减。
             // 计划清单：只有启用计划模式的会话才声明。
@@ -61,4 +64,15 @@ internal object AgentToolCatalog {
                 AgentFileToolCatalog.appendTo(tools)
             }
         })
+        // 逐工具开关放在能力投影之后：先按 Root/无障碍/机型筛掉不可用的，再按用户意愿删减，
+        // 顺序反过来会让「关掉的工具」在不可用统计里继续占位。
+        if (disabledTools.isEmpty()) return projected
+        return JSONArray().also { filtered ->
+            for (index in 0 until projected.length()) {
+                val tool = projected.optJSONObject(index) ?: continue
+                val name = tool.optJSONObject("function")?.optString("name").orEmpty()
+                if (AgentToolAvailability.isToolEnabled(name, disabledTools)) filtered.put(tool)
+            }
+        }
+    }
 }

@@ -164,12 +164,12 @@ internal object SubagentSessionStore {
 
     private fun notifyEvicted(message: String) {
         onEvicted?.invoke(message)
+    }
 
     fun clearConversation(conversationKey: String) {
         if (conversationKey.isBlank()) return
         synchronized(lock) {
             buckets.remove(conversationKey)
         }
-    }
     }
 }

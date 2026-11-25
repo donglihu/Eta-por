@@ -13,6 +13,7 @@ import androidx.compose.material.icons.rounded.AdminPanelSettings
 import androidx.compose.material.icons.rounded.AdsClick
 import androidx.compose.material.icons.rounded.Alarm
 import androidx.compose.material.icons.rounded.Apps
+import androidx.compose.material.icons.rounded.BugReport
 import androidx.compose.material.icons.rounded.Build
 import androidx.compose.material.icons.rounded.CalendarMonth
 import androidx.compose.material.icons.rounded.ChatBubble
@@ -129,6 +130,8 @@ internal fun iconForTool(toolId: String): ImageVector = when (toolId) {
     "search_system_memories", "search_coloros_memories" -> Icons.Rounded.Psychology
     "search_personal_orders" -> Icons.Rounded.ShoppingBag
     "terminal", "terminal_job", "terminal_daemon", "run_command" -> Icons.Rounded.Terminal
+    // Frida 卡（运行时观察/注入，本版本未接后端）单独给图标，不落在 Build 兜底上。
+    "frida" -> Icons.Rounded.BugReport
     "subagent", "subagent_profile" -> Icons.Rounded.Hub
     "ask_user" -> Icons.Rounded.ChatBubble
     "expert_manage" -> Icons.Rounded.AdminPanelSettings

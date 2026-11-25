@@ -15,7 +15,10 @@ import io.github.mangi.eta.R
 import io.github.mangi.eta.core.AndroidAgentLogger
 import io.github.mangi.eta.core.AppForeground
 import io.github.mangi.eta.core.safeLogType
+import io.github.mangi.eta.data.datastore.SettingsDataStore
 import io.github.mangi.eta.ui.MainActivity
+import kotlin.concurrent.thread
+import kotlinx.coroutines.runBlocking
 
 /**
  * 可选的后台保活前台服务。
@@ -141,32 +144,87 @@ internal class AgentKeepaliveService : Service() {
                 // 系统按 START_STICKY 重建：会话计数已随进程丢失，这里只恢复前台形态，
                 // 不按「无会话」判停，否则重建后立刻自停，STICKY 形同虚设。
                 AndroidAgentLogger.info("Keepalive service restarted by system")
+                // 常驻标记同样活在内存里，重建后必然是 false。不从设置补回来的话，
+                // 重建出来的服务在下一次 STOP_SESSION 就静默退出——用户看到的就是
+                // 「保活开关明明开着，过一会儿又没了」。
+                restorePersistentFromSettings()
             }
 
             else -> AndroidAgentLogger.warn("Keepalive unknown action: $action")
         }
-        if (action != null && sessionCount <= 0 && !persistent) {
+        if (KeepalivePolicy.shouldStopAfterCommand(action != null, persistent, sessionCount)) {
             AndroidAgentLogger.info("Keepalive idle: sessions=0 persistent=false, stopping")
             stopSelf()
         }
         return START_STICKY
     }
 
+    /**
+     * 从设置恢复常驻标记（后台线程）。
+     *
+     * 主线程不能 `runBlocking` 读 DataStore：配置差一点就是一次 ANR，
+     * 而这里本来就在服务重建的早期，没有时序要求。
+     * 读不到设置就保持现状（不动 persistent、不自停）——「读不到」不等于「用户关了」。
+     */
+    private fun restorePersistentFromSettings() {
+        runCatching {
+            thread(name = "eta-keepalive-restore") {
+                val enabled = runCatching { runBlocking { SettingsDataStore.settings().keepaliveEnabled } }
+                    .onFailure { error ->
+                        AndroidAgentLogger.warn(
+                            "Keepalive persistent restore failed: type=${error.safeLogType()}"
+                        )
+                    }
+                    .getOrNull()
+                if (enabled == null) return@thread
+                persistent = enabled
+                AndroidAgentLogger.info("Keepalive persistent restored: enabled=$enabled sessions=$sessionCount")
+                // 设置已关：重建出来的服务没有存在的理由，手上也没有会话时就按显式语义退出。
+                if (!enabled && sessionCount <= 0) {
+                    stopForeground(STOP_FOREGROUND_REMOVE)
+                    stopSelf()
+                }
+            }
+        }.onFailure { error ->
+            AndroidAgentLogger.warn("Keepalive restore thread rejected: type=${error.safeLogType()}")
+        }
+    }
+
     override fun onBind(intent: Intent?): IBinder? = null
 
     /**
-     * 用户从最近任务里划掉应用：先重排自检任务（下一次拉起靠它），再撤前台并自停。
+     * 用户从最近任务里划掉应用。
      *
-     * 不在这里强行「续命」是刻意的：用户划掉就是明确要它停，硬撑会让应用变成流氓软件。
+     * 语义按常驻开关分流：开关开着（用户显式要它常驻）就保留前台形态、只重排自检；
+     * 关着就照旧撤前台并自停——划掉就是明确要它停，不硬撑。
+     * 读设置必须放到后台线程，`onTaskRemoved` 跑在主线程，就地 `runBlocking` 读盘
+     * 极端情况直接 ANR（这里上一版就是靠 refreshAsync 规避的同一个坑）。
      */
     override fun onTaskRemoved(rootIntent: Intent?) {
         AndroidAgentLogger.info("Keepalive task removed: rescheduling self-check")
-        // onTaskRemoved 跑在主线程，refresh() 内部是 runBlocking 读 DataStore，
-        // 就地调用等于主线程同步读盘，极端情况直接 ANR。这里只投递后台任务后立即返回，
-        // 失败仍由 refreshAsync 自己记 warn，不静默吞。
         AgentKeepaliveScheduler.refreshAsync(this)
-        stopForeground(STOP_FOREGROUND_REMOVE)
-        stopSelf()
+        runCatching {
+            thread(name = "eta-keepalive-task-removed") {
+                val enabled = runCatching { runBlocking { SettingsDataStore.settings().keepaliveEnabled } }
+                    .onFailure { error ->
+                        AndroidAgentLogger.warn(
+                            "Keepalive task-removed settings read failed: type=${error.safeLogType()}"
+                        )
+                    }
+                    .getOrNull()
+                // 读不到就按「关」处理：没有明确授权时宁可退回旧行为，也不让应用变成划不掉的流氓软件。
+                if (enabled == null || KeepalivePolicy.shouldStopOnTaskRemoved(enabled)) {
+                    AndroidAgentLogger.info("Keepalive stopped after task removed: enabled=$enabled")
+                    stopForeground(STOP_FOREGROUND_REMOVE)
+                    stopSelf()
+                } else {
+                    persistent = true
+                    AndroidAgentLogger.info("Keepalive kept after task removed: keepalive enabled")
+                }
+            }
+        }.onFailure { error ->
+            AndroidAgentLogger.warn("Keepalive task-removed thread rejected: type=${error.safeLogType()}")
+        }
         super.onTaskRemoved(rootIntent)
     }
 

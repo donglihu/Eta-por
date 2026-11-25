@@ -49,7 +49,9 @@ import io.github.mangi.eta.ui.components.EtaPreferenceGroupTitle
 import io.github.mangi.eta.ui.components.EtaPreferenceIcon
 import io.github.mangi.eta.ui.components.MiuixScaffold
 import io.github.mangi.eta.ui.components.MiuixScaffoldPage
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import top.yukonga.miuix.kmp.basic.Icon
 import top.yukonga.miuix.kmp.basic.Text
 import top.yukonga.miuix.kmp.basic.TextField
@@ -78,8 +80,20 @@ internal fun PromptToolsScreen(
     }
     var searchMode by remember { mutableStateOf(false) }
     var mcpNames by remember { mutableStateOf(emptyList<String>()) }
+    // 全量工具与分组结果：首次组合不在这里同步计算（ALL_TOOL_NAMES lazy 首次排序 +
+    // 140 个工具 groupBy / rootRequirement / face 计算会阻塞主线程，点击白名单才卡顿）。
+    // 交给 LaunchedEffect 在后台线程算好再回写，首帧给空占位，加载完成后一次刷新。
+    var allTools by remember { mutableStateOf<List<String>>(emptyList()) }
+    var grouping by remember {
+        mutableStateOf(ToolGrouping(categories = emptyList(), grouped = emptyMap()))
+    }
     LaunchedEffect(Unit) { mcpNames = loadMcpToolNames() }
-    val allTools = allToolNames(mcpNames)
+    LaunchedEffect(mcpNames, selector.grouping) {
+        val names = withContext(Dispatchers.Default) { allToolNames(mcpNames) }
+        val grouped = withContext(Dispatchers.Default) { groupingOf(selector, names) }
+        allTools = names
+        grouping = grouped
+    }
     val dirty = selector.mode != saved.mode || selector.allowed != saved.allowedTools
 
     val save: () -> Unit = {
@@ -96,7 +110,6 @@ internal fun PromptToolsScreen(
         }
     }
 
-    val grouping = groupingOf(selector, allTools)
     val category = selector.pickerCategory?.takeIf { it in grouping.categories }
 
     when {

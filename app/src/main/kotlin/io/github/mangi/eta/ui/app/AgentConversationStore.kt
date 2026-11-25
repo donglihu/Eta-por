@@ -189,12 +189,25 @@ internal object AgentConversationStore {
                             if (isPlaceholder) continue
                             if (old == null || state.history != old.history || state.journal != old.journal) {
                                 val missing = dao.contextCheckpointRow(id) == null
-                                phase = "encode_history"
-                                val history = if (missing || old == null || state.history != old.history) {
+                                val needHistory = missing || old == null || state.history != old.history
+                                val needJournal = missing || old == null || state.journal != old.journal
+                                // 病灶 5：encodeConversationCheckpoint 只是 encodeTranscriptForStorage 的纯委托。
+                                // history 与 journal 内容完全相等且都要重编码时只编一次，避免同时多持一份完整 JSON。
+                                // 用 == 做 List 结构相等判断：内容不同必须各自编码，不能无条件复用。
+                                val sharedCheckpoint = if (needHistory && needJournal && state.history == state.journal) {
+                                    phase = "encode_checkpoint"
                                     AgentConversationCodec.encodeConversationCheckpoint(state.history)
                                 } else null
-                                phase = "encode_journal"
-                                val journal = if (missing || old == null || state.journal != old.journal) {
+                                val history = if (sharedCheckpoint != null) {
+                                    sharedCheckpoint
+                                } else if (needHistory) {
+                                    phase = "encode_history"
+                                    AgentConversationCodec.encodeConversationCheckpoint(state.history)
+                                } else null
+                                val journal = if (sharedCheckpoint != null) {
+                                    sharedCheckpoint
+                                } else if (needJournal) {
+                                    phase = "encode_journal"
                                     AgentConversationCodec.encodeTranscriptForStorage(state.journal)
                                 } else null
                                 phase = "write_checkpoint"

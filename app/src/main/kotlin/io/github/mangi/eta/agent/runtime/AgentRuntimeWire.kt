@@ -10,6 +10,7 @@ import android.os.Bundle
 import android.os.Parcel
 import android.os.ParcelFileDescriptor
 import io.github.mangi.eta.agent.model.AgentConversationCodec
+import io.github.mangi.eta.agent.model.AgentHistoryTrimmer
 import io.github.mangi.eta.agent.model.AgentModelClient
 import io.github.mangi.eta.agent.subagent.AgentSubagentToolCatalog
 import io.github.mangi.eta.agent.subagent.SubagentActivitySnapshot
@@ -323,7 +324,20 @@ internal object AgentRuntimeWire {
         require(request.assistantScreenContext.length <= AssistantScreenContextProjection.MAX_CHARS) {
             "助理屏幕上下文超过容量预算"
         }
-        AgentWireText.put(this, "history_json", AgentConversationCodec.encodeTranscriptForStorage(request.history), payloadDirectory)
+        // 先按传输预算裁一刀再编码：以前直接序列化完整 request.history，
+        // 长会话会产生几 MB 的字符串 + 它的 UTF-8 字节副本，是入口进程 OOM 的直接来源。
+        // 传输裁剪只保 Binder 体积；上下文窗口裁剪仍由接收侧
+        // AgentHistoryTrimmer.trimInPlace 负责，两者不互相替代。
+        val transferHistory = AgentHistoryTrimmer.trimForTransfer(
+            request.history,
+            AgentLegacyConversationProjection.DIRECT_CHARS,
+        )
+        AgentWireText.put(
+            this,
+            "history_json",
+            AgentConversationCodec.encodeTranscriptForStorage(transferHistory),
+            payloadDirectory,
+        )
         putString(KEY_RUN_ID, request.runId)
         AgentWireText.put(this, KEY_PROMPT, request.prompt, payloadDirectory)
         putString(KEY_ASSISTANT_SCREEN_CONTEXT, request.assistantScreenContext)
@@ -363,18 +377,26 @@ internal object AgentRuntimeWire {
         putString(KEY_CUSTOM_HEADERS_JSON, json.encodeToString(request.config.customHeaders))
         putString(KEY_CUSTOM_BODY_JSON, json.encodeToString(request.config.customBody))
         request.handoff?.let { putBundle(KEY_HANDOFF, toBundle(it)) }
+        // KEY_HISTORY 只是降级兜底：正常路径读回走 readText=true 的 history_json，
+        // 只有 history_json 读失败时才会回退到这个分量历史。
+        // 因此这里只做 O(n) 的尾部切片，不再走 encode -> decodeTranscript 那一轮
+        // 完整序列化往返（那是 O(n²) 的白费开销）。
         putParcelableArrayList(
             KEY_HISTORY,
-            ArrayList(AgentConversationCodec.decodeTranscript(AgentLegacyConversationProjection.encode(request.history, AgentLegacyConversationProjection.DIRECT_CHARS)).map { message ->
-                Bundle().apply {
-                    putString(KEY_ROLE, message.role)
-                    putString(KEY_CONTENT, message.content)
-                    putString(KEY_CONTENT_JSON, message.contentJson)
-                    putString(KEY_TOOL_CALL_ID, message.toolCallId)
-                    putString(KEY_REASONING_CONTENT, message.reasoningContent)
-                    putString(KEY_TOOL_CALLS_JSON, message.toolCallsJson)
-                }
-            })
+            ArrayList(
+                AgentLegacyConversationProjection
+                    .tail(request.history, AgentLegacyConversationProjection.DIRECT_CHARS)
+                    .map { message ->
+                        Bundle().apply {
+                            putString(KEY_ROLE, message.role)
+                            putString(KEY_CONTENT, message.content)
+                            putString(KEY_CONTENT_JSON, message.contentJson)
+                            putString(KEY_TOOL_CALL_ID, message.toolCallId)
+                            putString(KEY_REASONING_CONTENT, message.reasoningContent)
+                            putString(KEY_TOOL_CALLS_JSON, message.toolCallsJson)
+                        }
+                    }
+            )
         )
         putParcelableArrayList(
             KEY_IMAGES,

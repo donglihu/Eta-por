@@ -20,6 +20,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import org.xmlpull.v1.XmlPullParser
 import org.xmlpull.v1.XmlPullParserFactory
+import io.github.mangi.eta.agent.virtualdisplay.CanvasRoutingPolicy
 
 internal class RootShellDeviceController(
     private val logger: AgentLogger,
@@ -304,7 +305,7 @@ internal class RootShellDeviceController(
         AgentAccessibilityService.current()?.let { service ->
             return scrollActionJson("scroll", service.scrollCurrent(parsed, parsedAmount))
         }
-        if (CanvasRoutingPolicy.isVirtualDisplay(displayId) || !rootAvailable()) return accessibilityUnavailable()
+        if (!rootAvailable()) return accessibilityUnavailable()
         val beforeNodes = dumpUiNodes(120)
         val targetBounds = beforeNodes
             .asSequence()
@@ -540,15 +541,15 @@ internal class RootShellDeviceController(
         while (System.currentTimeMillis() <= deadline) {
             attempts++
             val service = AgentAccessibilityService.current()
-            if (service == null && (isVirtual || !rootAvailable())) return accessibilityUnavailable()
+            if (service == null && !rootAvailable()) return accessibilityUnavailable()
             val nodes = if (service != null) {
-                service.queryNodes(120, displayId).map { it.toUiNode() }
+                service.queryNodes(120, android.view.Display.DEFAULT_DISPLAY).map { it.toUiNode() }
             } else if (
                 ScreenObservationMetadata.mayUseUiAutomator(
                     requested = true,
                     accessibilityConnected = false,
                     rootAvailable = rootAvailable(),
-                    virtualDisplay = isVirtual,
+                    virtualDisplay = false,
                 )
             ) {
                 dumpUiNodes(120)
@@ -873,8 +874,6 @@ internal class RootShellDeviceController(
         } catch (_: java.io.IOException) {
             logger.warn("Agent device action=dump_ui outcome=failed source=root code=XML_READ_FAILED")
             emptyList()
-        }
-    }
         }
     }
 

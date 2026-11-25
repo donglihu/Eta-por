@@ -53,6 +53,7 @@ import io.github.mangi.eta.agent.display.dashboard.VisionTouch
 import io.github.mangi.eta.agent.runtime.AgentRuntimeService
 import io.github.mangi.eta.agent.runtime.RunControl
 import io.github.mangi.eta.agent.runtime.RunProgressNotifier
+import io.github.mangi.eta.core.MemoryPressure
 import io.github.mangi.eta.data.datastore.SettingsDataStore
 import io.github.mangi.eta.data.model.Settings
 import kotlinx.coroutines.CoroutineScope
@@ -129,6 +130,10 @@ internal object VirtualScreenFloatWindow {
     private var lastFrameId = 0L
     /** 连续拉帧失败次数：只用于限流留痕，不影响出帧逻辑。 */
     private var frameFailStreak = 0
+    /** 最近一次内存水位与探测时刻：拉帧循环 25fps 下不能每帧都读 /proc/meminfo。 */
+    @Volatile
+    private var framePressureLevel = MemoryPressure.Level.Normal
+    private var framePressureProbeAt = 0L
     private var frameJob: Job? = null
     private var observeJob: Job? = null
     /** 浮窗兜底看护；只在 init() 里启动一次。 */
@@ -525,7 +530,14 @@ internal object VirtualScreenFloatWindow {
             while (isActive) {
                 // 拉帧节奏跟随出帧档位：浮窗 25fps / 收起 5fps / 接管对齐屏幕刷新率 / 读屏 5fps。
                 // 以前按用户帧率设置算再钳到 66ms，会把 25fps 档硬压成 15fps。
-                val frameDelay = VirtualScreenSession.currentFrameIntervalMs().toLong().coerceIn(4L, 1000L)
+                // 内存偏低时再乘一档间隔：宁可画面慢半拍，也不要把堆顶到 OOM 那一侧。
+                val pressure = refreshFramePressure()
+                val interval = VirtualScreenSession.currentFrameIntervalMs().toLong().coerceIn(4L, 1000L)
+                val frameDelay = when (pressure) {
+                    MemoryPressure.Level.Critical -> (interval * 4).coerceAtMost(2_000L)
+                    MemoryPressure.Level.Low -> (interval * 2).coerceAtMost(1_000L)
+                    MemoryPressure.Level.Normal -> interval
+                }
                 val idleDelay = frameDelay.coerceAtLeast(40L)
                 syncDisplayRotation()
                 val startedAt = android.os.SystemClock.elapsedRealtime()
@@ -572,12 +584,22 @@ internal object VirtualScreenFloatWindow {
 
     private suspend fun readFrame(current: VirtualDisplayInfo): Frame? = withContext(Dispatchers.IO) {
         return@withContext try {
+            // 内存临界时直接放弃这一拍：整帧 base64 与 Bitmap 解码是当前最大的瞬时峰值，
+            // 2026-11-25 的三次 OOM 都发生在堆已贴顶、却还在继续申请整帧内存的时候。
+            if (refreshFramePressure() == MemoryPressure.Level.Critical) {
+                noteFrameFailure("MEMORY_CRITICAL")
+                return@withContext null
+            }
             val result = VirtualScreenSession.observeForViewer(context ?: return@withContext null, lastFrameId)
             val json = JSONObject(result.content)
             if (!json.optBoolean("ok")) {
+                val code = json.optString("code")
+                // 全局锁被工具占用（VIRTUAL_SCREEN_BUSY）不是故障：工具跑完下一拍自然就有帧，
+                // 这里直接跳过，既不计失败也不弹告警，避免把正常的锁竞争写成「灵屏出错」。
+                if (code == "VIRTUAL_SCREEN_BUSY") return@withContext null
                 // 早前这里默默 return null，浮窗就停在一帧定格画面上，
                 // 用户只看到「有窗口没画面」，日志里也什么都查不到。失败必须留痕。
-                noteFrameFailure(json.optString("code").ifBlank { "OBSERVE_FAILED" })
+                noteFrameFailure(code.ifBlank { "OBSERVE_FAILED" })
                 return@withContext null
             }
             val encoded = result.images.firstOrNull()?.reference?.substringAfter("base64,")
@@ -592,6 +614,24 @@ internal object VirtualScreenFloatWindow {
             noteFrameFailure(error.javaClass.simpleName + ":" + error.message)
             null
         }
+    }
+
+    /**
+     * 每 800ms 探测一次内存水位。
+     *
+     * 判据本身是全局的（[MemoryPressure]），但「多久看一次」必须跟拉帧节奏绑定：
+     * 25fps 循环里每帧都读 /proc/meminfo，省的这点内存还不够付 CPU 的账。
+     */
+    private fun refreshFramePressure(): MemoryPressure.Level {
+        val now = SystemClock.elapsedRealtime()
+        if (now - framePressureProbeAt < 800L) return framePressureLevel
+        framePressureProbeAt = now
+        val level = MemoryPressure.level()
+        if (level != framePressureLevel) {
+            framePressureLevel = level
+            VscrDiag.line("内存水位 " + MemoryPressure.describe())
+        }
+        return level
     }
 
     /** 连续拉帧失败计数与限流留痕：只在前几次和每 40 次记一条，避免 25fps 刷爆日志。 */

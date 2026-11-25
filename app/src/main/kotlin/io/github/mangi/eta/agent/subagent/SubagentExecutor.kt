@@ -13,6 +13,7 @@ import io.github.mangi.eta.data.model.enabledModel
 import io.github.mangi.eta.data.model.enabledModelByApiId
 import io.github.mangi.eta.agent.terminal.TerminalExecutionContext
 import io.github.mangi.eta.agent.tool.AgentToolCapabilities
+import io.github.mangi.eta.agent.tool.AgentToolGuard
 import io.github.mangi.eta.agent.tool.AgentToolRequirements
 import io.github.mangi.eta.agent.tool.ToolDomain
 import java.util.concurrent.ConcurrentHashMap
@@ -343,7 +344,12 @@ internal class SubagentExecutor(
 
         val childToolExecutor = AgentModelClient.ToolExecutor { subCall ->
             childController.throwIfCancelled()
-            if (!profile.isToolAllowed(subCall.name)) {
+            // 子代理的每次调用都会回到父工具链（runGated → baseToolExecutor），
+            // 逐工具开关在这里先判：被关掉的工具连资源域都不去排队。
+            val disabled = AgentToolGuard.rejectionOrNull(subCall.name)
+            if (disabled != null) {
+                disabled
+            } else if (!profile.isToolAllowed(subCall.name)) {
                 AgentModelClient.ToolResult(
                     content = JSONObject()
                         .put("ok", false)
@@ -843,7 +849,7 @@ internal class SubagentExecutor(
                 is AgentEvent.UsageReceived -> {
                     // 本地版 AgentTokenUsage 无 stepCount/llmMs（未并 TurnMetrics）：
                     // 每次 UsageReceived 一律按步骤用量累计，轮次快照回落到最新一步。
-                    latestStepUsage = event.usage
+                    pendingStepUsage = event.usage
                     false
                 }
 
@@ -908,7 +914,7 @@ internal class SubagentExecutor(
             } else {
                 roundTexts.values.lastOrNull()?.toString()?.trim().orEmpty().takeLastUtf16Safe(MAX_OUTPUT_CHARS)
             }
-            val baseUsage = latestTurnUsage ?: latestStepUsage
+            val baseUsage = latestTurnUsage ?: pendingStepUsage
             val totalInput = (baseUsage?.inputTokens ?: 0) + compactionInputTokens
             val totalCached = (baseUsage?.cachedTokens ?: 0) + compactionCachedTokens
             val totalCacheWrite = (baseUsage?.cacheWriteTokens ?: 0) + compactionCacheWriteTokens

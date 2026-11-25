@@ -47,6 +47,11 @@ internal data class PendingApproval(
     /** 被拦下的工具名与原始参数（JSON 文本）：批准后原样回灌，避免模型改参数导致再次拦截。 */
     val toolName: String = "",
     val toolArgs: String = "",
+    /**
+     * 发起这次拦截 / 提问的运行 id：用户裁决后优先 steer 回灌这个 run，
+     * run 已结束时才退回「作为新消息发出」。
+     */
+    val runId: String = "",
     val createdAt: Long = System.currentTimeMillis(),
 ) {
     val riskLabel: String
@@ -86,6 +91,18 @@ internal data class PendingApproval(
  * 取舍：宁可多拦一次，也不放行一次扣款。误拦的代价是模型多问一句，
  * 漏拦的代价是钱已经花出去。
  */
+
+/**
+ * 用户裁决结果：回复文案 + 是否拒绝/手动接管。
+ *
+ * rejected=true 时工具侧必须以失败语义（ok=false USER_REJECTED）收尾，
+ * 避免模型拿到「成功」继续尝试同一操作从而反复挂卡（2026-11-25 修复）。
+ */
+data class VerdictOutcome(
+    val reply: String?,
+    val rejected: Boolean = false,
+)
+
 internal object AgentConfirmGuard {
 
     private const val CHANNEL = "eta_confirm_required"
@@ -116,6 +133,25 @@ internal object AgentConfirmGuard {
      * （`ask` 直接返回 PROMPT_PENDING），等于一张卡锁死全部对话。
      */
     private val mutablePendings = MutableStateFlow<List<PendingApproval>>(emptyList())
+
+    /**
+     * 裁决等待表：token -> 用户选完后的回灌文本（或空 = 会话被丢弃 / 超时）。
+     *
+     * reverse 3.4.4 里是 `Luf` 的 LinkedHashMap + Condition.signalAll/await 轮询：
+     * 工具线程注册 pending 后阻塞等待，UI 通知/卡片点选时写结果唤醒，原 run 继续。
+     * 这里用 CountDownLatch 实现同样的「工具线程阻塞等裁决」语义，兼容现有 UI 回调。
+     */
+    private val verdictResults = java.util.concurrent.ConcurrentHashMap<String, VerdictSlot>()
+
+    private class VerdictSlot {
+        val latch = java.util.concurrent.CountDownLatch(1)
+        @Volatile
+        var reply: String? = null
+        /** 用户拒绝/手动接管：true 时工具侧应以失败语义收尾，避免模型拿到成功继续重试。 */
+        @Volatile
+        var rejected = false
+        var consumed = false
+    }
 
     /** 全部待答卡。 */
     val pendings: StateFlow<List<PendingApproval>> = mutablePendings.asStateFlow()
@@ -376,26 +412,118 @@ internal object AgentConfirmGuard {
                 conversationKey = owner,
                 toolName = toolName,
                 toolArgs = toolArgs,
+                runId = runId,
             )
         }
+        // 裁决 slot 必须先于卡片可见创建：工具线程 awaitVerdict 与 UI 点选都可能立即发生，
+        // 若 UI 先 completeVerdict 而 slot 不存在会返回 false，裁决就丢了。
+        verdictResults.putIfAbsent(pending.token, VerdictSlot())
         mutatePendings { current ->
             current.filter { it.conversationKey != owner && !it.expired() } + pending
         }
-        // 刻意不 pause。
-        // 早先的做法是命中即 pauseRun()，想着「别让模型继续跑」。实测两次翻车：
-        // ① 模型拿到 NEED_CONFIRM 后本来就把这一轮收尾了，run 变 terminal，
-        //    用户裁决时 resumeRun() 找不到活动 run，setPaused(false) 根本不执行，
-        //    界面永远停在「已暂停 · 点继续恢复」；
-        // ② 就算清了标记，运行线程仍卡在 pauseCondition.await()，模型照样不动。
-        // 结论：拦截不需要暂停，它只需要「这一句不执行 + 把结论当成新消息推进下一轮」。
+        // 这里不设 pauseRun() 标记（早先命中即 pause 实测翻车：模型拿到 NEED_CONFIRM 收尾、
+        // run 变 terminal，resumeRun() 找不到活动 run，界面卡死）。改为：run 不结束，
+        // 工具线程在下方 awaitVerdict 上阻塞等用户裁决（reverse 的 Condition.await 语义），
+        // 只要用户点选就会唤醒同一 run 继续，不需要 resume/新发消息。
         if (pending.repeatCount == 1) {
             context?.let { runCatching { notify(it, pending) } }
         } else {
             PendingPromptStore.save(mutablePendings.value)
             EtaTrace.log("confirm.repeat", "subject=$subject count=${pending.repeatCount}")
         }
-        return draft
+        // 回填 token：工具线程随后用它 awaitVerdict 阻塞等用户裁决。
+        // reverse 3.4.4 的 Luf 用 Condition.await 挂起原 run，裁决后同一 run 继续；
+        // 这里保持同样的「挂起等待，不结束 run、不新发消息」语义。
+        return draft.copy(token = pending.token)
     }
+
+    /**
+     * 工具线程阻塞等待用户裁决。
+     *
+     * reverse 3.4.4 的 `Luf` 里工具线程 `Condition.await()` 轮询取裁决，用户按钮
+     * `signalAll()` 唤醒——审批结果回到**同一个** run 的挂起点继续执行，而不是
+     * 结束 run 后由 UI 另发一条新消息。
+     *
+     * 这里用 CountDownLatch 等价实现：
+     * - 用户在会话卡 / 通知 / 全屏确认页点选 → [completeVerdict] 写结果并 countDown；
+     * - 本方法返回裁决文案，工具侧把它作为工具结果交给模型，run 继续；
+     * - 等待期间 run 被取消（cancelRun）、或超过 [VERDICT_WAIT_MS] 仍未裁决 →
+     *   返回 null，调用方应在发现 null 时以 NEED_CONFIRM 收尾，不强推。
+     */
+    fun awaitVerdict(
+        token: String,
+        timeoutMs: Long = VERDICT_WAIT_MS,
+        isCancelled: () -> Boolean = { false },
+    ): VerdictOutcome? {
+        if (token.isBlank()) return null
+        val slot = verdictResults[token] ?: return null
+        val deadline = System.currentTimeMillis() + timeoutMs
+        // 轮询 + 每 500ms 检查一次取消：用户点「停止」时 run 的取消标志会置位，
+        // 工具线程必须能感知并退出阻塞，否则会一直挂到超时（30 分钟）。
+        while (System.currentTimeMillis() < deadline) {
+            if (isCancelled()) break
+            try {
+                if (slot.latch.await(500, java.util.concurrent.TimeUnit.MILLISECONDS)) break
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+                break
+            }
+        }
+        verdictResults.remove(token)
+        return VerdictOutcome(reply = slot.reply, rejected = slot.rejected)
+    }
+
+    /** 便捷读法：只要回复文本（不关心拒绝标记）。等不到裁决或超时返回 null。 */
+    fun awaitVerdictText(
+        token: String,
+        timeoutMs: Long = VERDICT_WAIT_MS,
+        isCancelled: () -> Boolean = { false },
+    ): String? = awaitVerdict(token, timeoutMs, isCancelled)?.reply
+
+    /**
+     * 用户裁决完成：写入回灌文案并唤醒等待中的工具线程。
+     *
+     * 由 [choose] / [chooseMany] / [chooseFreeform] / [skip] 统一调用——
+     * 这些方法把「用户选了什么」翻译成给模型的回灌文本（已含「请继续/不要重复问」语义），
+     * 工具线程拿到后作为工具结果返回，模型在同一 run 里继续执行。
+     *
+     * @return true = 工具线程仍在该 token 上等待并已唤醒（不需要 UI 兜底）；
+     *         false = 没有等待者（工具线程已超时放弃 / run 已结束），调用方应回退到
+     *                旧逻辑（steer / 新发消息）兜底，以免裁决丢失。
+     */
+    private fun completeVerdict(token: String, reply: String, rejected: Boolean = false): Boolean {
+        val slot = verdictResults[token] ?: return false
+        slot.reply = reply
+        slot.rejected = rejected
+        slot.latch.countDown()
+        return true
+    }
+
+    /**
+     * 工具线程从等待中醒来后读取裁决结果（rejected=true 时为失败语义）。
+     */
+    fun awaitVerdictResult(token: String): Pair<String?, Boolean> {
+        val slot = verdictResults[token] ?: return null to false
+        return slot.reply to slot.rejected
+    }
+
+    /**
+     * 把用户裁决装配成工具结果。
+     *
+     * @param rejected 用户拒绝/手动接管：结果必须是失败语义（ok=false），
+     *                 否则模型拿到「成功」会继续尝试同一操作，又被拦截挂新卡，
+     *                 视觉上就是「一直卡在读秒」（2026-11-25 修复）。
+     */
+    fun verdictResult(reply: String, draft: ConfirmDraft? = null, rejected: Boolean = false): String =
+        JSONObject()
+            .put("ok", !rejected)
+            .put("code", if (rejected) "USER_REJECTED" else "USER_VERDICT")
+            .put("message", reply)
+            .put("title", draft?.title.orEmpty())
+            .toString()
+
+    /** 工具线程等待用户裁决的最长时长：超过则放弃阻塞，以免 run 被永久挂死。 */
+    private const val VERDICT_WAIT_MS = 30 * 60 * 1000L
 
     /**
      * 用户批准。返回 false 表示这次裁决无效（token 过期/已被别的入口处理）。
@@ -431,7 +559,8 @@ internal object AgentConfirmGuard {
             }
 
             PromptOptionId.REJECT ->
-                "用户拒绝了「${current.title}」。请停止这个操作，不要换方式重试，并说明接下来可行的替代做法。"
+                "用户拒绝了「${current.title}」，本次调用已中止、没有执行。请停止这个操作，" +
+                    "不要换方式重试、不要用相同参数再次发起；说明当前进度和接下来可行的替代做法等你。"
 
             PromptOptionId.MANUAL ->
                 "用户选择自己手动完成「${current.title}」。请立刻停下所有操作，" +
@@ -452,7 +581,13 @@ internal object AgentConfirmGuard {
                 "tool=${current.toolName.ifBlank { "-" }} " +
                 "waited_ms=$waited",
         )
-        return reply
+        // 裁决交付：工具线程还在 awaitVerdict 上等待（= run 仍活着、同一 run 继续）→
+        // 返回 null，UI 不再新发消息；工具线程已超时放弃 / run 已结束 → 返回 reply，
+        // UI 复用旧逻辑（新发消息）兜底，保证裁决不丢。
+        // 拒绝 / 手动接管：以失败语义收尾（rejected=true），模型收到 USER_REJECTED 后
+        // 不再尝试重试同一操作，避免反复挂新卡造成「一直卡在读秒」（2026-11-25 修复）。
+        val denied = optionId == PromptOptionId.REJECT || optionId == PromptOptionId.MANUAL
+        return if (completeVerdict(token, reply, rejected = denied)) null else reply
     }
 
     /**
@@ -482,7 +617,7 @@ internal object AgentConfirmGuard {
         AndroidAgentLogger.info("Prompt chosen many token=$token count=${labels.size}")
         EtaTrace.log("confirm.chooseMany", "count=${labels.size} title=${current.title.take(40)}")
         resume(context)
-        return text
+        return if (completeVerdict(token, text)) null else text
     }
 
     /**
@@ -515,7 +650,7 @@ internal object AgentConfirmGuard {
         AndroidAgentLogger.info("Prompt freeform token=$token")
         EtaTrace.log("confirm.freeform", "title=${current.title.take(40)}")
         resume(context)
-        return reply
+        return if (completeVerdict(token, reply)) null else reply
     }
 
     /**
@@ -532,7 +667,7 @@ internal object AgentConfirmGuard {
         AndroidAgentLogger.info("Prompt skipped token=$token")
         EtaTrace.log("confirm.skip", "title=${current.title.take(40)}")
         resume(context)
-        return reply
+        return if (completeVerdict(token, reply)) null else reply
     }
 
     /**
@@ -560,6 +695,7 @@ internal object AgentConfirmGuard {
         options: List<PromptOption>,
         allowMultiple: Boolean = false,
         runId: String = "",
+        isCancelled: () -> Boolean = { false },
     ): String {
         // 一次只留一张**提问**卡：直接覆盖会让上一问凭空消失，用户还没答就丢了。
         // 但审批卡（资金 / 隐私 / 不可撤销）不算占用：它和「向用户提问」是两件事，
@@ -599,36 +735,65 @@ internal object AgentConfirmGuard {
             allowMultiple = allowMultiple,
             conversationKey = owner,
             source = PendingApproval.SOURCE_ASK,
+            runId = runId,
         )
         mutatePendings { current ->
             current.filter { it.conversationKey != owner && !it.expired() } + pending
         }
+        // 同样预建裁决 slot，避免 UI 先裁决时 slot 不存在导致丢失。
+        verdictResults.putIfAbsent(pending.token, VerdictSlot())
         // 提问也要发通知：用户可能正在别的应用里，不提醒他根本不知道有人在等。
         // （早先只有拦截路径调了 notify，提问这条线一直是静默的。）
         context?.let { runCatching { notify(it, pending) } }
-        // 刻意不 pause：本轮会拿到 AWAITING_USER 后自然收尾。
-        // 挂住反而不对——用户选完时 run 往往已经结束，resume/steer 都会落空。
+        // 提问也走 awaitVerdict 阻塞：工具线程挂起等用户裁决（reverse 的 Condition.await 语义），
+        // 不设 pauseRun 标记、不结束 run、不新发消息；用户点选后同一 run 继续。
+        // run 若被取消会经 isCancelled 中断等待（ask 的调用方传入 isRunCancelled）。
         AndroidAgentLogger.info("Ask user: ${question.take(40)} options=${clean.size}")
-        return JSONObject()
-            .put("ok", true)
-            .put("code", "AWAITING_USER")
-            .put("token", pending.token)
-            .put("message", "问题已经展示给用户，本轮已暂停。用户选完会以消息形式告诉你他选了什么，不要自己猜答案，也不要重复提问。")
-            .toString()
+        val outcome = awaitVerdict(pending.token, isCancelled = isCancelled)
+        val verdict = outcome?.reply
+        if (verdict == null) {
+            // 超时（默认 30 分钟）仍无人应答 / run 被取消：回到旧的 AWAITING_USER 收尾，避免 run 永久挂死。
+            EtaTrace.log("confirm.ask.timeout", "token=${pending.token}")
+            return JSONObject()
+                .put("ok", true)
+                .put("code", "AWAITING_USER")
+                .put("token", pending.token)
+                .put("message", "问题已经展示给用户，本轮已暂停。用户选完会以消息形式告诉你他选了什么，不要自己猜答案，也不要重复提问。")
+                .toString()
+        }
+        return if (verdict.isBlank()) {
+            JSONObject()
+                .put("ok", true)
+                .put("code", "AWAITING_USER")
+                .put("token", pending.token)
+                .put("message", "问题已经展示给用户，等待回答。")
+                .toString()
+        } else if (outcome.rejected) {
+            JSONObject()
+                .put("ok", false)
+                .put("code", "USER_REJECTED")
+                .put("token", pending.token)
+                .put("message", verdict)
+                .toString()
+        } else {
+            JSONObject()
+                .put("ok", true)
+                .put("code", "USER_VERDICT")
+                .put("token", pending.token)
+                .put("message", verdict)
+                .toString()
+        }
     }
 
     /** 批准回灌文案：字段带上，模型才知道批的是哪一单。 */
     private fun approvalText(current: PendingApproval): String {
         val detail = current.fields.joinToString(" · ") { "${it.label} ${it.value}" }.take(160)
         val suffix = if (detail.isBlank()) "" else "（$detail）"
-        // 带上原始调用：只回灌一句「已确认」时，模型常常改写参数或干脆不再发起，命令就永远没被执行。
-        val replay = if (current.toolName.isNotBlank()) {
-            "用户已批准这次调用，请立刻用完全相同的工具与参数重新发起，不要改写命令、不要换别的工具：" +
-                "${current.toolName}(${current.toolArgs})。这次调用已放行，不会再询问。"
-        } else {
-            "请继续执行这一步，不要重复询问同一操作。"
-        }
-        return "用户已确认「${current.title}」$suffix。$replay"
+        // 批准后：原调用已在工具线程上行，不需要模型重发。回灌只传达「已获许可、继续」，
+        // 显式禁止再用相同工具与参数重新发起——否则每次批准都会重复执行同一操作（实测踩到）。
+        // 若模型这一轮已经走到别处、原调用确未执行，它应基于自身上下文判断是否继续，而不是照抄参数重发。
+        return "用户已批准「${current.title}」$suffix，该操作已获许可并继续执行。" +
+            "不要重复发起同一操作，不要用相同参数重试；直接按当前进度继续下一步。"
     }
 
     private fun grantFor(current: PendingApproval, remember: Boolean) {
@@ -661,6 +826,9 @@ internal object AgentConfirmGuard {
     fun dismiss(context: Context?, token: String) {
         clearNotification(context, token)
         takeIfCurrent(token)
+        // 唤醒仍在等待的工具线程：以「无裁决」收尾，工具侧回退为 NEED_CONFIRM 结果，
+        // 不让 run 挂死在 awaitVerdict 上。
+        verdictResults.remove(token)?.latch?.countDown()
     }
 
     /** 会话卡与通知共用：token 对得上、没过期，才允许消费，消费即清空。 */

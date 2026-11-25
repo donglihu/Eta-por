@@ -15,6 +15,11 @@ internal data class ConfirmDraft(
     val risk: ConfirmRisk,
     val title: String,
     val fields: List<ConfirmField>,
+    /**
+     * 挂卡后由 [io.github.mangi.eta.agent.display.dashboard.AgentConfirmGuard.register] 回填的审批 token：
+     * 工具线程用它阻塞等待用户裁决，点选后以裁决文本继续同一 run。
+     */
+    val token: String = "",
 )
 
 internal object ConfirmRiskDetector {

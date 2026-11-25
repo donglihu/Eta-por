@@ -80,6 +80,10 @@ sealed interface AgentToolsAction {
     data object NavigateBack : AgentToolsAction
     data object OpenBrowser : AgentToolsAction
     data object OpenWebToolsSettings : AgentToolsAction
+    /** 单个工具开关；enabled = false 表示写入禁用集合。下一轮对话才生效。 */
+    data class ToggleTool(val toolId: String, val enabled: Boolean) : AgentToolsAction
+    /** 整组批量开关；只作用于该组内可开关的工具。 */
+    data class ToggleGroup(val groupId: String, val enabled: Boolean) : AgentToolsAction
 }
 
 sealed interface AgentSkillsAction {

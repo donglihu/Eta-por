@@ -174,7 +174,6 @@ internal fun ConversationPanePanel(
     onOpenModelProviders: () -> Unit,
     onOpenTools: () -> Unit,
     onOpenSkills: () -> Unit,
-    onOpenScheduledTasks: () -> Unit = {},
     onOpenCharacters: () -> Unit,
     onOpenPermissions: () -> Unit,
     onOpenTasks: () -> Unit,
@@ -301,124 +300,28 @@ internal fun ConversationPanePanel(
                             verticalAlignment = Alignment.CenterVertically,
                             horizontalArrangement = Arrangement.spacedBy(8.dp),
                         ) {
-                            if (!isSearching) {
-                                item(key = "pane_workbench") {
-                                    PaneWorkbenchSection(
-                                        activeModelLabel = activeModelLabel,
-                                        onOpenModelProviders = onOpenModelProviders,
-                                        onOpenCharacters = onOpenCharacters,
-                                        onOpenTools = onOpenTools,
-                                        onOpenSkills = onOpenSkills,
-                                        onOpenScheduledTasks = onOpenScheduledTasks,
-                                    )
-                                }
-                            }
-
-                            if (state.conversations.isEmpty()) {
-                                item(key = "pane_empty_conversations") {
-                                    EmptyConversations(isSearching = isSearching)
-                                }
-                            } else {
-                                groups.forEachIndexed { groupIndex, group ->
-                                    item(key = "section-${group.section}") {
-                                        ConversationSectionHeader(
-                                            group = group,
-                                            isFirstSection = groupIndex == 0,
-                                            hasWorkbenchAbove = !isSearching,
-                                        )
-                                    }
-                                    items(
-                                        items = group.items,
-                                        key = { it.id },
-                                    ) { conversation ->
-                                        ConversationHistoryRow(
-                                            conversation = conversation,
-                                            selected = conversation.id == state.selectedConversationId,
-                                            miuixBackdrop = miuixBackdrop,
-                                            onClick = { onConversationSelected(conversation.id) },
-                                            onTogglePin = { onConversationTogglePin(conversation) },
-                                            onRename = { onConversationRename(conversation) },
-                                            onExport = { onConversationExport(conversation) },
-                                            onDelete = { onConversationDelete(conversation) },
-                                        )
-                                    }
-                                }
-                            }
+                            Text(
+                                stringResource(R.string.app_name),
+                                style = MiuixTheme.textStyles.headline2,
+                                fontWeight = FontWeight.Bold,
+                                color = MiuixTheme.colorScheme.onSurface,
+                                maxLines = 1,
+                            )
+                            PaneModeBadges(
+                                rootGranted = capabilities.root.isGranted,
+                                accessibilityAvailable = capabilities.accessibilityAvailable,
+                                onOpenRootSettings = onOpenRootSettings,
+                                onOpenAccessibilitySettings = onOpenAccessibilitySettings,
+                                onOpenSettings = onOpenSettings,
+                                modifier = Modifier.weight(1f),
+                            )
                         }
                     }
                     Spacer(Modifier.height(ConversationPanelMetrics.AfterActionBar))
                 }
             }
-
-            // 侧栏物理右侧细微收边，保证浅/深/纯黑模式下与右侧聊天舞台始终保持利落边界。
-            Box(
-                modifier = Modifier
-                    .align(Alignment.CenterEnd)
-                    .fillMaxHeight()
-                    .width(0.5.dp)
-                    .background(conversationPaneEdgeBorderColor()),
-            )
-        }
-    }
-}
-
-private data class WorkbenchEntry(
-    val icon: ImageVector,
-    val title: String,
-    val trailingValue: String? = null,
-    val onClick: () -> Unit,
-)
-
-@Composable
-private fun PaneWorkbenchSection(
-    activeModelLabel: String?,
-    onOpenModelProviders: () -> Unit,
-    onOpenCharacters: () -> Unit,
-    onOpenTools: () -> Unit,
-    onOpenSkills: () -> Unit,
-    onOpenScheduledTasks: () -> Unit = {},
-) {
-    val modelSummary = activeModelLabel?.takeIf { it.isNotBlank() }
-        ?: stringResource(R.string.conversation_model_unconfigured)
-    val entries = listOf(
-        WorkbenchEntry(
-            icon = ConversationPaneIcons.Model,
-            title = stringResource(R.string.conversation_dock_models),
-            trailingValue = modelSummary,
-            onClick = onOpenModelProviders,
-        ),
-        WorkbenchEntry(
-            icon = ConversationPaneIcons.Character,
-            title = stringResource(R.string.conversation_dock_characters),
-            onClick = onOpenCharacters,
-        ),
-        WorkbenchEntry(
-            icon = ConversationPaneIcons.Tools,
-            title = stringResource(R.string.route_tools),
-            onClick = onOpenTools,
-        ),
-        WorkbenchEntry(
-            icon = ConversationPaneIcons.Skills,
-            title = stringResource(R.string.route_skills),
-            onClick = onOpenSkills,
-        ),
-        WorkbenchEntry(
-            icon = ConversationPaneIcons.Schedule,
-            title = stringResource(R.string.route_scheduled_tasks),
-            onClick = onOpenScheduledTasks,
-        ),
-    )
-
-    val cardColor = conversationPaneCardColor()
-    val dividerIndent = ConversationPanelMetrics.WorkbenchRowHorizontalPadding +
-        ConversationPanelMetrics.WorkbenchIconSize +
-        ConversationPanelMetrics.WorkbenchIconGap
-
-    when (LocalUiStyle.current) {
-        AppearanceUiStyle.COUI -> {
-            val shape = remember { CouiShape(ConversationPanelMetrics.WorkbenchCornerRadius, 2.5f) }
-            val dark = CouiTheme.isDark
-            Column(
+            LazyColumn(
+                state = listState,
                 modifier = Modifier
                     .fillMaxWidth()
                     .weight(1f)

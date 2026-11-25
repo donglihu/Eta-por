@@ -53,6 +53,7 @@ import io.github.mangi.eta.agent.expert.ExpertStore
 import io.github.mangi.eta.agent.model.AgentToolCatalog
 import io.github.mangi.eta.agent.skill.SkillRuntime
 import io.github.mangi.eta.agent.tool.AgentToolCapabilities
+import io.github.mangi.eta.config.Prefs
 import io.github.mangi.eta.data.repository.ProviderRepository
 import io.github.mangi.eta.ui.model.AgentModelPickerProjector
 import io.github.mangi.eta.ui.model.AgentModelProviderGroupUi
@@ -582,6 +583,8 @@ internal fun ExpertEditorSheet(draft: ExpertDraft, onDismiss: () -> Unit, onSave
                 memoryWritable = true,
                 capabilities = AgentToolCapabilities(rootAvailable = true),
                 localWebSearch = true,
+                // 与运行时同一口径：能力页关掉的工具不进白名单池，避免给专家配上永远跑不了的工具。
+                disabledTools = Prefs.disabledTools(),
             )
             (0 until array.length()).mapNotNull { index ->
                 val function = array.optJSONObject(index)?.optJSONObject("function")

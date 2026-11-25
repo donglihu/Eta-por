@@ -9,6 +9,7 @@ import io.github.mangi.eta.agent.display.dashboard.AgentInjectionGate
 import io.github.mangi.eta.agent.model.AgentModelClient
 import io.github.mangi.eta.agent.runtime.AgentExecutionService
 import io.github.mangi.eta.data.datastore.SettingsDataStore
+import io.github.mangi.eta.data.model.Settings
 import java.io.BufferedReader
 import java.io.BufferedWriter
 import java.util.concurrent.Executors
@@ -16,6 +17,7 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import java.util.UUID
+import kotlin.concurrent.withLock
 import kotlin.math.roundToInt
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -35,7 +37,44 @@ import org.json.JSONObject
  * 整帧 JPEG 管线，画面不会互相抢占。
  */
 internal object VirtualScreenSession {
-    private val lock = Any()
+    private val lock = java.util.concurrent.locks.ReentrantLock()
+
+    /** 纯读状态的短等上限：主线程最多被拖这么久，远低于输入分发 5s 的 ANR 线。 */
+    private const val MAIN_READ_WAIT_MS = 120L
+
+    /**
+     * 主线程入口专用：拿不到锁立刻走兜底值，绝不让 UI 线程排队。
+     *
+     * ANR 现场（`/data/anr/anr_2026-11-25_09-13-00-580`）：
+     * `agent-runtime` 在 [execute] 里持有本对象的锁，锁内又等无障碍主线程（`CountDownLatch` 最长 3s）；
+     * 同一时刻主线程在悬浮窗协程里想进同一把锁 → 互等 → Input dispatch 等满 5s → 进程被判 ANR 杀掉
+     * → helper 子进程连带消失（用户看到的就是「灵屏闪退」）。
+     * 所以凡是主线程会碰的入口都必须走这里：锁被占用就放弃本次，下一帧/下次点击自然重试。
+     */
+    private inline fun <T> tryLocked(busy: () -> T, block: () -> T): T {
+        if (!lock.tryLock()) return busy()
+        try {
+            return block()
+        } finally {
+            lock.unlock()
+        }
+    }
+
+    /** 纯读状态用：允许短等 [MAIN_READ_WAIT_MS]，超时给兜底值，避免锁竞争时读到错误结论。 */
+    private inline fun <T> readLocked(busy: () -> T, block: () -> T): T {
+        if (!lock.tryLock(MAIN_READ_WAIT_MS, TimeUnit.MILLISECONDS)) return busy()
+        try {
+            return block()
+        } finally {
+            lock.unlock()
+        }
+    }
+
+    /** 锁被占用时的可重试失败：调用方按「忙，稍后重试」处理，不当成灵屏异常。 */
+    private fun busyResult() = failure("VIRTUAL_SCREEN_BUSY")
+
+    /** 设置快照 TTL：兼顾「设置页切完立刻生效」与「25fps 路径不读盘」。 */
+    private const val SETTINGS_CACHE_TTL_MS = 1_500L
 
     /**
      * 手机是否处于锁屏（亮屏锁屏也算）。
@@ -53,6 +92,24 @@ internal object VirtualScreenSession {
 
     /** owner → 屏。LinkedHashMap 保持创建顺序，回收时先尝试最早的。 */
     private val sessions = LinkedHashMap<String, Session>()
+
+    /**
+     * 设置快照缓存。
+     *
+     * [execute] 被浮窗按 25fps 调用，原来每次都在全局锁里 `runBlocking` 读 DataStore：
+     * 等于每秒几十次阻塞读盘，还全部压在锁内，主线程一进来就是 ANR 的候选。
+     * 这里给 1.5 秒 TTL——设置页的一次切换仍有亚秒级生效，浮窗路径的读盘次数降两个数量级。
+     */
+    @Volatile
+    private var settingsCache: Settings? = null
+
+    @Volatile
+    private var settingsCacheAt = 0L
+
+    /** 非预期退出后的重建配额：同一 owner 10 分钟内最多 3 次，防重建风暴。 */
+    private val rebuildHistory = mutableMapOf<String, MutableList<Long>>()
+    private const val REBUILD_WINDOW_MS = 10 * 60 * 1000L
+    private const val REBUILD_MAX_ATTEMPTS = 3
 
     /** 焦点屏镜像：浮窗与查看页只订阅它。 */
     private val viewerState = MutableStateFlow(VirtualScreenViewerState())
@@ -163,8 +220,11 @@ internal object VirtualScreenSession {
         val output: BufferedReader,
         var width: Int,
         var height: Int,
+        /** 建屏时的密度：helper 非预期退出后重建要还原同一档，否则灵屏布局会跳一次。 */
+        val density: Int,
         val allowOff: Boolean,
-        runId: String?,
+        /** 建这块屏时绑定的 run；helper 意外退出重建时要沿用同一个 run 归属。 */
+        val runId: String?,
     ) {
         val id = UUID.randomUUID().toString()
         var displayId: Int = -1
@@ -181,7 +241,7 @@ internal object VirtualScreenSession {
 
         fun close() {
             if (!closed.compareAndSet(false, true)) return
-            synchronized(lock) {
+            lock.withLock {
                 if (sessions[owner] === this) sessions.remove(owner)
                 if (focusedOwner == owner) {
                     focusedOwner = sessions.keys.lastOrNull()
@@ -203,6 +263,75 @@ internal object VirtualScreenSession {
         }
     }
 
+    /**
+     * 设置快照：1.5 秒 TTL。
+     *
+     * 读盘失败不缓存、不吞：直接把异常抛给 [execute] 的 catch，由它按 VIRTUAL_SCREEN_FAILED
+     * 回给调用方——「读不到设置」和「设置关着」在语义上必须分开。
+     */
+    private fun currentSettings(): Settings {
+        val now = SystemClock.elapsedRealtime()
+        settingsCache?.let { cached ->
+            if (now - settingsCacheAt < SETTINGS_CACHE_TTL_MS) return cached
+        }
+        val fresh = runBlocking { SettingsDataStore.settings() }
+        settingsCache = fresh
+        settingsCacheAt = now
+        return fresh
+    }
+
+    /**
+     * helper 非预期退出后的重建。
+     *
+     * 为什么不直接在退出线程里建：退出线程要立刻返回，而 create 会走 [execute] 的全局锁；
+     * 排到 cleanup 线程既避免在 `waitFor` 回调里做重活，也让同 owner 的重建串行。
+     * 参数沿用建屏时的 capture 尺寸与密度，保证重建后布局不跳档（否则灵屏会按默认档重排一次）。
+     */
+    private fun scheduleRebuild(dead: Session, exitCode: Int) {
+        val now = SystemClock.elapsedRealtime()
+        val allowed = lock.withLock {
+            val history = rebuildHistory.getOrPut(dead.owner) { mutableListOf() }
+            history.removeAll { now - it > REBUILD_WINDOW_MS }
+            if (history.size >= REBUILD_MAX_ATTEMPTS) {
+                false
+            } else {
+                history += now
+                true
+            }
+        }
+        if (!allowed) {
+            VscrDiag.line("灵屏重建放弃 owner=" + dead.owner.take(8) + " 原因=配额用尽 exitCode=" + exitCode)
+            return
+        }
+        VscrDiag.line("灵屏重建排入 owner=" + dead.owner.take(8) + " exitCode=" + exitCode)
+        cleanup.execute {
+            runCatching {
+                // 让 helper 释放 display 落定：立刻重开容易拿到同一 displayId 的残影。
+                Thread.sleep(800L)
+                val request = JSONObject()
+                    .put("action", "create")
+                    .put("width", dead.width)
+                    .put("height", dead.height)
+                    .put("density", dead.density)
+                val result = execute(dead.context, dead.owner, request, runId = dead.runId)
+                val ok = runCatching { JSONObject(result.content).optBoolean("ok") }.getOrDefault(false)
+                VscrDiag.line("灵屏重建 owner=" + dead.owner.take(8) + " ok=" + ok)
+                if (!ok) {
+                    // 重建失败必须留原因，否则「灵屏老是没」永远无从查起。
+                    VscrDiag.line(
+                        "灵屏重建失败 owner=" + dead.owner.take(8) + " 原样=" + result.content.take(160)
+                    )
+                }
+                Unit
+            }.onFailure { error ->
+                VscrDiag.line(
+                    "灵屏重建异常 owner=" + dead.owner.take(8) +
+                        " 原因=" + (error.message ?: error.javaClass.simpleName)
+                )
+            }
+        }
+    }
+
     /** 把某块屏的状态抄到外层镜像（仅当它是焦点）。 */
     private fun publish(session: Session) {
         if (focusedOwner == session.owner) viewerState.value = session.viewer.value
@@ -217,11 +346,11 @@ internal object VirtualScreenSession {
         VirtualScreenHostSurfaces.setFocusOwner(session.owner)
     }
 
-    fun isActive(): Boolean = synchronized(lock) {
+    fun isActive(): Boolean = readLocked({ true }) {
         sessions.values.any { !it.closed.get() && it.process.isAlive }
     }
 
-    fun isActive(owner: String): Boolean = synchronized(lock) {
+    fun isActive(owner: String): Boolean = readLocked({ true }) {
         sessions[owner]?.let { !it.closed.get() && it.process.isAlive } == true
     }
 
@@ -235,15 +364,15 @@ internal object VirtualScreenSession {
         context.resources.displayMetrics.densityDpi
 
     /** 当前是否有任何一块灵屏活着（用于让 UI 工具自动跟随路由）。 */
-    fun hasActiveSession(): Boolean = synchronized(lock) {
+    fun hasActiveSession(): Boolean = readLocked({ false }) {
         sessions.values.any { !it.closed.get() && it.process.isAlive }
     }
 
     fun isOwnedBy(owner: String): Boolean = isActive(owner)
 
-    fun currentOwner(): String? = synchronized(lock) { focusedOwner }
+    fun currentOwner(): String? = readLocked({ null }) { focusedOwner }
 
-    fun activeOwners(): List<String> = synchronized(lock) {
+    fun activeOwners(): List<String> = readLocked({ emptyList() }) {
         sessions.values.filter { !it.closed.get() && it.process.isAlive }.map { it.owner }
     }
 
@@ -255,7 +384,7 @@ internal object VirtualScreenSession {
      * 进入工具前准备：本会话已有屏就走租约；没有屏则在上限内允许新建。
      * 别的会话的屏不再挡住本会话（多开），只有到上限时才尝试回收对方空闲的屏。
      */
-    fun prepareForRun(owner: String, runId: String): Boolean = synchronized(lock) {
+    fun prepareForRun(owner: String, runId: String): Boolean = lock.withLock {
         sessions[owner]?.takeIf { it.closed.get() || !it.process.isAlive }?.let { stale ->
             sessions.remove(owner)
             stale.close()
@@ -276,10 +405,10 @@ internal object VirtualScreenSession {
                     updateIdleTimeout(owner)
                 }
             }
-            return@synchronized acquired
+            return@withLock acquired
         }
         // 数量不设限，只看内存：够就再开一块，不够就明确告诉调用方，而不是悄悄关掉别人的屏。
-        if (hasMemoryForNewSession()) return@synchronized true
+        if (hasMemoryForNewSession()) return@withLock true
         VscrDiag.line(
             "灵屏 内存不足，拒绝新建 现有=" + sessions.size +
                 " 可用=" + runCatching {
@@ -295,17 +424,17 @@ internal object VirtualScreenSession {
         false
     }
 
-    fun releaseRun(owner: String, runId: String, retain: Boolean, cancelled: Boolean = false) = synchronized(lock) {
-        val current = sessions[owner] ?: return@synchronized
-        if (!current.runLease.release(runId, retain)) return@synchronized
+    fun releaseRun(owner: String, runId: String, retain: Boolean, cancelled: Boolean = false) = lock.withLock {
+        val current = sessions[owner] ?: return@withLock
+        if (!current.runLease.release(runId, retain)) return@withLock
         current.viewer.update { it.finishRun(runId, retain, cancelled) }
         publish(current)
         if (!retain) current.close() else updateIdleTimeout(owner)
     }
 
-    fun updateIdleTimeout(owner: String? = null) = synchronized(lock) {
+    fun updateIdleTimeout(owner: String? = null) = lock.withLock {
         val targets = if (owner != null) listOfNotNull(sessions[owner]) else sessions.values.toList()
-        if (targets.isEmpty()) return@synchronized
+        if (targets.isEmpty()) return@withLock
         val settings = runBlocking { SettingsDataStore.settings() }
         val profile = watchProfile
         val interval = when {
@@ -377,7 +506,7 @@ internal object VirtualScreenSession {
         watchProfile?.let { resolveInterval(it) } ?: READ_SCREEN_INTERVAL_MS
 
     fun recordOperation(owner: String, runId: String?, name: String, success: Boolean, manual: Boolean = false) {
-        val current = synchronized(lock) { sessions[owner]?.takeIf { !it.closed.get() } } ?: return
+        val current = readLocked({ null }) { sessions[owner]?.takeIf { !it.closed.get() } } ?: return
         val operation = VirtualScreenOperation(operationIds.incrementAndGet(), name, System.currentTimeMillis(), success, manual)
         current.viewer.update {
             if (runId != null && it.activeRunId != runId) it else it.record(operation)
@@ -394,12 +523,13 @@ internal object VirtualScreenSession {
         appRestartApproved: Boolean = false,
         /** true = 用户在悬浮窗/查看页里的手动输入；不参与注入门控。 */
         manual: Boolean = false,
-    ): AgentModelClient.ToolResult = synchronized(lock) {
+    ): AgentModelClient.ToolResult = lock.withLock {
         try {
             if (appContext == null) appContext = context.applicationContext
             check(!isCancelled()) { "DISPLAY_CANCELLED" }
             require(android.os.Build.VERSION.SDK_INT >= 34) { "DEVICE_UNSUPPORTED" }
-            val settings = runBlocking { SettingsDataStore.settings() }
+            // 25fps 路径上不能每次读盘：走 1.5s TTL 快照（见 [currentSettings]）。
+            val settings = currentSettings()
             require(settings.virtualScreenEnabled) { "VIRTUAL_SCREEN_DISABLED" }
             if (!RootAccess.isGranted) {
                 VscrDiag.line("RootAccess 未授权，主动申请一次")
@@ -444,7 +574,7 @@ internal object VirtualScreenSession {
                         publish(existing)
                         VirtualScreenWakeLock.sync(context, settings.virtualScreenKeepScreenOn)
                         updateIdleTimeout(owner)
-                        return@synchronized AgentModelClient.ToolResult(
+                        return@withLock AgentModelClient.ToolResult(
                             JSONObject().put("ok", true)
                                 .put("displayId", existing.displayId)
                                 .put("width", reused.width).put("height", reused.height)
@@ -512,17 +642,27 @@ internal object VirtualScreenSession {
                 }.apply { isDaemon = true; start() }
                 val input = process.outputStream.bufferedWriter()
                 val output = process.inputStream.bufferedReader()
-                val current = Session(context.applicationContext, owner, process, input, output, width, height, allowOff, runId)
+                val current = Session(context.applicationContext, owner, process, input, output, width, height, density, allowOff, runId)
                 sessions[owner] = current
                 focus(current)
                 VirtualScreenWakeLock.sync(context, settings.virtualScreenKeepScreenOn)
                 Thread {
                     val exitCode = runCatching { process.waitFor() }.getOrDefault(-1)
                     // 退出码是判断 native 崩溃还是被系统回收的唯一线索，必须留下。
-                    io.github.mangi.eta.core.EtaTrace.log("vscr", "helper 退出 owner=$owner exitCode=$exitCode")
+                    // unexpected=true 表示不是我们自己 close 掉的：这才是「灵屏突然没了」的那一类。
+                    val unexpected = !current.closed.get()
+                    io.github.mangi.eta.core.EtaTrace.log(
+                        "vscr",
+                        "helper 退出 owner=$owner exitCode=$exitCode unexpected=$unexpected"
+                    )
                     HelperExitLog.finished(exitCode)
-                    VscrDiag.line("helper 退出 owner=" + owner + " exitCode=" + exitCode)
+                    VscrDiag.line(
+                        "helper 退出 owner=" + owner + " exitCode=" + exitCode + " unexpected=" + unexpected
+                    )
                     current.close()
+                    // 早前这里只 close 就结束：屏直接消失，用户看到的是「灵屏里的应用闪退」，
+                    // 而且没有任何自动恢复，只能自己重开一次。非预期退出必须尝试重建。
+                    if (unexpected) scheduleRebuild(current, exitCode)
                 }.apply { name = "eta-display-exit"; isDaemon = true; start() }
                 if (!AgentExecutionService.acquire(context, "virtual-screen-${current.id}", onStop = current::close)) {
                     current.close(); error("DISPLAY_LIFECYCLE_UNAVAILABLE")
@@ -596,7 +736,7 @@ internal object VirtualScreenSession {
                     VirtualScreenNotification.cancel(context, current.id)
                     error("DISPLAY_CANCELLED")
                 }
-                return@synchronized AgentModelClient.ToolResult(response.toString())
+                return@withLock AgentModelClient.ToolResult(response.toString())
             }
             val current = sessions[owner] ?: error("NO_VIRTUAL_SCREEN")
             require(!current.closed.get() && current.process.isAlive) { "DISPLAY_GONE" }
@@ -696,7 +836,7 @@ internal object VirtualScreenSession {
     }
 
     /** A′ 直通：宿主面变了（查看页/小窗重建、互切），让 helper 立刻重新取面。 */
-    fun notifyHostSurface(context: Context) = synchronized(lock) {
+    fun notifyHostSurface(context: Context) = tryLocked({ Unit }) {
         val targets = sessions.values.toList()
         if (targets.isEmpty()) VscrDiag.line("直通 notify 无会话")
         targets.forEach { current ->
@@ -722,20 +862,20 @@ internal object VirtualScreenSession {
         private set
 
     /** 只探尺寸与前台包，不拉整帧：直通模式下小窗靠它跟上灵屏的横竖屏切换。 */
-    fun refreshForViewer(context: Context, owner: String? = null): AgentModelClient.ToolResult = synchronized(lock) {
-        val target = chooseSession(owner) ?: return@synchronized failure("NO_VIRTUAL_SCREEN")
+    fun refreshForViewer(context: Context, owner: String? = null): AgentModelClient.ToolResult = tryLocked({ busyResult() }) {
+        val target = chooseSession(owner) ?: return@tryLocked failure("NO_VIRTUAL_SCREEN")
         execute(context, target.owner, JSONObject().put("action", "probe"))
     }
 
-    fun observeForViewer(context: Context, afterFrameId: Long = 0, owner: String? = null): AgentModelClient.ToolResult = synchronized(lock) {
-        val target = chooseSession(owner) ?: return@synchronized failure("NO_VIRTUAL_SCREEN")
+    fun observeForViewer(context: Context, afterFrameId: Long = 0, owner: String? = null): AgentModelClient.ToolResult = tryLocked({ busyResult() }) {
+        val target = chooseSession(owner) ?: return@tryLocked failure("NO_VIRTUAL_SCREEN")
         execute(context, target.owner, JSONObject().put("action", "observe").put("afterFrameId", afterFrameId))
     }
 
-    fun inputForViewer(context: Context, sessionId: String, args: JSONObject): AgentModelClient.ToolResult = synchronized(lock) {
+    fun inputForViewer(context: Context, sessionId: String, args: JSONObject): AgentModelClient.ToolResult = tryLocked({ busyResult() }) {
         val current = sessions.values.firstOrNull { it.id == sessionId }
         if (current == null || args.optString("action") !in setOf("tap", "swipe", "long_press", "back", "key", "switch_task", "text", "touch", "ime")) {
-            return@synchronized failure("STALE_VIRTUAL_SCREEN")
+            return@tryLocked failure("STALE_VIRTUAL_SCREEN")
         }
         // 直通拖动每秒上百个事件：只有按下和抬起值得记一条历史。
         val liveMove = args.optString("action") == "touch" && args.optString("phase") in setOf("down", "move")
@@ -753,23 +893,23 @@ internal object VirtualScreenSession {
         }
     }
 
-    fun tasksForViewer(context: Context, sessionId: String): AgentModelClient.ToolResult = synchronized(lock) {
-        val current = sessions.values.firstOrNull { it.id == sessionId } ?: return@synchronized failure("STALE_VIRTUAL_SCREEN")
+    fun tasksForViewer(context: Context, sessionId: String): AgentModelClient.ToolResult = tryLocked({ busyResult() }) {
+        val current = sessions.values.firstOrNull { it.id == sessionId } ?: return@tryLocked failure("STALE_VIRTUAL_SCREEN")
         execute(context, current.owner, JSONObject().put("action", "tasks"))
     }
 
     /** 手动在小窗里点开某个应用：只在 display 内启动，绝不把主屏任务迁进来。 */
-    fun launchForViewer(context: Context, sessionId: String, component: String): AgentModelClient.ToolResult = synchronized(lock) {
-        val current = sessions.values.firstOrNull { it.id == sessionId } ?: return@synchronized failure("STALE_VIRTUAL_SCREEN")
+    fun launchForViewer(context: Context, sessionId: String, component: String): AgentModelClient.ToolResult = tryLocked({ busyResult() }) {
+        val current = sessions.values.firstOrNull { it.id == sessionId } ?: return@tryLocked failure("STALE_VIRTUAL_SCREEN")
         execute(context, current.owner, JSONObject().put("action", "launch").put("component", component)).also { result ->
             recordOperation(current.owner, null, "launch", JSONObject(result.content).optBoolean("ok"), manual = true)
         }
     }
 
     /** 在 display 内打开 Eta 自带导航页；mode 用 HOME / MENU / APPS。 */
-    fun homeForViewer(context: Context, sessionId: String, mode: String): AgentModelClient.ToolResult = synchronized(lock) {
-        val current = sessions.values.firstOrNull { it.id == sessionId } ?: return@synchronized failure("STALE_VIRTUAL_SCREEN")
-        val action = mode.takeIf { it in setOf("HOME", "MENU", "APPS") } ?: return@synchronized failure("VIRTUAL_ACTION_UNSUPPORTED")
+    fun homeForViewer(context: Context, sessionId: String, mode: String): AgentModelClient.ToolResult = tryLocked({ busyResult() }) {
+        val current = sessions.values.firstOrNull { it.id == sessionId } ?: return@tryLocked failure("STALE_VIRTUAL_SCREEN")
+        val action = mode.takeIf { it in setOf("HOME", "MENU", "APPS") } ?: return@tryLocked failure("VIRTUAL_ACTION_UNSUPPORTED")
         execute(context, current.owner, JSONObject().put("action", "key").put("button", action))
     }
 
@@ -779,15 +919,15 @@ internal object VirtualScreenSession {
         owner: String,
         isCancelled: () -> Boolean = { false },
         block: (VirtualDisplayInfo) -> AgentModelClient.ToolResult,
-    ): AgentModelClient.ToolResult = synchronized(lock) {
+    ): AgentModelClient.ToolResult = lock.withLock {
         val probe = execute(context, owner, JSONObject().put("action", "probe"), isCancelled)
-        if (!JSONObject(probe.content).optBoolean("ok")) return@synchronized probe
-        val info = sessions[owner]?.viewer?.value?.display ?: return@synchronized failure("NO_VIRTUAL_SCREEN")
+        if (!JSONObject(probe.content).optBoolean("ok")) return@withLock probe
+        val info = sessions[owner]?.viewer?.value?.display ?: return@withLock failure("NO_VIRTUAL_SCREEN")
         block(info.copy(focusedPackage = JSONObject(probe.content).optString("packageName")))
     }
 
     fun showNodeGesture(info: VirtualDisplayInfo, action: String, x: Int, y: Int, durationMs: Int = 500, endX: Int = x, endY: Int = y) {
-        val current = synchronized(lock) { sessions.values.firstOrNull { it.id == info.sessionId } } ?: return
+        val current = readLocked({ null }) { sessions.values.firstOrNull { it.id == info.sessionId } } ?: return
         publishGesture(current, JSONObject().put("action", action).put("x", x).put("y", y)
             .put("x1", x).put("y1", y).put("x2", endX).put("y2", endY).put("durationMs", durationMs))
     }
@@ -817,7 +957,7 @@ internal object VirtualScreenSession {
     )
 
     fun closeOwner(owner: String) {
-        synchronized(lock) {
+        readLocked({ VscrDiag.line("关闭会话跳过：全局锁忙 owner=" + owner.take(8)) }) {
             sessions[owner]?.let { current ->
                 sessions.remove(owner)
                 current.close()
@@ -828,7 +968,7 @@ internal object VirtualScreenSession {
     }
 
     fun revokePermission() {
-        synchronized(lock) {
+        readLocked({ VscrDiag.line("撤销权限跳过：全局锁忙") }) {
             val all = sessions.values.toList()
             sessions.clear()
             focusedOwner = null

@@ -5,6 +5,7 @@ import io.github.mangi.eta.agent.tool.AgentToolRequirements
 import io.github.mangi.eta.agent.tool.RootRequirement
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -38,6 +39,16 @@ class ToolCapabilityProjectionTest {
         assertTrue(visibleOnCurrentDevice("search_notification_history", false, false))
         assertEquals(RootRequirement.PARTIAL, toolCardRequirement("terminal").rootRequirement)
         assertFalse(visibleOnCurrentDevice("search_coloros_memories", true, false))
+    }
+
+    @Test fun mergedFridaCardStaysVisibleWithoutARegisteredRequirement() {
+        // 合并后的 Frida 卡没有后端、也没有执行要求登记；能力页必须原样列出来并置灰，
+        // 不能因为「查不到要求」就整张卡从列表里消失。
+        assertNull(toolCardRequirementOrNull(FRIDA_TOOL_CARD_ID))
+        assertTrue(visibleOnCurrentDevice(FRIDA_TOOL_CARD_ID, rootGranted = false, colorOs = false))
+        val groups = listOf(ToolGroupUi("terminal", "终端与文件", listOf(card(FRIDA_TOOL_CARD_ID))))
+        assertEquals(listOf(FRIDA_TOOL_CARD_ID),
+            projectToolGroups(groups, false, false, false).single().tools.map { it.id })
     }
 
     @Test fun missingOrdinaryPermissionOpensPermissionsBeforePartialRootBenefits() {

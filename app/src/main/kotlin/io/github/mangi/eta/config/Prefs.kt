@@ -48,6 +48,14 @@ internal object Prefs {
         const val AGENT_DEVICE_DIRECT_TOOLS = "agent_device_direct_tools"
         const val AGENT_DEVICE_SENSITIVE_READ_TOOLS = "agent_device_sensitive_read_tools"
         const val AGENT_DEVICE_SENSITIVE_ACTION_TOOLS = "agent_device_sensitive_action_tools"
+        /**
+         * 工具能力页的逐工具禁用集合（StringSet）。
+         *
+         * 默认空集合 = 全开；集合内的工具名在模型目录与执行侧同时被拒绝。
+         * 它不在 [BOOLEAN_DEFAULTS] 里：布尔默认值表只覆盖布尔键，混进来会在遍历时按
+         * getBoolean 读同名字符串键直接抛 ClassCastException。
+         */
+        const val AGENT_DISABLED_TOOLS = "agent_disabled_tools"
         const val AGENT_THINKING_ENABLED = "agent_thinking_enabled"
         const val AGENT_DEFAULT_REASONING_EFFORT = "agent_default_reasoning_effort"
         const val AGENT_AUTO_COMPACTION_ENABLED = "agent_auto_compaction_enabled"
@@ -264,6 +272,32 @@ internal object Prefs {
             }
             if (changed) editor.commit()
         }
+    }
+
+    /**
+     * 读取逐工具禁用集合。local 配置未初始化或读失败时按「全开」处理，不让一次读盘失败
+     * 把所有工具一起关掉。
+     */
+    fun disabledTools(preferences: SharedPreferences? = localAgent ?: remote): Set<String> =
+        runCatching {
+            preferences?.getStringSet(Keys.AGENT_DISABLED_TOOLS, emptySet())?.toSet() ?: emptySet()
+        }.getOrDefault(emptySet())
+
+    /**
+     * 批量写入逐工具开关：enabled = true 移出禁用集合，false 加入。
+     *
+     * 返回是否真的提交成功——写失败时 UI 不能假装开关已生效（下一轮仍按旧集合声明工具）。
+     */
+    fun putDisabledTools(preferences: SharedPreferences, toolNames: Collection<String>, enabled: Boolean): Boolean {
+        val targets = toolNames.filter { it.isNotBlank() }.toSet()
+        if (targets.isEmpty()) return true
+        return runCatching {
+            // getStringSet 返回的是共享实例，直接改会污染内存里的那份，先复制。
+            val current = preferences.getStringSet(Keys.AGENT_DISABLED_TOOLS, emptySet()).orEmpty().toMutableSet()
+            val changed = if (enabled) current.removeAll(targets) else current.addAll(targets)
+            if (!changed) return@runCatching true
+            preferences.edit().putStringSet(Keys.AGENT_DISABLED_TOOLS, current).commit()
+        }.getOrDefault(false)
     }
 
     /** 公共开关与旧版小 V 别名一次提交，兼容尚未重启的助手进程。 */

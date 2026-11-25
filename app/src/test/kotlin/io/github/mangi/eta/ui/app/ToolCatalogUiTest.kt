@@ -12,9 +12,12 @@ import io.github.mangi.eta.agent.tool.RootRequirement
 import io.github.mangi.eta.R
 import io.github.mangi.eta.agent.overlay.toolDisplayNameResource
 import io.github.mangi.eta.ui.components.iconForTool
+import io.github.mangi.eta.ui.model.FRIDA_TOOL_CARD_ID
 import io.github.mangi.eta.ui.model.projectToolGroups
 import io.github.mangi.eta.ui.model.toolCardRequirement
+import io.github.mangi.eta.ui.model.toolCardRequirementOrNull
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -100,15 +103,24 @@ class ToolCatalogUiTest {
     fun everyDisplayedCardHasExplicitMetadataAndKeepsItsOriginalOrder() {
         val groups = buildToolsState(RuntimeEnvironment.getApplication()).groups
         val allCards = groups.flatMap { it.tools }
-        allCards.forEach { toolCardRequirement(it.id) }
+        // Frida 卡在本版本没有后端、也没有登记执行要求，显式断言「查不到」，
+        // 其余卡仍然逐张强制 toolCardRequirement（查不到就炸），不放过任何漏登记。
+        allCards.filter { it.id != "frida" }.forEach { toolCardRequirement(it.id) }
+        assertNull(toolCardRequirementOrNull("frida"))
         assertEquals(allCards.size, allCards.map { it.id }.distinct().size)
         assertEquals(groups, projectToolGroups(groups, true, false, false))
-        assertEquals(groups, projectToolGroups(groups, false, true, true))
+        // 「全部能力」口径（showAll=true）不按设备能力裁剪，必须与原始分组完全一致；
+        // 未登记执行要求的卡（frida）在这里不会被隐藏掉。
+        assertEquals(groups, projectToolGroups(groups, true, true, true))
 
         val ordinaryCards = projectToolGroups(groups, false, false, false).flatMap { it.tools }
         assertTrue(ordinaryCards.isNotEmpty())
+        // Frida 合并卡没有后端也没有执行要求，但「当前设备」视图必须能看到它（置灰不可开关）：
+        // 之前按「查不到要求就隐藏」处理，结果合并后用户在原列表里根本找不到这张卡。
+        assertTrue(ordinaryCards.any { it.id == FRIDA_TOOL_CARD_ID })
         assertEquals(allCards.filter { card ->
-            val requirement = toolCardRequirement(card.id)
+            if (card.id == FRIDA_TOOL_CARD_ID) return@filter true
+            val requirement = toolCardRequirementOrNull(card.id) ?: return@filter false
             requirement.rootRequirement != RootRequirement.REQUIRED && !requirement.colorOs
         }, ordinaryCards)
     }

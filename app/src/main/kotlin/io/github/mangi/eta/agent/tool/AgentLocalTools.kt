@@ -96,6 +96,8 @@ internal class AgentLocalTools(
     private val deviceSensitiveActionToolsEnabled: () -> Boolean = {
         Prefs.isEnabled(Prefs.Keys.AGENT_DEVICE_SENSITIVE_ACTION_TOOLS)
     },
+    /** 工具能力页关掉的工具名；默认直接读本地配置，测试可注入固定集合。 */
+    private val disabledTools: () -> Set<String> = { Prefs.disabledTools() },
     private val memoryToolsEnabled: () -> Boolean = {
         runBlocking { AgentMemoryRepository.isEnabled() }
     },
@@ -277,6 +279,16 @@ internal class AgentLocalTools(
         val execStartedAt = SystemClock.elapsedRealtime()
         return runCatching {
             if (closed.get()) return@runCatching textResult(errorResult("DISPLAY_CANCELLED", "任务已结束，本次工具未执行"))
+            // 审批已放行（用户批准）：本次调用 flow-through 到工具分发，后续闸门不再二次拦截，
+            // 否则同一工具会被连挂两次卡（Ask 卡 + 主屏闸门卡），用户批准了还继续等（2026-11-25 修复）。
+            var approvalGranted = false
+            // 逐工具开关：目录侧已经不声明被关掉的工具，但历史消息、专家白名单或模型凭记忆硬调
+            // 都可能绕过目录，执行侧必须同样拒绝，否则「关了」只是看不见、跑得动。
+            if (!AgentToolAvailability.isToolEnabled(toolCall.name, disabledTools())) {
+                // 拒绝码与文案只在 AgentToolGuard 里定义一份：执行链其它入口（子智能体、MCP、
+                // 复盘、目录）判的都是同一个 code，界面与提示词不会读到两套说法。
+                return@runCatching AgentToolGuard.failure()
+            }
             val args = JSONObject(toolCall.argumentsJson.ifBlank { "{}" })
             // 工具调用审查五档：只读 / 严格 / 标准 / 智能 / 自动。
             // 唯一策略入口是 AgentToolReviewPolicy.decide()，这里不再手写 when 分支——
@@ -316,9 +328,37 @@ internal class AgentLocalTools(
                             toolArgs = args.toString(),
                         )
                     if (registered != null) {
-                        return@runCatching textResult(
-                            io.github.mangi.eta.agent.display.dashboard.AgentConfirmGuard.blockedResult(registered),
-                        )
+                        // 同一 run 阻塞等用户裁决：reverse 的 Condition.await 语义。
+                        // - 批准：原工具本身还没执行，这里直接放行执行（不再让模型重发，避免重复发起）；
+                        // - 拒绝 / 手动接管：以失败语义收尾，模型不会继续重试同一操作。
+                        val outcome = io.github.mangi.eta.agent.display.dashboard.AgentConfirmGuard
+                            .awaitVerdict(registered.token, isCancelled = isRunCancelled)
+                        val reply = outcome?.reply
+                        if (outcome != null && reply.isNullOrBlank()) {
+                            // 有裁决但回灌为空：按阻塞超时 / 被取消处理。
+                            return@runCatching textResult(
+                                io.github.mangi.eta.agent.display.dashboard.AgentConfirmGuard.blockedResult(registered),
+                            )
+                        }
+                        if (outcome != null && outcome.rejected) {
+                            // 拒绝 / 手动接管：失败语义，明确告知不执行、不要重试。
+                            return@runCatching textResult(
+                                io.github.mangi.eta.agent.display.dashboard.AgentConfirmGuard
+                                    .verdictResult(reply.orEmpty(), registered, rejected = true),
+                            )
+                        }
+                        if (outcome != null) {
+                            // 批准：grant 窗口已写入（choose → grantFor），本次调用放行执行。
+                            // 不 return 裁决文本，继续向下走到真正的工具分发——原工具执行一次，
+                            // 结果直接回灌给模型；模型不需要（也不应）再次发起同一调用。
+                            // 后续主屏闸门的 inspect 会命中 grant 窗口而不再挂卡。
+                            approvalGranted = true
+                        } else {
+                            // 没有有效裁决（超时/取消）：以 NEED_CONFIRM 收尾。
+                            return@runCatching textResult(
+                                io.github.mangi.eta.agent.display.dashboard.AgentConfirmGuard.blockedResult(registered),
+                            )
+                        }
                     }
                 }
                 ToolReviewOutcome.Delegate -> Unit
@@ -328,7 +368,7 @@ internal class AgentLocalTools(
             // 主屏 GUI 点击原先完全不过审批：inspectTool 只认 terminal/write_file，
             // 而按屏上文本判定的 inspect() 只挂在灵屏那两个入口上。
             // 主屏回退（或灵屏关闭）时模型可以直接点「确认支付」——这里补同口径闸门。
-            if (reviewMode != ToolReviewMode.AUTO && !virtualUi && toolCall.name in primaryGuardedTools) {
+            if (reviewMode != ToolReviewMode.AUTO && !virtualUi && !approvalGranted && toolCall.name in primaryGuardedTools) {
                 val guard = io.github.mangi.eta.agent.display.dashboard.AgentConfirmGuard
                 val target = when (toolCall.name) {
                     "tap_area" -> guard.labelAt(
@@ -340,7 +380,22 @@ internal class AgentLocalTools(
                     else -> guard.labelAt(args.optInt("x", 0), args.optInt("y", 0))
                 }
                 guard.inspect(context, target, toolCall.name, browserRunId)?.let { draft ->
-                    return@runCatching textResult(guard.blockedResult(draft))
+                    // 同一 run 阻塞等用户裁决：
+                    // - 批准：grant 已写入，放行继续向下执行 GUI 原动作（不 return 裁决文本）；
+                    // - 拒绝 / 手动接管：以失败语义收尾，模型不再重试同一动作；
+                    // - 无有效裁决（超时 / 取消）：以 NEED_CONFIRM 收尾。
+                    val outcome = guard.awaitVerdict(draft.token, isCancelled = isRunCancelled)
+                    val reply = outcome?.reply
+                    if (outcome != null && reply.isNullOrBlank()) {
+                        return@runCatching textResult(guard.blockedResult(draft))
+                    }
+                    if (outcome != null && outcome.rejected) {
+                        return@runCatching textResult(guard.verdictResult(reply.orEmpty(), draft, rejected = true))
+                    }
+                    if (outcome == null) {
+                        return@runCatching textResult(guard.blockedResult(draft))
+                    }
+                    // 批准：flow-through 继续执行原工具。
                 }
             }
             if (virtualRouting.usesPrimary && virtualSettings != null) {
@@ -1074,6 +1129,8 @@ internal class AgentLocalTools(
             options = options,
             allowMultiple = args.optBoolean("allow_multiple", false),
             runId = browserRunId,
+            // run 取消时立即退出等待，避免工具线程空挂 30 分钟（审查补丁）。
+            isCancelled = isRunCancelled,
         )
     }
 

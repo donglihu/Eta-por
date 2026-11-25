@@ -91,7 +91,18 @@ internal object AgentKeepaliveScheduler {
             }
             .getOrNull()
         when (enabled) {
-            true -> schedule(context)
+            true -> {
+                schedule(context)
+                // 补拉一次：光排周期任务不够。周期下限 15 分钟、Doze 下更久，
+                // 服务被清掉后用户会在这段空窗里看到「保活开了但没生效」。
+                // 这里跑在 worker 线程（应用启动与设置切换都走这条路），不是可见 Activity
+                // 上下文，所以按 fromJob 语义放行；真正的权限拒绝由 enable 自己留痕。
+                if (!AgentKeepaliveService.isRunning(context)) {
+                    AndroidAgentLogger.info("Keepalive refresh: service missing, starting")
+                    AgentKeepaliveService.enable(context, fromJob = true)
+                }
+            }
+
             false -> cancel(context)
             null -> AndroidAgentLogger.warn("Keepalive refresh skipped: settings unavailable")
         }

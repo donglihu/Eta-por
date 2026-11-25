@@ -7,6 +7,7 @@ import io.github.mangi.eta.data.model.McpServerSetting
 import io.github.mangi.eta.data.model.McpToolDefinition
 import io.github.mangi.eta.data.repository.McpServerRepository
 import java.security.MessageDigest
+import io.github.mangi.eta.agent.tool.AgentToolGuard
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -284,8 +285,12 @@ internal class RoutingToolExecutor(
     private val local: AgentModelClient.ToolExecutor,
     private val mcp: McpToolExecutor,
 ) : AgentModelClient.ToolExecutor, AutoCloseable {
-    override fun execute(toolCall: AgentModelClient.ToolCall): AgentModelClient.ToolResult =
-        if (mcp.contains(toolCall.name)) mcp.execute(toolCall) else local.execute(toolCall)
+    override fun execute(toolCall: AgentModelClient.ToolCall): AgentModelClient.ToolResult {
+        // 直连入口也要过逐工具开关：子智能体的 sub 调用直接落到这里，不经过 AgentLoop，
+        // 而且 MCP 工具与本地工具同名时同样要能被能力页关掉。
+        AgentToolGuard.rejectionOrNull(toolCall.name)?.let { return it }
+        return if (mcp.contains(toolCall.name)) mcp.execute(toolCall) else local.execute(toolCall)
+    }
 
     override fun close() {
         runCatching { mcp.close() }

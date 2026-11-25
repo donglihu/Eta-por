@@ -13,6 +13,7 @@ import io.github.mangi.eta.agent.media.SCREEN_ENCODE_MAX_BYTES
 import io.github.mangi.eta.agent.model.AgentModelClient
 import io.github.mangi.eta.core.AndroidAgentLogger
 import io.github.mangi.eta.core.EtaTrace
+import io.github.mangi.eta.core.MemoryPressure
 import java.io.ByteArrayInputStream
 import java.io.Closeable
 import java.io.File
@@ -166,6 +167,23 @@ internal object AgentRuntimeImageTransfer {
             throw ImageTransferException("一次最多支持 $MAX_IMAGE_COUNT 张图片")
         }
         val budget = ModelImageBudget.forProviderType(providerType)
+        // 图片是这套应用里最大的一次性峰值：32 MiB 原图 + Base64 字符（UTF-16 下再翻一倍）
+        // + 一次整图解码位图。2026-11-25 的三次 OOM 全都发生在堆已贴顶之后，
+        // 所以这里按水位于入口收口：临界时直接给可读错误（模型能读到、用户能重试），
+        // 而不是走到 OutOfMemoryError 把整个进程带走。
+        val pressure = MemoryPressure.snapshot()
+        val pressureLevel = MemoryPressure.classify(pressure)
+        if (pressureLevel == MemoryPressure.Level.Critical) {
+            AndroidAgentLogger.warn("Agent image rejected: memory ${MemoryPressure.describe(pressure)}")
+            throw ImageTransferException(
+                "设备内存紧张（${MemoryPressure.describe(pressure)}），本次图片传输已中止，请稍后重试"
+            )
+        }
+        // 偏低时把总量上限砍半：还要留出请求体序列化时的第二份拷贝。
+        val totalImageLimit = when (pressureLevel) {
+            MemoryPressure.Level.Low -> MAX_TOTAL_IMAGE_BYTES / 2
+            else -> MAX_TOTAL_IMAGE_BYTES
+        }
         AndroidAgentLogger.debug {
             "Agent image action=materialize_budget provider=${providerType ?: "unset"} " +
                 "budget_bytes=${budget.maxEncodedBytes} images=${request.images.size}"
@@ -198,8 +216,10 @@ internal object AgentRuntimeImageTransfer {
                     throw ImageTransferException("图片传输不完整")
                 }
                 totalBytes += bytes.size
-                if (totalBytes > MAX_TOTAL_IMAGE_BYTES) {
-                    throw ImageTransferException("图片总大小不能超过 ${MAX_TOTAL_IMAGE_BYTES / 1024 / 1024} MiB")
+                if (totalBytes > totalImageLimit) {
+                    throw ImageTransferException(
+                        "图片总大小不能超过 ${totalImageLimit / 1024 / 1024} MiB（当前内存水位 $pressureLevel）"
+                    )
                 }
                 val materialized = if (image.preserveOriginal) {
                     AgentImageCodec.fromScreenBytes(bytes, image.source, image.mimeType)

@@ -49,7 +49,24 @@ internal class VirtualScreenUiTools(
                 else -> AgentConfirmGuard.labelAt(args.optInt("x", 0), args.optInt("y", 0))
             }
             AgentConfirmGuard.inspect(context, target, name, runId)?.let { draft ->
-                return AgentModelClient.ToolResult(AgentConfirmGuard.blockedResult(draft))
+                // 同一 run 阻塞等用户裁决：
+                // - 批准：grant 已写入，放行继续执行 GUI 原动作（不 return 裁决文本）；
+                // - 拒绝 / 手动接管：以失败语义收尾，模型不再重试同一动作；
+                // - 无有效裁决（超时 / 取消）：以 NEED_CONFIRM 收尾。
+                val outcome = AgentConfirmGuard.awaitVerdict(draft.token, isCancelled = isCancelled)
+                val reply = outcome?.reply
+                if (outcome != null && reply.isNullOrBlank()) {
+                    return AgentModelClient.ToolResult(AgentConfirmGuard.blockedResult(draft))
+                }
+                if (outcome != null && outcome.rejected) {
+                    return AgentModelClient.ToolResult(
+                        AgentConfirmGuard.verdictResult(reply.orEmpty(), draft, rejected = true)
+                    )
+                }
+                if (outcome == null) {
+                    return AgentModelClient.ToolResult(AgentConfirmGuard.blockedResult(draft))
+                }
+                // 批准：flow-through 继续执行原工具。
             }
         }
         if (name in VirtualScreenRoutingPolicy.unavailableTools) {
@@ -359,7 +376,24 @@ internal class VirtualScreenUiTools(
         if (name == "tap_element" || name == "long_press_element") {
             val label = node.text.ifBlank { node.desc }
             AgentConfirmGuard.inspect(context, label, name, runId)?.let { draft ->
-                return AgentModelClient.ToolResult(AgentConfirmGuard.blockedResult(draft))
+                // 同一 run 阻塞等用户裁决：
+                // - 批准：grant 已写入，放行继续执行 GUI 原动作（不 return 裁决文本）；
+                // - 拒绝 / 手动接管：以失败语义收尾，模型不再重试同一动作；
+                // - 无有效裁决（超时 / 取消）：以 NEED_CONFIRM 收尾。
+                val outcome = AgentConfirmGuard.awaitVerdict(draft.token, isCancelled = isCancelled)
+                val reply = outcome?.reply
+                if (outcome != null && reply.isNullOrBlank()) {
+                    return AgentModelClient.ToolResult(AgentConfirmGuard.blockedResult(draft))
+                }
+                if (outcome != null && outcome.rejected) {
+                    return AgentModelClient.ToolResult(
+                        AgentConfirmGuard.verdictResult(reply.orEmpty(), draft, rejected = true)
+                    )
+                }
+                if (outcome == null) {
+                    return AgentModelClient.ToolResult(AgentConfirmGuard.blockedResult(draft))
+                }
+                // 批准：flow-through 继续执行原工具。
             }
         }
         val service = AgentAccessibilityService.current() ?: error("ACCESSIBILITY_UNAVAILABLE")

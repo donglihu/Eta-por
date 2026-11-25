@@ -1,9 +1,10 @@
 package io.github.mangi.eta.ui.components
 
 import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.animation.animateContentSize
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.expandVertically
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
 import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -13,10 +14,12 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -42,6 +45,7 @@ import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import io.github.mangi.eta.R
@@ -78,6 +82,14 @@ private val PlanExpandedMaxHeight = 320.dp
 private const val PlanExpandedMaxScreenRatio = 0.42f
 
 /**
+ * 步骤序号的占位宽度。
+ *
+ * 序号是「1.」这种右对齐文本，个位数比「10.」窄；给一个最小宽度并右对齐，
+ * 个位数与两位数的圆点才不会错位，清单排到 10 条以上左缘仍是一条直线。
+ */
+private val StepIndexMinWidth = 20.dp
+
+/**
  * 会话输入框正上方的任务清单：标题行常驻，展开才是完整步骤。
  *
  * 位置：贴在输入框上方（同一列内、输入栏之上），不是浮在屏幕顶部也不是盖住会话。
@@ -89,6 +101,9 @@ private const val PlanExpandedMaxScreenRatio = 0.42f
  *
  * 折叠态把正在执行的那一步挂在标题行（见 [planFocusStep]），
  * 折起来也知道在干什么；展开态由用户自己按，不跟 run 状态跳。
+ *
+ * 版式：卡片纵向顺序是「展开列表 → 1dp 分隔线 → 标题行」，标题行坐最下面。
+ * 面板底部对齐输入框，因此标题行位置固定，列表变长只向上生长。
  */
 @Composable
 internal fun AgentPlanPanel(
@@ -150,14 +165,79 @@ internal fun AgentPlanPanel(
     Column(
         modifier = modifier
             .fillMaxWidth()
-            .animateContentSize()
             // 卡片感：描边 + 浅底色，让它读起来是「贴在输入框上方的卡片」，
             // 而不是浮在会话顶部的一块遮罩。投影已经由外层 Box 提供。
+            //
+            // 这里刻意不挂 animateContentSize：高度变化已经由内层 AnimatedVisibility 的
+            // expand/shrink(120/160ms) 逐帧驱动，外层再叠一层高度动画等于同一段高度被插值两次，
+            // 两层曲线不一致时标题行会先被顶开再回落（瞬态位移）。单一动画源也便于排查。
             .squircleBorder(width = 1.dp, color = MiuixTheme.colorScheme.dividerLine, cornerRadius = 18.dp)
             .squircleSurface(color = MiuixTheme.colorScheme.surfaceContainer, cornerRadius = 18.dp)
             .padding(horizontal = 14.dp, vertical = 10.dp),
         verticalArrangement = Arrangement.spacedBy(6.dp),
     ) {
+        // 顺序：列表在上、标题行在下。
+        // 面板停在输入框上沿，整张卡是底部对齐的，标题行作为最后一个子项被钉在原地：
+        // 列表长高时只往上顶，标题行不动，视线锚点始终贴着输入框。
+        // 反过来（标题在前）一展开就会把标题推离输入框，折叠／展开两次视线都要重新找位置。
+        AnimatedVisibility(
+            visible = expanded,
+            // 面板停在底部（输入框正上方），所以展开要往上长：expandFrom = Bottom 让内容
+            // 从下沿往上铺，收起时也从下沿往下缩。默认的 Top 方向在底部停靠的布局里
+            // 看起来是「内容往下掉」，和「点击向上展开」的直觉相反。
+            //
+            // 换成「列表在上、标题在下」后参数不变、语义仍成立，原因：
+            // 列表下方只剩分隔线与标题行，两者高度固定且整张卡底部对齐，
+            // 所以 AnimatedVisibility 自己的下沿恒等于标题行上沿（屏幕坐标不动）。
+            // Bottom 对齐＝把内容钉在这个固定下沿上，高度从 0 长起来时只在顶部开窗，
+            // 表现正是「从标题上沿往上铺开」，收起则向标题方向缩回。
+            enter = expandVertically(animationSpec = tween(160), expandFrom = Alignment.Bottom),
+            exit = shrinkVertically(animationSpec = tween(120), shrinkTowards = Alignment.Bottom),
+        ) {
+            // 上限 + 内部滚动：步骤再多也只占固定高度，超出的在面板里滑动查看。
+            // heightIn 在 verticalScroll 外层：内容短时按内容高度，长时封顶到上限并可滚动。
+            // 不用 weight：面板本身是 wrap-content 高度，weight 在这种父容器里拿不到剩余空间。
+            //
+            // nestedScroll 把滑动**锁在面板内**：面板就贴在输入框上方，
+            // 不加这个拦截的话，手指在面板上滑到尽头后会把剩余位移交给上面的 LazyColumn，
+            // 表现为「在待办面板上滑动，会话信息也跟着滚」（2026-11-20 用户反馈）。
+            Column(
+                modifier = Modifier
+                    .heightIn(max = maxExpandedHeight)
+                    .nestedScroll(planScrollConnection)
+                    .verticalScroll(planScrollState),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                // 序号按步骤在计划里的原始位置给（index + 1），已完成的行保留原号、
+                // 不重新编号：用户对照上面的消息记录时序号才对得上，不会因为做完一步就跳号。
+                steps.forEachIndexed { index, step ->
+                    PlanStepRow(
+                        index = index + 1,
+                        step = step,
+                        isRunning = isRunning,
+                        state = state,
+                    )
+                }
+            }
+        }
+        // 列表与标题行同处一张卡，中间补一条 1dp 分隔线把两段读开；
+        // 只在展开时画，折叠态不画——列表隐藏后这条线没有对应内容，
+        // 会变成标题上方一条莫名其妙的横线。
+        AnimatedVisibility(
+            visible = expanded,
+            enter = fadeIn(animationSpec = tween(160)),
+            // 与上方列表的 shrinkVertically(120ms) 对齐：分隔线自带 1dp 高度 + 6dp 间距 = 7dp，
+            // 淡出若仍是 100ms，它会比列表早 20ms 结束、7dp 先瞬间塌掉，而列表还在缩，
+            // 末帧下沿就跳一下（本处为底部锚定）。两者同时归零，末帧下沿不动。
+            exit = fadeOut(animationSpec = tween(120)),
+        ) {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(1.dp)
+                    .background(MiuixTheme.colorScheme.dividerLine),
+            )
+        }
         Row(
             modifier = Modifier.fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically,
@@ -218,33 +298,6 @@ internal fun AgentPlanPanel(
                 contentDescription = stringResource(R.string.chat_plan_clear),
                 onClick = onClear,
             )
-        }
-        AnimatedVisibility(
-            visible = expanded,
-            // 面板停在底部（输入框正上方），所以展开要往上长：expandFrom = Bottom 让内容
-            // 从下沿往上铺，收起时也从下沿往下缩。默认的 Top 方向在底部停靠的布局里
-            // 看起来是「内容往下掉」，和「点击向上展开」的直觉相反。
-            enter = expandVertically(animationSpec = tween(160), expandFrom = Alignment.Bottom),
-            exit = shrinkVertically(animationSpec = tween(120), shrinkTowards = Alignment.Bottom),
-        ) {
-            // 上限 + 内部滚动：步骤再多也只占固定高度，超出的在面板里滑动查看。
-            // heightIn 在 verticalScroll 外层：内容短时按内容高度，长时封顶到上限并可滚动。
-            // 不用 weight：面板本身是 wrap-content 高度，weight 在这种父容器里拿不到剩余空间。
-            //
-            // nestedScroll 把滑动**锁在面板内**：面板就贴在输入框上方，
-            // 不加这个拦截的话，手指在面板上滑到尽头后会把剩余位移交给上面的 LazyColumn，
-            // 表现为「在待办面板上滑动，会话信息也跟着滚」（2026-11-20 用户反馈）。
-            Column(
-                modifier = Modifier
-                    .heightIn(max = maxExpandedHeight)
-                    .nestedScroll(planScrollConnection)
-                    .verticalScroll(planScrollState),
-                verticalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                steps.forEach { step ->
-                    PlanStepRow(step, isRunning = isRunning, state = state)
-                }
-            }
         }
     }
 }
@@ -307,6 +360,8 @@ private fun ProgressBadge(done: Int, total: Int) {
  */
 @Composable
 private fun PlanStepRow(
+    /** 行首序号，从 1 开始：按步骤在计划里的原始位置给，不随状态重排。 */
+    index: Int,
     step: PlanStepUi,
     isRunning: Boolean,
     state: PlanPanelState,
@@ -326,6 +381,19 @@ private fun PlanStepRow(
         modifier = Modifier.fillMaxWidth(),
         verticalAlignment = Alignment.Top,
     ) {
+        // 序号在前、状态圆点在后；字号跟正文一致（body2），
+        // 颜色直接复用 textColor，已完成的步骤整体降为次级色时序号一起退后。
+        // 数字右对齐 + 最小宽度：个位数与两位数的圆点不会错位。
+        Text(
+            text = "$index.",
+            modifier = Modifier.widthIn(min = StepIndexMinWidth),
+            style = MiuixTheme.textStyles.body2,
+            color = textColor,
+            textAlign = TextAlign.End,
+            maxLines = 1,
+            softWrap = false,
+        )
+        Spacer(modifier = Modifier.width(6.dp))
         // 已完成用实心、其余用空心环：形状本身就区分了「做完」和「没做完」。
         Box(
             modifier = Modifier

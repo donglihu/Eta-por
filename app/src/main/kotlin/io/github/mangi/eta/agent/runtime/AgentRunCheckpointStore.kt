@@ -19,9 +19,43 @@ internal object AgentRunCheckpointStore {
     /** 单次检查点写入超过这个时长才记一行；实测正常在 1 位数毫秒。 */
     private const val SLOW_APPEND_MS = 150L
 
+    /**
+     * transcript 增量节流阈值（字符）。
+     *
+     * onTranscript 每轮都会回调一次，而 saveTranscript 每次都要全量编码 + 全量写库；
+     * 长会话下这等于每轮都重新分配一整份 JSON。累积增量没到这个量级就先不落库，
+     * run 结束/取消时用 force = true 冲刷最后一次。
+     */
+    private const val CHECKPOINT_MIN_DELTA_CHARS = 400_000L
+
     /** 每个 run 的父行副本：并发路径把父行清掉时用它补写，避免在途事件外键失败。 */
     private val seededRuns =
         java.util.concurrent.ConcurrentHashMap<String, RuntimeInFlightRunEntity>()
+
+    /** 每个 runId 上次真正写库时的 transcript 总字符数（节流基准）。 */
+    private val writtenTranscriptChars =
+        java.util.concurrent.ConcurrentHashMap<String, Long>()
+
+    /** 每个 runId 上次真正写库时的 transcript 条数：条数变少说明压缩/回滚，必须无条件落库。 */
+    private val writtenTranscriptCounts =
+        java.util.concurrent.ConcurrentHashMap<String, Int>()
+
+    /**
+     * 只按字符数估算 transcript 体积，不物化任何新字符串。
+     * 与 codec 实际序列化体积不要求相等，只要同向单调即可用于节流判断。
+     */
+    private fun measureTranscriptChars(transcript: List<AgentModelClient.ConversationMessage>): Long {
+        var total = 0L
+        for (message in transcript) {
+            total += message.content.length.toLong()
+            total += message.contentJson.length.toLong()
+            total += message.reasoningContent.length.toLong()
+            total += message.toolCallsJson.length.toLong()
+            total += message.toolCallId.length.toLong()
+        }
+        return total
+    }
+
     data class Checkpoint(
         val runId: String,
         val ownerInstanceId: String,
@@ -57,6 +91,10 @@ internal object AgentRunCheckpointStore {
             updatedAt = now,
         )
         seededRuns[runId] = entity
+        // start 会用 transcriptJson = "[]" 重建父行，等于把库里的 transcript 清空；
+        // 上一轮同 runId 残留的节流基准必须一起清掉，否则新一轮首写会被误判为「增量不足」而跳过。
+        writtenTranscriptChars.remove(runId)
+        writtenTranscriptCounts.remove(runId)
         io.github.mangi.eta.core.EtaTrace.log(
             "ckpt.start",
             "runId=$runId operation=${request.operation}",
@@ -161,11 +199,30 @@ internal object AgentRunCheckpointStore {
                 .toList()
         }
 
-    fun saveTranscript(context: Context, runId: String, transcript: List<AgentModelClient.ConversationMessage>) {
+    fun saveTranscript(
+        context: Context,
+        runId: String,
+        transcript: List<AgentModelClient.ConversationMessage>,
+        /** run 结束/取消时冲刷最后一次：跳过增量节流直接写库。 */
+        force: Boolean = false,
+    ) {
+        val currentChars = measureTranscriptChars(transcript)
+        val previousChars = writtenTranscriptChars[runId]
+        if (!force && previousChars != null) {
+            val previousCount = writtenTranscriptCounts[runId]
+            // 压缩/回滚会让 transcript 变短：条数或字符数下降都必须无条件落库。
+            // 否则库里留着更长的旧版本，恢复时会把已被压缩掉的消息重新读回来（幽灵消息）。
+            val shrunk = (previousCount != null && transcript.size < previousCount) ||
+                currentChars < previousChars
+            // 增量不到阈值就跳过写库；节流跳过不记日志，避免每轮刷屏。
+            if (!shrunk && currentChars - previousChars < CHECKPOINT_MIN_DELTA_CHARS) return
+        }
         runBlocking(Dispatchers.IO) {
             EtaDatabase.get(context.applicationContext).runtimeRunDao()
                 .updateTranscript(runId, AgentConversationCodec.encodeTranscriptForStorage(transcript))
         }
+        writtenTranscriptChars[runId] = currentChars
+        writtenTranscriptCounts[runId] = transcript.size
     }
 
     fun saveContext(context: Context, runId: String, snapshot: AgentContextSnapshot) {
@@ -184,6 +241,10 @@ internal object AgentRunCheckpointStore {
         // append 触发 FK 恢复时，把已被清掉的 run 的旧父行（甚至同 runId 新会话的父行）
         // 用过期数据顶回来，造成事件错挂旧 run。
         seededRuns.remove(runId)
+        // 节流基准与 DB 行同样必须同步清理：否则同 runId 的新会话会继承旧基准，
+        // 首轮写入被误判为「增量不足」而跳过，库里直接缺一段 transcript。
+        writtenTranscriptChars.remove(runId)
+        writtenTranscriptCounts.remove(runId)
         runBlocking(Dispatchers.IO) {
             EtaDatabase.get(context.applicationContext)
                 .runtimeRunDao()

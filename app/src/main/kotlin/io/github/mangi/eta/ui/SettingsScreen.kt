@@ -40,7 +40,6 @@ import androidx.compose.material.icons.rounded.Security
 import androidx.compose.material.icons.rounded.Settings
 import androidx.compose.material.icons.rounded.SettingsVoice
 import androidx.compose.material.icons.rounded.Smartphone
-import androidx.compose.material.icons.rounded.Schedule
 import androidx.compose.material.icons.rounded.SportsBar
 import androidx.compose.material.icons.rounded.SupportAgent
 import androidx.compose.material.icons.rounded.SwipeUp
@@ -1248,13 +1247,6 @@ private fun AutoCompactionThresholdPref(prefs: SharedPreferences?) {
         },
         enabled = prefs != null,
     )
-
-                    EtaPreferenceDivider()
-                    EtaArrowPreference(
-                        title = stringResource(R.string.route_scheduled_tasks),
-                        startAction = { EtaPreferenceIcon(Icons.Rounded.Schedule, tint = EtaPreferenceColors.Blue) },
-                        onClick = { onNavigate(AppRoute.ScheduledTasks) },
-                    )
 }
 
 @Composable

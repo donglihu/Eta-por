@@ -2,13 +2,70 @@ package io.github.mangi.eta.ui.app
 
 import android.content.Context
 import io.github.mangi.eta.R
+import io.github.mangi.eta.agent.tool.AgentToolAvailability
+import io.github.mangi.eta.config.Prefs
 import io.github.mangi.eta.ui.model.AgentToolsUiState
+import io.github.mangi.eta.ui.model.FRIDA_TOOL_CARD_ID
 import io.github.mangi.eta.ui.model.ToolGroupUi
 import io.github.mangi.eta.ui.model.ToolItemUi
+import io.github.mangi.eta.ui.model.actualToolName
 
-internal fun buildToolsState(context: Context): AgentToolsUiState =
-    AgentToolsUiState(
-        groups = listOf(
+internal fun buildToolsState(context: Context): AgentToolsUiState {
+    val disabledTools = Prefs.disabledTools()
+    return AgentToolsUiState(
+        groups = buildToolGroups(context).map { group ->
+            group.copy(tools = group.tools.map { tool -> applyToolAvailability(tool, disabledTools) })
+        },
+    )
+}
+
+/**
+ * 把本地禁用集合投影成每张卡的开关状态。
+ *
+ * 卡 id 与执行侧工具名不是一一对应（浏览器三个卡共用一个工具），统一走 [actualToolName]，
+ * 否则关掉 browser_read 而运行期 browser_use 照跑，开关就成了摆设。
+ */
+private fun applyToolAvailability(tool: ToolItemUi, disabledTools: Set<String>): ToolItemUi = when {
+    // Frida 卡自带终态（后端未集成），不参与禁用集合。
+    tool.id == FRIDA_TOOL_CARD_ID -> tool
+    // 运行时骨架工具不可关：写进禁用集合也不会被目录过滤，UI 上锁死为开，避免「关了还在跑」。
+    actualToolName(tool.id) in AgentToolAvailability.PROTECTED_TOOLS ->
+        tool.copy(enabled = true, switchable = false)
+    else -> tool.copy(
+        enabled = AgentToolAvailability.isToolEnabled(actualToolName(tool.id), disabledTools),
+        switchable = true,
+    )
+}
+
+/** 组内可开关工具的卡片 id 集合；「全部禁用／全部启用」只动这些。 */
+internal fun switchableToolIds(state: AgentToolsUiState, groupId: String): Set<String> =
+    state.groups.firstOrNull { it.id == groupId }
+        ?.tools
+        ?.filter { it.switchable }
+        ?.mapTo(linkedSetOf()) { it.id }
+        .orEmpty()
+
+/**
+ * 落库一次开关动作并重算页面状态。
+ *
+ * 返回 null 表示配置不可写（local preferences 未就绪或提交失败）：调用方必须原样保留旧状态，
+ * 不能把「写失败」显示成「已关闭」。
+ */
+internal fun applyToolToggle(
+    context: Context,
+    state: AgentToolsUiState,
+    toolIds: Set<String>,
+    enabled: Boolean,
+): AgentToolsUiState? {
+    val targets = toolIds.mapTo(linkedSetOf(), ::actualToolName)
+    Prefs.initLocal(context)
+    val preferences = Prefs.localAgentPreferences() ?: return null
+    if (!Prefs.putDisabledTools(preferences, targets, enabled)) return null
+    return buildToolsState(context)
+}
+
+/** 工具能力页的静态目录；开关状态由 [buildToolsState] 投影，这里只声明「有哪些工具」。 */
+private fun buildToolGroups(context: Context): List<ToolGroupUi> = listOf(
             ToolGroupUi(
                 id = "screen",
                 title = context.getString(R.string.state_screens_and_controls_3f095b),
@@ -147,6 +204,15 @@ internal fun buildToolsState(context: Context): AgentToolsUiState =
                     ToolItemUi("read_file", context.getString(R.string.tool_ui_read_file_dc995c), context.getString(R.string.tool_ui_read_the_contents_of_mobile_phone_files_bf3066)),
                     ToolItemUi("write_file", context.getString(R.string.tool_ui_write_file_e620fd), context.getString(R.string.tool_ui_write_or_overwrite_mobile_files_29fae4)),
                     ToolItemUi("list_directory", context.getString(R.string.tool_ui_list_directory_96e765), context.getString(R.string.tool_ui_list_directory_contents_feff30)),
+                    // Frida：观察与注入合并成一张卡，后端未集成前只占位、不可开关。
+                    ToolItemUi(
+                        id = FRIDA_TOOL_CARD_ID,
+                        title = context.getString(R.string.tool_frida_title),
+                        summary = context.getString(R.string.tool_frida_summary),
+                        enabled = false,
+                        switchable = false,
+                        unavailableReason = context.getString(R.string.tool_frida_unavailable),
+                    ),
                 ),
             ),
             ToolGroupUi(
@@ -160,5 +226,4 @@ internal fun buildToolsState(context: Context): AgentToolsUiState =
                     ToolItemUi("subagent_profile", "管理子智能体模板", "保存、列举、删除可复用的子智能体模板。"),
                 ),
             ),
-        )
-    )
+)
