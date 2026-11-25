@@ -1,6 +1,6 @@
 # 本地分叉状态（给后续会话看的交接文档）
 
-> 最后更新：2026-10-28（含 10-27 夜间一轮 + #006 会话内存修复，见 4.6）。只写实测结论；不确定的地方标「待核实」。
+> 最后更新：2026-11-25（OOM 七病灶修复 + UI 合并回退，见 4.9）。只写实测结论；不确定的地方标「待核实」。
 > 目的：任何会话接手前先读这一页，避免把「本地自研」当成上游行为，或把「上游已有」重复实现。
 
 ## 1. 代码基线
@@ -8,11 +8,12 @@
 | 项 | 值 |
 |---|---|
 | 仓库 | `项目/Eta/Eta主源码`（fork `Oo0520/Eta-por`，upstream `Mangi-11/Eta`） |
-| 当前分支 | `feat/auto-backup-full-backup` |
-| HEAD | `c57ff0b`（自动备份可靠性与对账修复 + 全量压缩包导入导出） |
-| 上游对齐点 | `origin/main` = `b322d98`（准备发布 3.3.4） |
-| 工作区状态 | **不等于 HEAD**：`git status --porcelain` 实测 207 条（2026-10-28 实测，含 #006 修复的 4 个源文件与 1 个 DAO）。构建用的是工作区，不是 HEAD |
-| versionCode | `2026102803`（工作区已前移）；#006 修复包为 `2026102801`；**设备上实际装的是 `2026102728`**（2026-10-28 `inspect_app` 实测，旧记录的 2026102719 已过期） |
+| 当前分支 | `branch`（2026-11-25 实测；AGENTS.md 声明发布线为 `test/beta-on-latest`，与 README 的 `main` 不一致，动分支前先 `git branch -a` 实测） |
+| HEAD | `d8f58e3b`（OOM 七病灶修复 + UI 合并回退，2026-11-25 已推送 `origin/branch`） |
+| 上一基线 | `961cfe36`（UI 合并回退目标点；`8eb7393c` 双风格管理界面因引用从未提交的 coui/virtualdisplay 整批文件被回退） |
+| 上游对齐点 | `source/main` = `ffd972d6`（`Mangi-11/Eta`；注意该仓库无 coui、无 MiuixTopBarActionButton、无 EtaPreferenceGroupItem） |
+| 工作区状态 | **干净**：2026-11-25 commit `d8f58e3b` 已提交 91 个源码文件（+2572/-7161），`logs/`、`tmp/`、`知识库/`、`记录/` 未纳入版本控制 |
+| versionCode | 沿用 `2026102803` 未改动；本次产物 `Eta-v3.3.4-oom修复-ui回退-unsigned.apk`（12,508,243 字节，sha256 `a5e33a74…`），**未签名未装机** |
 
 结论：判断「某功能是否存在」时必须读工作区文件，`git show HEAD:` 会漏掉大量未提交实现。
 
@@ -26,6 +27,8 @@
   - 现在只剩 `FULL` / `CHAT` 两档（顶栏胶囊：全部工具 / 纯聊天）
 - **MCP 工具 schema 压缩**：`AgentToolSchemaCompactor.compactMcp`（第三方 server 描述可达约 190KB）
 - **记忆热区自动压缩**：`memoryAutoCompactEnabled` / `AgentMemoryRepository.maybeCompact`
+- **统一内存水位判据**：`core/MemoryPressure.kt`（堆 0.82/0.68 双档 + MemAvailable 512MB/1024MB，纯函数 `classify` 可脱离 Android 断言；2026-11-25 起被 `AgentMemoryGate`、`VirtualScreenFloatWindow`、`AgentRuntimeImageTransfer`、`EtaApp` 共用，**判据只此一处，不要各处另立阈值**）
+- **传输预算裁剪**：`AgentHistoryTrimmer.trimForTransfer` / `costOf`（2026-11-25 新增，与上下文窗口裁剪 `trimInPlace` 职责分离：前者管 Binder 体积，后者管模型窗口，保留量必须前者 ≥ 后者）
 - **会话分类、会话导航面板、工作区面板、提示词工坊、@ 引用、斜杠命令**等 UI 能力
 
 ## 3. 本轮（2026-10-28）已移除的本地改动
@@ -228,7 +231,51 @@
 - 详细记录：`记录/Bug-002-会话分组丢失-20261028.md`（含真机库实测表与去留表）。
 - **日志类型契约（2026-11-23）**：应用自有异常必须实现 `core.StableLogType` 声明稳定 token，禁止依赖 `javaClass.simpleName` 作为线上日志标识（R8 会把类名改成 `sp`/`tp`）。
 
-## 5. 验证现状（2026-10-28 实测）
+### 4.9 会话内存 OOM 七病灶修复 + UI 合并回退（2026-11-25）
+
+> 完整执行记录：`logs/2026-11-25-oom-fix-ui-rollback.md`；摘要：`记录/OOM七病灶修复与UI回退-20261125.md`
+
+**根因**（与 4.6 的 #006 不同，这是第二轮）：`largeHeap` 已开，但每轮请求与保存把整段历史反复复制 4~6 份，其中投影路径是 O(n²) 分配，单次分配随会话长度增长，最终打在 `AbstractStringBuilder.<init>`。
+
+**七个病灶与改法**（全部落地）：
+
+| # | 文件 | 病灶 | 改法 |
+|---|---|---|---|
+| 1 | `agent/model/AgentHistoryTrimmer.kt` | 发送侧不裁剪，完整历史进 Binder | 新增 `costOf()` + `trimForTransfer()`；未超预算原样返回同一 list 引用（零复制） |
+| 2 | `agent/runtime/AgentLegacyConversationProjection.kt` | `while` 里 `removeAt(0)` + 每次全量 `encodeToString` = O(n²) | 新增 `tail()` 尾部切片，`encode()` 改「切片+单次编码」，O(n²)→O(n) |
+| 3 | `agent/runtime/AgentWireText.kt` | `toByteArray()` 物化 + 读时 `ByteArray(size)`+`toString`，两份全量 | 写侧 `buffered().writer(UTF_8)` 流式；读侧 `reader` + 64K `CharArray` 分块 |
+| 4 | `agent/runtime/AgentRuntimeWire.kt` | `history_json` 直接编码完整 history；`KEY_HISTORY` 走 O(n²) 投影 | 先 `trimForTransfer` 再编码；`KEY_HISTORY` 改 `tail()`（该键仅作降级兜底，正常路径无人读） |
+| 5 | `ui/app/AgentConversationStore.kt` | `encode_history` 与 `encode_journal` 两次独立全量编码 | `history == journal` 且都需重编码时只编一次（`encodeConversationCheckpoint` 是 `encodeTranscriptForStorage` 的纯委托） |
+| 6 | `agent/runtime/AgentRunCheckpointStore.kt` | `saveTranscript` 每轮全量编码 + 全量写库，无节流 | `CHECKPOINT_MIN_DELTA_CHARS = 400_000` 增量节流 + `force` 参数；条数或字符数变短无条件落库（防幽灵消息） |
+| 7 | `agent/runtime/AgentMemoryGate.kt` | 只看系统 `MemAvailable`，无进程堆判据 | 复用既有 `core/MemoryPressure.kt`（0.82/0.68 双档），Critical 抬到 `TIER_QUEUE` + 会话上限收敛到 1；**只抬不降**，不另立阈值 |
+
+补充：`AgentRuntimeRunExecutor.kt` 在收尾 `finally` 用 `force = true` 冲刷最终 transcript，保证崩溃恢复不缺最后一段。
+
+**UI 合并回退**（指令驱动）：
+
+- `8eb7393c`（feat(scheduler) 双风格管理界面）引用了从未提交的整批文件：`ui/components/coui/`、`agent/virtualdisplay/`、`LocalUiStyle`、`AppearanceUiStyle`、`MiuixTopBarActionButton` 等
+- 证据：`git log --all --diff-filter=A -- "*coui*"` 为空（全历史从未存在）；`git fsck` 报 **4383 处 broken link**；`git fetch source` 失败（`pack has 789 unresolved deltas`）；GitHub API 核验 `Mangi-11/Eta` main 树 1377 条目中 coui 0 命中
+- 处置：回退到 `961cfe36`，21 个新增文件移入 `.trash/2026-ui-rollback-files-094547/`，18 个修改文件还原；**scheduler 整批（引擎 + 4 个 scheduled 页面 + DB v29 迁移）随之移除**
+- agent 层 OOM 修复全部保留
+
+**回退副作用修复**（6 处，全部必要，否则编译不过）：
+
+1. `res/values/strings.xml` 补回 9 条字符串（`tool_frida_*`、`tool_chip_*`、`tool_group_*` 等）
+2. `agent/device/RootShellDeviceController.kt`：4 处未定义的 `displayId`/`isVirtual` 引用改为不依赖它们的等价判断；另删 2 个多余 `}`（它们把常量定义块包进了错误作用域，导致 `ROOT_OBSERVATION_IDS` 等全部不可见）
+3. `agent/subagent/SubagentSessionStore.kt`：`notifyEvicted` 缺闭合括号，导致 `clearConversation` 被嵌进内部不可见
+4. `ui/app/AgentAppRoot.kt`：`when (action)` 补 `else -> Unit`
+5. `ui/app/AgentAppState.kt`：删除不存在的 `SubagentSessionStore.clearConversation` 调用
+6. `agent/subagent/SubagentExecutor.kt`：`latestStepUsage`（未声明）→ `pendingStepUsage`
+
+另新增 `agent/virtualdisplay/CanvasRoutingPolicy.kt`（227 行，取自 `Mangi-11/Eta` 上游实现，仅依赖 `android.view.Display` 与 `java.util.Locale`）。
+
+**遗留 / 注意**：
+
+- 定时任务功能随回退整体移除；要恢复须从 `.trash/2026-ui-rollback-files-094547/` 取回，但仍需解决 coui 依赖（该依赖 `itoseo 0.0.1-alpha11` 从未提交，`git log -S itoseo` 为空）
+- `记录索引.md` 有一条更早的复核记录指出 `17d751d4` 才是真正的「UI 合并」提交，coui 是 `8eb7393c` 定时任务界面的支撑依赖——两者结论一致：coui 不可补，只能整批取舍
+- 本次改动无自动化用例覆盖（Robolectric 在 arm64 一律 skipped），只能上设备实测
+
+## 5. 验证现状（2026-10-28 基线 + 2026-11-25 本轮实测）
 
 ```
 ./gradlew :app:compileDebugKotlin --offline     → BUILD SUCCESSFUL
@@ -252,6 +299,22 @@
 
 修改前同一命令：`1481 tests / 14 failed / 92 skipped`；更早的全量状态是 `1967 tests / 491 failed`（其中绝大部分为 native runtime 不可用）。
 
+### 2026-11-25 实测（本轮，4.9）
+
+```
+./gradlew :app:compileDebugKotlin   → BUILD SUCCESSFUL
+./gradlew :app:assembleRelease      → BUILD SUCCESSFUL in 5m49s
+./gradlew :app:testDebugUnitTest    → 1777 tests / 44 failed / 91 skipped
+```
+
+对比基线 `logs/test-results-20261125`（1761 / 38 / 91）：
+
+- 新增 6 个失败，全部在 `SubagentTest`，原因均为 `Robolectric native runtime is not supported on Linux (aarch64)` —— arm64 环境限制，非代码问题
+- 基线有而本次通过的：0
+- 结论：**无功能性新增失败**
+
+产物：`projects/ETA/build/Eta-v3.3.4-oom修复-ui回退-unsigned.apk`，12,508,243 字节，sha256 `a5e33a74fe5eb4779cb1ba01fa479940057be408b41ecef73aa4c0862b59ef1b`，未签名未装机。
+
 ## 6. 构建与交付约定（沿用既有规则）
 
 - 构建环境：Debian chroot，`sdk.dir=/workspace/android-sdk`，签名用 `local.properties` / 环境变量里的 keystore
@@ -261,9 +324,12 @@
 
 ## 7. 接手时的最小检查清单
 
-1. `git status --short | head` 确认工作区改动规模（不该是干净的）
+1. `git status --short | head` 确认工作区改动规模（2026-11-25 起基线 `d8f58e3b` 已提交，工作树应为**干净**；若又出现大量改动，先确认是谁改的再动手）
 2. `git log --oneline -3` 与本文档第 1 节比对，判断基线是否已前移
 3. 需要判断「上游有没有」时：`git grep -n '<关键字>' origin/main -- '*.kt'`
 4. 改完跑 `:app:compileDebugKotlin` + 定向 `--tests '*XXXTest'`；注意本机 Robolectric 类会 skipped，不要误判为「没覆盖」
 5. 编译报错但不在你改的文件里：先 `git diff <该文件>` 看是不是**另一个会话正在改**（10-27 夜曾遇到 `AgentAppState` / `AgentAppShell` 的降档管线在编译期间被改动，只能做「让编译过」的最小清理，别顺手重写别人的半成品）
 6. 判断某个「看起来没做」的功能：先 grep 参数是否只是透传未使用（Kimi 菜单就是透传三层却没人用），再看 `git show HEAD:` 与工作区的差异
+7. **补缺失文件前先验证它是否真的存在于任何提交**：`git log --all --diff-filter=A -- "*关键字*"` 为空即「从未提交过」，此时补文件是造代码而非补齐。2026-11-25 的 coui 整批就是这样：`git fsck` 报 4383 处 broken link、`git fetch source` 报 `pack has 789 unresolved deltas`，GitHub API 核验上游 main 树 1377 条目里 0 命中——只能整批取舍，不能补
+8. **回退提交不是干净的一刀切**：被回退的提交会把改动散落在共享文件里（strings 资源、共享工具的 import 与调用行、测试文件）。回退后必须全量编译，逐个修连带断裂；修的时候优先「让编译过的最小改动」，不要顺手重写别人的实现
+9. **删括号要数清楚**：删 `when` 外壳或多余 `}` 时先算括号收支（每删一个自带 `{` 的行就要对应删一个 `}`）。2026-11-25 两次踩坑：一次少删导致函数提前闭合、一次多删导致常量定义块被包进错误作用域而全部不可见
