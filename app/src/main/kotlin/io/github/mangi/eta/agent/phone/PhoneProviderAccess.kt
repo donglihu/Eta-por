@@ -29,6 +29,8 @@ internal interface PhoneProviderAccess {
 
     fun insert(uri: Uri, values: ContentValues): Uri?
 
+    fun update(uri: Uri, values: ContentValues, selection: String?, args: Array<String>?): Int
+
     fun delete(uri: Uri, selection: String?, args: Array<String>?): Int
 
     fun call(uri: Uri, method: String, arg: String?, extras: Bundle): Bundle?
@@ -52,6 +54,9 @@ internal class AppPhoneProviderAccess(
     ) = resolver.query(uri, columns, selection, args, sort)
 
     override fun insert(uri: Uri, values: ContentValues) = resolver.insert(uri, values)
+
+    override fun update(uri: Uri, values: ContentValues, selection: String?, args: Array<String>?) =
+        resolver.update(uri, values, selection, args)
 
     override fun delete(uri: Uri, selection: String?, args: Array<String>?) =
         resolver.delete(uri, selection, args)
@@ -176,6 +181,11 @@ internal class RootPhoneProviderAccess(private val userId: Int) : PhoneProviderA
     override fun insert(uri: Uri, values: ContentValues): Uri? =
         Lease(authority(uri)).use {
             it.operation("insert", attribution, withoutUser(uri), values, Bundle()) as? Uri
+        }
+
+    override fun update(uri: Uri, values: ContentValues, selection: String?, args: Array<String>?): Int =
+        Lease(authority(uri)).use {
+            it.operation("update", attribution, withoutUser(uri), values, queryArgs(selection, args)) as Int
         }
 
     override fun delete(uri: Uri, selection: String?, args: Array<String>?): Int =
