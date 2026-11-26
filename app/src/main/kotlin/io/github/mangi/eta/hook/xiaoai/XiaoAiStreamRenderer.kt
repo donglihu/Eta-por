@@ -93,7 +93,10 @@ internal class XiaoAiStreamRenderer(
         mainHandler.post {
             runCatching {
                 val player = ttsPlayer(loader) ?: return@runCatching
-                HookSupport.findMethod(player.javaClass, "stopPlay")?.invoke(player)
+                // 507013035 起停止入口是 stop()，旧版为 stopPlay()。
+                val stopper = HookSupport.findMethod(player.javaClass, "stopPlay")
+                    ?: HookSupport.findMethod(player.javaClass, "stop")
+                stopper?.invoke(player)
             }
         }
     }
@@ -162,6 +165,13 @@ internal class XiaoAiStreamRenderer(
     private fun speak(text: String) {
         try {
             val player = ttsPlayer(classLoader) ?: return
+            // 507013035 起只有 speakTts(String, rz.b[, boolean])，没有单参重载；
+            // 第二参数是 @Nullable 的透传回调，传 null 即可，旧版单参保留为兜底。
+            val withCallback = findSpeakTtsWithCallback(player.javaClass)
+            if (withCallback != null) {
+                withCallback.invoke(player, text, null)
+                return
+            }
             HookSupport.findMethod(player.javaClass, "speakTts", String::class.java)
                 ?.invoke(player, text)
         } catch (exception: Exception) {
@@ -171,8 +181,32 @@ internal class XiaoAiStreamRenderer(
         }
     }
 
+    /** 形如 speakTts(String, <引用类型>) 的入口；第二参数可空，调用时传 null。 */
+    private fun findSpeakTtsWithCallback(clazz: Class<*>): Method? {
+        var current: Class<*>? = clazz
+        while (current != null) {
+            val method = HookSupport.findDeclaredMethods(current, makeAccessible = true) { candidate ->
+                candidate.name == "speakTts" &&
+                    candidate.parameterTypes.size == 2 &&
+                    candidate.parameterTypes[0] == String::class.java &&
+                    !candidate.parameterTypes[1].isPrimitive
+            }.firstOrNull()
+            if (method != null) return method
+            current = current.superclass
+        }
+        return null
+    }
+
     private fun ttsPlayer(loader: ClassLoader): Any? {
-        val playerClass = Class.forName(XiaoAiHooks.TTS_PLAYER_CLASS, false, loader)
+        XiaoAiHooks.TTS_PLAYER_CLASSES.forEach { className ->
+            val player = runCatching { resolveTtsPlayer(className, loader) }.getOrNull()
+            if (player != null) return player
+        }
+        return null
+    }
+
+    private fun resolveTtsPlayer(className: String, loader: ClassLoader): Any? {
+        val playerClass = Class.forName(className, false, loader)
         val singletonField = playerClass.declaredFields.firstOrNull { field ->
             Modifier.isStatic(field.modifiers) && field.type == playerClass
         } ?: return null

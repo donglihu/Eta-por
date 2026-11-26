@@ -9,16 +9,49 @@ import org.junit.Test
 
 class XiaoAiHookStateTest {
     @Test
-    fun versionGateOnlyAcceptsTheAnalyzedApk() {
+    fun versionGateAcceptsEveryAnchoredApk() {
         assertTrue(XiaoAiTakeoverPolicy.isSupportedVersion(507013032L))
+        assertTrue(XiaoAiTakeoverPolicy.isSupportedVersion(507013035L))
         assertFalse(XiaoAiTakeoverPolicy.isSupportedVersion(507013031L))
         assertFalse(XiaoAiTakeoverPolicy.isSupportedVersion(-1L))
     }
 
     @Test
+    fun unknownVersionFallsBackToStableAnchors() {
+        val present = XiaoAiTakeoverPolicy.STABLE_ANCHORS.toSet()
+        assertTrue(XiaoAiTakeoverPolicy.shouldInstallOnUnknownVersion { it in present })
+        assertFalse(
+            XiaoAiTakeoverPolicy.shouldInstallOnUnknownVersion { anchor ->
+                anchor != XiaoAiTakeoverPolicy.STABLE_ANCHORS.first()
+            }
+        )
+        assertFalse(XiaoAiTakeoverPolicy.shouldInstallOnUnknownVersion { false })
+    }
+
+    @Test
+    fun stableAnchorsExcludeR8ShortNames() {
+        // 短名（y00.r0 / z10.a / lh0.s0 / y00.c1 等）会随版本重排，不能当结构判据；
+        // 一旦混进来，未登记版本的门禁会在下次小爱升级后静默误判。
+        val shortName = Regex("^[a-z0-9]{1,4}\\.[a-z0-9]{1,4}$")
+        XiaoAiTakeoverPolicy.STABLE_ANCHORS.forEach { anchor ->
+            assertFalse("稳定锚点不应是混淆短名: $anchor", shortName.matches(anchor))
+        }
+        assertTrue(XiaoAiTakeoverPolicy.STABLE_ANCHORS.contains("com.xiaomi.voiceassistant.VAApplication"))
+    }
+
+    @Test
     fun outboundMatchUsesTheEventTypeBecauseXiaoAiRegeneratesTheEventId() {
         assertTrue(XiaoAiTakeoverPolicy.matchesOutboundEvent("Nlp.Request"))
+        // 7.13.35 起 LLM 直连/摘要/天气都是独立的 Nlp.Request* 事件名，
+        // 只认 "Nlp.Request" 会让新版大模型链路整条漏接。
+        assertTrue(
+            XiaoAiTakeoverPolicy.matchesOutboundEvent("Nlp.RequestLargeLanguageModelContent"),
+        )
+        assertTrue(XiaoAiTakeoverPolicy.matchesOutboundEvent("Nlp.RequestSummaryText"))
+        assertTrue(XiaoAiTakeoverPolicy.matchesOutboundEvent("Nlp.RequestWeather"))
         assertFalse(XiaoAiTakeoverPolicy.matchesOutboundEvent("SpeechRecognizer.Recognize"))
+        assertFalse(XiaoAiTakeoverPolicy.matchesOutboundEvent("SpeechRecognizer.RecognizeResult"))
+        assertFalse(XiaoAiTakeoverPolicy.matchesOutboundEvent(""))
     }
 
     @Test

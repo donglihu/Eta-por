@@ -9,15 +9,52 @@ internal object XiaoAiTakeoverPolicy {
     private const val IMAGE_ONLY_PLACEHOLDER = "blank"
     private const val IMAGE_ONLY_PROMPT = "请分析这张图片"
 
+    /**
+     * 已逐锚点核对过的小爱版本。新增版本前先按 XiaoAiHooks 里的类常量核一遍 APK，
+     * 混淆锚点（y00.r0 / z10.a / k00.y0 / lh0.s0 / y00.c1）会随版本重排。
+     */
+    val ADAPTED_VERSION_CODES: Set<Long> = setOf(507013032L, 507013035L)
+
+    /**
+     * 跨版本稳定的锚点：都是保留语义的完整类名（小爱自有包名或 com.xiaomi.ai.api），
+     * 不含 R8 分配的短名（如 widget.d / card.a / y00.r0），所以能用来判断结构是否同一套。
+     */
+    val STABLE_ANCHORS: List<String> = listOf(
+        "com.xiaomi.voiceassistant.VAApplication",
+        "com.xiaomi.voiceassistant.instruction.base.OperationManager",
+        "com.xiaomi.voiceassistant.instruction.card.stream.FlowTemplateToastCard",
+        "com.xiaomi.voiceassistant.UiManager",
+        "com.xiaomi.ai.api.common.Event",
+        "com.xiaomi.ai.api.common.Instruction",
+    )
+
     data class Decision(
         val prompt: String,
     )
 
     fun isSupportedVersion(versionCode: Long): Boolean =
-        versionCode == XiaoAiHooks.SUPPORTED_VERSION_CODE
+        ADAPTED_VERSION_CODES.contains(versionCode)
+
+    /**
+     * 未登记的版本不直接放弃：只要小爱侧仍保留这批稳定锚点（都在 com.xiaomi 命名空间、
+     * 不受 R8 改名影响），就允许安装钩子；单个混淆锚点落空由 HookRegistrar.missing 降级，
+     * 不会拖垮整条链路。
+     */
+    fun shouldInstallOnUnknownVersion(anchorPresent: (String) -> Boolean): Boolean =
+        STABLE_ANCHORS.all(anchorPresent)
+
+    /**
+     * 可接管的出站事件名。
+     *
+     * 7.13.35 的 dex 里实测存在四个 Nlp 出站变体（Nlp.Request /
+     * Nlp.RequestLargeLanguageModelContent / Nlp.RequestSummaryText / Nlp.RequestWeather），
+     * 只认 "Nlp.Request" 会在新版走 LLM 直连分支时静默漏接。这里按前缀匹配 Nlp.Request，
+     * 排除纯识别事件（SpeechRecognizer.*），保持「文本问答才接管」的语义。
+     */
+    private const val OUTBOUND_EVENT_PREFIX = "Nlp.Request"
 
     fun matchesOutboundEvent(fullName: String): Boolean =
-        fullName == "Nlp.Request"
+        fullName.startsWith(OUTBOUND_EVENT_PREFIX)
 
     fun decide(
         query: String,

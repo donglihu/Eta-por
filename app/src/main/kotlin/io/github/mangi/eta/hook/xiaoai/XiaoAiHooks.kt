@@ -30,7 +30,12 @@ import java.util.concurrent.atomic.AtomicReference
 import org.json.JSONObject
 
 internal object XiaoAiHooks {
-    const val SUPPORTED_VERSION_CODE = 507013032L
+    /**
+     * 逐锚点核对过的版本基线；真实门禁在 [XiaoAiTakeoverPolicy]：
+     * 命中 [XiaoAiTakeoverPolicy.ADAPTED_VERSION_CODES] 直接放行，
+     * 未登记版本只要稳定锚点齐全也放行（混淆锚点缺失由 HookRegistrar.missing 降级）。
+     */
+    const val SUPPORTED_VERSION_CODE = 507013035L
 
     private const val OPERATION_MANAGER_CLASS =
         "com.xiaomi.voiceassistant.instruction.base.OperationManager"
@@ -39,7 +44,8 @@ internal object XiaoAiHooks {
     private const val INSTRUCTION_CLASS = "com.xiaomi.ai.api.common.Instruction"
     private const val ENGINE_CLASS = "y00.r0"
     private const val ASR_PROCESSOR_CLASS = "z10.a"
-    private const val AGENT_ACTION_MANAGER_CLASS = "kh0.s0"
+    /** 507013035 实测为 lh0.s0；507013032 为 kh0.s0，按顺序探测。 */
+    private val AGENT_ACTION_MANAGER_CLASSES = listOf("lh0.s0", "kh0.s0")
     private const val ASR_RESULT_FULL_NAME = "SpeechRecognizer.RecognizeResult"
     private const val IMAGE_ID_STORE_CLASS = "k00.y0"
     private const val FLOAT_MANAGER_CLASS = "com.xiaomi.voiceassistant.widget.d"
@@ -47,12 +53,15 @@ internal object XiaoAiHooks {
     internal const val FLOW_TOAST_CARD_CLASS =
         "com.xiaomi.voiceassistant.instruction.card.stream.FlowTemplateToastCard"
     private const val UI_MANAGER_CLASS = "com.xiaomi.voiceassistant.UiManager"
-    internal const val TTS_PLAYER_CLASS = "la0.n1"
+    /** 507013035 实测为 y00.c1（更早版本是 la0.n1），按顺序探测。 */
+    internal val TTS_PLAYER_CLASSES = listOf("y00.c1", "la0.n1")
     private const val EXTRA_IMAGE_FILE_ID = "extra_image_file_id"
     private val DOCUMENT_EXTRA_KEYS = setOf("file_path", "file_name", "file_desc", "query_type")
     private const val BRIDGE_QUEUE_CAPACITY = 4
     private const val ACTIVATION_TIMEOUT_SECONDS = 3L
     private const val PENDING_DRAIN_LIMIT = 8
+    /** 认领成功后等最终结果的上限；超过就回收浮窗，避免永久转圈。 */
+    private const val RUN_WATCHDOG_SECONDS = 180L
 
     private val queryCache = XiaoAiQueryCache()
     private val turnTracker = XiaoAiTurnTracker()
@@ -119,7 +128,16 @@ internal object XiaoAiHooks {
         ) { chain ->
             val context = chain.thisObject as? Context
             val versionCode = context?.let(::packageVersionCode) ?: -1L
-            if (XiaoAiTakeoverPolicy.isSupportedVersion(versionCode)) {
+            val adapted = XiaoAiTakeoverPolicy.isSupportedVersion(versionCode)
+            val anchorProbe = XiaoAiTakeoverPolicy.shouldInstallOnUnknownVersion { anchor ->
+                HookSupport.findClassOrNull(classLoader, anchor) != null
+            }
+            if (adapted || anchorProbe) {
+                if (!adapted) {
+                    hooks.logger.info(
+                        "超级小爱未登记版本但稳定锚点齐全，按结构适配安装: versionCode=$versionCode"
+                    )
+                }
                 installBusinessHooksOnce(
                     module = module,
                     rootLogger = rootLogger,
@@ -349,7 +367,49 @@ internal object XiaoAiHooks {
                 }
                 false
             }
-            if (claimed) true else chain.proceed()
+            if (claimed) {
+                true
+            } else {
+                // 诊断：C0 是全链路唯一出站边界，认领失败时把事件名与判定依据打出来，
+                // 否则「钩子已装但毫无反应」在现场无法定位（507013035 首轮就卡在这里）。
+                if (event != null) {
+                    logOutboundSkip(hooks.logger, event)
+                }
+                chain.proceed()
+            }
+        }
+    }
+
+    /** 认领未命中时输出一行诊断，节流 5s；只打事件名与文本长度，不落用户原文。 */
+    private fun logOutboundSkip(logger: ModuleLogger, event: Any) {
+        val fullName = runCatching { invokeString(event, "getFullName") }.getOrDefault("")
+        // C0 是全局出站边界，SpeechRecognizer.* 等纯识别事件每轮都会经过；
+        // 全量打印会淹没真正有用的信息，因此只对 Nlp 系出站事件做明细诊断。
+        val nlpOutbound = XiaoAiTakeoverPolicy.matchesOutboundEvent(fullName)
+        if (!nlpOutbound) return
+        val dialogId = runCatching { invokeString(event, "getId") }.getOrDefault("")
+        val query = runCatching {
+            HookSupport.invokeNoArgs(event, "getPayload")?.let { invokeString(it, "getQuery") }
+        }.getOrNull().orEmpty()
+        logger.warnThrottled("xiaoai_outbound_skip", windowMs = 5_000L) {
+            "小爱出站未认领: event=${fullName.ifBlank { "-" }} " +
+                "dialog=${shortId(dialogId)} queryChars=${query.length} " +
+                "cached=${queryCache.size()} turn=${turnTracker.latest()?.query?.length ?: -1} " +
+                "customModel=${Prefs.isEnabled(Prefs.Keys.AGENT_CUSTOM_MODEL)} " +
+                "requirePrefix=${Prefs.isEnabled(Prefs.Keys.AGENT_REQUIRE_PREFIX)}"
+        }
+    }
+
+    /**
+     * 总开关关闭时的显式提示。
+     *
+     * 之前「钩子全装上但小爱毫无变化」在现场无从下手，因为 decide() 因总开关返回 null
+     * 属于静默分支。这里把原因直接写进日志，避免再次把「配置没开」误判成「钩子失效」。
+     */
+    private fun warnIfTakeoverDisabled(logger: ModuleLogger) {
+        if (Prefs.isEnabled(Prefs.Keys.AGENT_CUSTOM_MODEL)) return
+        logger.warnThrottled("xiaoai_takeover_disabled", windowMs = 60_000L) {
+            "小爱接管未启用：设置里「启用厂商助手自定义模型」当前为关，请求保持原生行为"
         }
     }
 
@@ -357,7 +417,9 @@ internal object XiaoAiHooks {
         hooks: HookRegistrar,
         classLoader: ClassLoader,
     ) {
-        val managerClass = HookSupport.findClassOrNull(classLoader, AGENT_ACTION_MANAGER_CLASS)
+        val managerClass = AGENT_ACTION_MANAGER_CLASSES.firstNotNullOfOrNull { name ->
+            HookSupport.findClassOrNull(classLoader, name)
+        }
         if (managerClass == null) {
             hooks.missing(
                 id = "xiaoai.agent-action",
@@ -434,6 +496,9 @@ internal object XiaoAiHooks {
         val dialogId = invokeString(event, "getId").trim()
         if (dialogId.isBlank()) return false
         if (claimedDialogIds.contains(dialogId)) return true
+
+        // 总开关关闭是最常见的「毫无反应」原因，进入认领逻辑先自检一次。
+        warnIfTakeoverDisabled(logger)
 
         val payload = HookSupport.invokeNoArgs(event, "getPayload")
         val eventQuery = payload?.let { invokeString(it, "getQuery") }.orEmpty()
@@ -533,8 +598,17 @@ internal object XiaoAiHooks {
         return true
     }
 
+    /**
+     * 是否吞掉小爱原生 Agent Action。
+     *
+     * 只有「ETA 真的接了这一轮」才允许吞：必须存在未取消的 activeRun。
+     * 旧实现只看 turnTracker（setQueryInfo/ASR 就能写进去），一旦认领没成功，
+     * 原生动作被吞、ETA 又没出答案，小爱浮窗就永远转圈（507013035 现场的卡死）。
+     */
     private fun shouldOwnLatestTurn(): Boolean {
-        val turn = turnTracker.latest() ?: return activeRun.get() != null
+        val run = activeRun.get() ?: return false
+        if (run.cancelled.get()) return false
+        val turn = turnTracker.latest() ?: return true
         if (turn.documentInput) return false
         return XiaoAiTakeoverPolicy.decide(
             query = turn.query,
@@ -549,7 +623,15 @@ internal object XiaoAiHooks {
         context: Context,
         run: ActiveRun,
     ) {
-        if (!run.awaitActivation() || activeRun.get() !== run) return
+        if (!run.awaitActivation()) {
+            logger.warnThrottled("xiaoai_run_activation_timeout") {
+                "超级小爱本轮未完成激活，放弃并保持原生行为"
+            }
+            activeRun.clear(run)
+            return
+        }
+        if (activeRun.get() !== run) return
+        scheduleWatchdog(logger, run)
         val client = AgentRuntimeClient(context, logger)
         run.client.set(client)
         var resultRunId: String? = null
@@ -589,6 +671,25 @@ internal object XiaoAiHooks {
             resultRunId?.let { client.ackResult(it) }
             activeRun.clear(run)
         }
+    }
+
+    /**
+     * 兜底看门狗：认领成功后如果长时间拿不到最终结果（Runtime 无响应、模型挂起、
+     * 跨进程丢失），主动把浮窗收成失败卡。否则小爱侧被吞掉的原生请求无法恢复，
+     * 浮窗会一直转圈到用户手动关掉。
+     */
+    private fun scheduleWatchdog(logger: ModuleLogger, run: ActiveRun) {
+        val handler = Handler(Looper.getMainLooper())
+        handler.postDelayed({
+            if (activeRun.get() !== run || run.cancelled.get()) return@postDelayed
+            logger.warnThrottled("xiaoai_watchdog_timeout") {
+                "超级小爱本轮 ${RUN_WATCHDOG_SECONDS}s 无最终结果，回收浮窗"
+            }
+            run.cancelled.set(true)
+            run.renderer.fail()
+            run.future.get()?.cancel(true)
+            activeRun.clear(run)
+        }, RUN_WATCHDOG_SECONDS * 1_000L)
     }
 
     private fun resolveImage(
