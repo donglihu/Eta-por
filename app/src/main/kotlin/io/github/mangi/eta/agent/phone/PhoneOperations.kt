@@ -45,7 +45,7 @@ internal object PhoneOperations {
                     "update_alarm_time",
                     "set_alarm_enabled",
                     "delete_alarm" ->
-                        ClockOperations(access, userId ?: 0, markMutation).execute(tool, args)
+                        ClockOperations(access, userId ?: 0, markMutation, context).execute(tool, args)
                     "create_note",
                     "read_note",
                     "delete_note" ->

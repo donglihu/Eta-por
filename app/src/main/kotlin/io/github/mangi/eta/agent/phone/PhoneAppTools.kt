@@ -28,19 +28,24 @@ internal class PhoneAppTools(
                     )
         if (tool == "set_sound_mode" && !rootAvailable())
             return PhoneOperations.execute(context, tool, arguments)
-        if (!calendar && !system && !colorOs())
-            return if (tool in setOf("set_alarm", "list_alarms")) null
-            else PhoneOperation.failure("DEVICE_UNSUPPORTED", "当前设备没有兼容的一方应用接口")
-        // 闹钟优先走厂商直写接口：全程不发 Intent，不会拉起时钟界面。
-        // 有 Root 走 root 子进程；没有 Root 时也先让应用自身试一次，失败再回退标准 Intent。
-        if (tool == "set_alarm") {
+        // 闹钟读写都不再按厂商白名单丢弃：ClockOperations 已改为「Intent 建 + Provider 查改删」，
+        // 走的是标准 AlarmClock Intent 与时钟 App 自己的 AlarmProvider，AOSP/小米/ColorOS 同一套。
+        // 之前非 ColorOS 设备把 list_alarms 直接返回 null，会掉到私有库快照分支并报
+        // CLOCK_SCHEMA_UNSUPPORTED，这就是闹钟列表在本机不可用的原因。
+        if (tool in ALARM_TOOLS) {
             if (rootAvailable()) return executeRoot(tool, arguments)
-            // 只要厂商接口给出了结果（含「已创建但未能回读确认」）就采信，避免回退 Intent 重复创建；
-            // 只有抛异常（接口不可用 / 被拒）才回退。
-            val viaProvider = runCatching { PhoneOperations.execute(context, tool, arguments) }.getOrNull()
-            if (viaProvider != null) return viaProvider
-            return null
+            // 没有 Root 时先让应用自身身份试一次（新建走 Intent、查询走 Provider 读权限）；
+            // 只有抛异常（接口不可用 / 被拒）才交回上层，由上层给出明确失败原因。
+            return runCatching { PhoneOperations.execute(context, tool, arguments) }
+                .getOrElse {
+                    PhoneOperation.failure(
+                        "CLOCK_UNAVAILABLE",
+                        "时钟接口不可用：${it.message ?: it::class.java.simpleName}；已确认未写入任何记录",
+                    )
+                }
         }
+        if (!calendar && !system && !colorOs())
+            return PhoneOperation.failure("DEVICE_UNSUPPORTED", "当前设备没有兼容的一方应用接口")
         if (calendar && hasCalendarAccess(tool in PhoneOperation.writes))
             return PhoneOperations.execute(context, tool, arguments)
         if (!rootAvailable())
@@ -97,4 +102,10 @@ internal class PhoneAppTools(
 
     private fun hasCalendarAccess(write: Boolean) =
         io.github.mangi.eta.agent.device.CalendarPermissions.granted(context, write)
+
+    private companion object {
+        /** 闹钟读写：走 Intent + 时钟 App 的 AlarmProvider，不再受厂商白名单限制。 */
+        val ALARM_TOOLS =
+            setOf("list_alarms", "set_alarm", "update_alarm_time", "set_alarm_enabled", "delete_alarm")
+    }
 }
