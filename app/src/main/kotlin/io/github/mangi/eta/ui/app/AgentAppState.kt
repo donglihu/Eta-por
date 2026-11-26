@@ -176,6 +176,9 @@ internal class AgentAppState(
     /** 导入备份期间串行化会话加载，避免与保存/重载交叉。 */
     private val conversationLoadMutex = Mutex()
 
+    /** 图片暂存串行锁：多选一次会连发多个 attachImage，避免并发争抢同一目录 IO。 */
+    private val imageAttachMutex = Mutex()
+
     @Volatile
     private var conversationPersistence = AgentConversationPersistence(initialConversations)
     /** 新建会话待落库的分类（会话在首次发送时才真正生成）。 */
@@ -3104,32 +3107,53 @@ internal class AgentAppState(
 
     fun attachImage(uri: String) {
         scope.launch(Dispatchers.IO) {
-            try {
-                val staged = AgentImageCodec.stageAttachment(
-                    context = appContext,
-                    value = uri,
-                    source = "user_attach",
-                )
-                val image = when (staged) {
-                    is AgentImageCodec.StageResult.Success -> staged.image
-                    AgentImageCodec.StageResult.InsufficientStorage -> {
-                        io.github.mangi.eta.core.EtaTrace.log(
-                            "image.attach",
-                            "action=stage_failed reason=insufficient_storage source=user_attach",
-                        )
-                        withContext(Dispatchers.Main) {
-                            Toast.makeText(
-                                appContext,
-                                appContext.getString(R.string.capability_import_insufficient_storage),
-                                Toast.LENGTH_SHORT,
-                            ).show()
+            // 串行化：多选一次会连发 N 个 attachImage，并发暂存会争抢同一目录的 IO，
+            // 且每个都会扫一遍旧附件做清理，选 9 张图就是 9 次全目录扫描 —— 用户体感就是卡住。
+            // 加锁后依次处理，首张很快出现缩略图，后面的排队完成，不会互相拖慢。
+            imageAttachMutex.withLock {
+                try {
+                    val staged = AgentImageCodec.stageAttachment(
+                        context = appContext,
+                        value = uri,
+                        source = "user_attach",
+                    )
+                    val image = when (staged) {
+                        is AgentImageCodec.StageResult.Success -> staged.image
+                        AgentImageCodec.StageResult.InsufficientStorage -> {
+                            io.github.mangi.eta.core.EtaTrace.log(
+                                "image.attach",
+                                "action=stage_failed reason=insufficient_storage source=user_attach",
+                            )
+                            withContext(Dispatchers.Main) {
+                                Toast.makeText(
+                                    appContext,
+                                    appContext.getString(R.string.capability_import_insufficient_storage),
+                                    Toast.LENGTH_SHORT,
+                                ).show()
+                            }
+                            return@launch
                         }
-                        return@launch
+                        AgentImageCodec.StageResult.InvalidImage -> {
+                            io.github.mangi.eta.core.EtaTrace.log(
+                                "image.attach",
+                                "action=stage_failed reason=invalid_image source=user_attach",
+                            )
+                            withContext(Dispatchers.Main) {
+                                Toast.makeText(
+                                    appContext,
+                                    appContext.getString(R.string.state_ui_unable_to_read_this_image_please_try_again_or_us_d94978),
+                                    Toast.LENGTH_SHORT,
+                                ).show()
+                            }
+                            return@launch
+                        }
                     }
-                    AgentImageCodec.StageResult.InvalidImage -> {
+                    val preview = AgentImageCodec.previewFromReference(appContext, image)
+                    if (preview == null) {
+                        deleteStagedAttachmentIfLocal(image.reference)
                         io.github.mangi.eta.core.EtaTrace.log(
                             "image.attach",
-                            "action=stage_failed reason=invalid_image source=user_attach",
+                            "action=preview_failed bytes=${image.bytes} size=${image.width}x${image.height}",
                         )
                         withContext(Dispatchers.Main) {
                             Toast.makeText(
@@ -3140,47 +3164,31 @@ internal class AgentAppState(
                         }
                         return@launch
                     }
-                }
-                val preview = AgentImageCodec.previewFromReference(appContext, image)
-                if (preview == null) {
-                    deleteStagedAttachmentIfLocal(image.reference)
                     io.github.mangi.eta.core.EtaTrace.log(
                         "image.attach",
-                        "action=preview_failed bytes=${image.bytes} size=${image.width}x${image.height}",
+                        "action=staged bytes=${image.bytes} size=${image.width}x${image.height} " +
+                            "preview_bytes=${preview.bytes} preview_size=${preview.width}x${preview.height}",
+                    )
+                    val pending = PendingImageUi(
+                        id = "img-${UUID.randomUUID()}",
+                        // 后续发送直接对私有暂存文件开只读 fd 零拷贝传输，既脱离 Photo Picker URI 生命周期，
+                        // 也不在 UI 堆内存中囤积整张原图的 Base64。
+                        uri = image.reference,
+                        dataUrl = preview.reference,
+                        mimeType = image.mimeType,
                     )
                     withContext(Dispatchers.Main) {
-                        Toast.makeText(
-                            appContext,
-                            appContext.getString(R.string.state_ui_unable_to_read_this_image_please_try_again_or_us_d94978),
-                            Toast.LENGTH_SHORT,
-                        ).show()
+                        updateCurrentConversation(homeState.copy(pendingImages = homeState.pendingImages + pending))
                     }
-                    return@launch
-                }
-                io.github.mangi.eta.core.EtaTrace.log(
-                    "image.attach",
-                    "action=staged bytes=${image.bytes} size=${image.width}x${image.height} " +
-                        "preview_bytes=${preview.bytes} preview_size=${preview.width}x${preview.height}",
-                )
-                val pending = PendingImageUi(
-                    id = "img-${UUID.randomUUID()}",
-                    // 后续发送直接对私有暂存文件开只读 fd 零拷贝传输，既脱离 Photo Picker URI 生命周期，
-                    // 也不在 UI 堆内存中囤积整张原图的 Base64。
-                    uri = image.reference,
-                    dataUrl = preview.reference,
-                    mimeType = image.mimeType,
-                )
-                withContext(Dispatchers.Main) {
-                    updateCurrentConversation(homeState.copy(pendingImages = homeState.pendingImages + pending))
-                }
-            } finally {
-                val selectedUri = Uri.parse(uri)
-                if (selectedUri.scheme == ContentResolver.SCHEME_CONTENT) {
-                    runCatching {
-                        appContext.contentResolver.releasePersistableUriPermission(
-                            selectedUri,
-                            Intent.FLAG_GRANT_READ_URI_PERMISSION,
-                        )
+                } finally {
+                    val selectedUri = Uri.parse(uri)
+                    if (selectedUri.scheme == ContentResolver.SCHEME_CONTENT) {
+                        runCatching {
+                            appContext.contentResolver.releasePersistableUriPermission(
+                                selectedUri,
+                                Intent.FLAG_GRANT_READ_URI_PERMISSION,
+                            )
+                        }
                     }
                 }
             }

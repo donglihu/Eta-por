@@ -86,6 +86,8 @@ internal fun AgentAttachmentPickerButton(
     val photoPicker = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.PickMultipleVisualMedia(),
     ) { uris ->
+        // 权限申请失败不影响继续：Photo Picker 的 URI 往往不支持持久授权，
+        // 真正的读取靠 Eta 侧立刻把内容暂存进私有目录，而不是指望这个 grant 活到发送时。
         uris.forEach { uri ->
             runCatching {
                 context.contentResolver.takePersistableUriPermission(

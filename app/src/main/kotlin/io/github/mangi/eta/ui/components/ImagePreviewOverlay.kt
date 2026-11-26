@@ -34,6 +34,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -52,7 +53,9 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.core.content.FileProvider
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
 import top.yukonga.miuix.kmp.basic.Text
 import java.io.File
 
@@ -288,11 +291,17 @@ internal fun shareDataUrlImage(context: Context, dataUrl: String) {
  *
  * 文件与相册来源用 `BitmapFactory` + `inSampleSize` 降采样：
  * 4000×3000 的原图直接解码要吃几十 MB，低端机当场 OOM。
+ *
+ * 解码放后台线程（[produceState] + [Dispatchers.IO]）：预览浮层打开时主线程要立刻画遮罩，
+ * 在组合阶段同步解码一张大图会把入场动画卡住，用户体感就是「点开预览卡一下」。
  */
 @Composable
 private fun rememberMediaBitmap(source: String): ImageBitmap? {
     val context = LocalContext.current
-    return remember(source) { decodeMediaBitmap(context, source) }
+    val bitmap by produceState<ImageBitmap?>(initialValue = null, source) {
+        value = withContext(Dispatchers.IO) { decodeMediaBitmap(context, source) }
+    }
+    return bitmap
 }
 
 private fun decodeMediaBitmap(

@@ -56,6 +56,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
@@ -108,7 +109,9 @@ import io.github.mangi.eta.ui.model.ToolActivityMessageUi
 import io.github.mangi.eta.ui.model.ToolSummaryMessageUi
 import io.github.mangi.eta.ui.model.UserMessageUi
 import io.github.mangi.eta.ui.voice.SpeechReadAloudButton
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
 import top.yukonga.miuix.kmp.basic.Icon
 import top.yukonga.miuix.kmp.basic.IconButton
 import top.yukonga.miuix.kmp.basic.RichTooltip
@@ -121,9 +124,22 @@ import top.yukonga.miuix.kmp.squircle.squircleBorder
 import top.yukonga.miuix.kmp.squircle.squircleSurface
 import top.yukonga.miuix.kmp.theme.MiuixTheme
 
+/**
+ * 在后台线程解码消息图片，返回可空状态。
+ *
+ * 旧实现是 `remember(...) { decodeDataUrlBitmap(...) }`：组合阶段在**主线程**同步做
+ * Base64 解码 + BitmapFactory 解码。选图后输入条要立刻渲染缩略图，一张 1200×2670 的
+ * 图就要在主线程吃几十毫秒到上百毫秒，多选几张直接卡成白屏，用户看到的就是「添加图片卡住」。
+ * 这里改成 produceState + Dispatchers.IO：主线程只拿到 null 先占位，解码完成后自动重组。
+ *
+ * 解码失败保持 null（不抛），与旧行为一致；OOM 由 decodeDataUrlBitmap 内部 runCatching 兜住。
+ */
 @Composable
-internal fun rememberDataUrlBitmap(dataUrl: String, maxPx: Int? = null) = remember(dataUrl, maxPx) {
-    decodeDataUrlBitmap(dataUrl, maxPx)
+internal fun rememberDataUrlBitmap(dataUrl: String, maxPx: Int? = null): ImageBitmap? {
+    val bitmap by produceState<ImageBitmap?>(initialValue = null, dataUrl, maxPx) {
+        value = withContext(Dispatchers.IO) { decodeDataUrlBitmap(dataUrl, maxPx) }
+    }
+    return bitmap
 }
 
 /**
