@@ -16,7 +16,7 @@ internal class AgentPrivateDatabaseTools(
 ) {
     fun execute(name: String, args: JSONObject): AgentModelClient.ToolResult? = when (name) {
         "list_alarms" -> sensitive(readDatabase(CLOCK_DATABASE, "CLOCK_DATA_UNAVAILABLE") { listAlarms(it, args) })
-        "list_active_timers" -> sensitive(readDatabase(CLOCK_DATABASE, "CLOCK_DATA_UNAVAILABLE") { listTimers(it, args) })
+        "list_active_timers" -> sensitive(listTimers(args))
         "search_clipboard_history" -> sensitive(readDatabase(CLIPBOARD_DATABASE, "CLIPBOARD_HISTORY_UNAVAILABLE") { searchClipboard(it, args) })
         "get_health_summary" -> sensitive(readDatabase(HEALTH_DATABASE, "HEALTH_DATA_UNAVAILABLE") { healthSummary(it, args) })
         else -> null
@@ -31,7 +31,7 @@ internal class AgentPrivateDatabaseTools(
             table = "alarms",
             columns = listOf(
                 "_id", "hour", "minutes", "daysofweek", "alarmtime", "enabled", "message",
-                "vibrate", "deleteAfterUse", "workdaySwitch", "holidaySwitch", "snoozeTime",
+                "vibrate", "deleteAfterUse", "skiptime",
             ),
             selection = if (args.optBoolean("enabled_only", true)) "enabled=1" else null,
             order = "enabled DESC, alarmtime ASC",
@@ -40,22 +40,71 @@ internal class AgentPrivateDatabaseTools(
         return ok("list_alarms", items, limit)
     }
 
-    private fun listTimers(database: SQLiteDatabase, args: JSONObject): String {
-        if (!database.hasColumns("timer_schedule", setOf("_id", "duration", "state"))) {
-            return error("CLOCK_SCHEMA_UNSUPPORTED", "当前时钟数据库结构暂不受支持")
-        }
+    private fun listTimers(args: JSONObject): String {
         val limit = args.optInt("limit", 20).coerceIn(1, 50)
-        val items = database.rows(
-            table = "timer_schedule",
-            columns = listOf(
-                "_id", "description", "duration", "state", "first_start_time", "start_time",
-                "remain_time", "pause_remain_time", "alert_time",
-            ),
-            selection = "state<>0",
-            order = "alert_time ASC",
-            limit = limit,
-        )
-        return ok("list_active_timers", items, limit)
+        val state = queryTimerCountdown()
+            ?: return error("CLOCK_TIMER_UNAVAILABLE", "时钟计时器状态暂时不可访问")
+        val stateCode = state.optInt("timestate", TIMER_STATE_OFF)
+        val active = stateCode == TIMER_STATE_RUNNING || stateCode == TIMER_STATE_PAUSED
+        val items = JSONArray()
+        if (active) {
+            items.put(
+                JSONObject()
+                    .put("state", stateCode)
+                    .put("state_label", timerStateLabel(stateCode))
+                    .put("duration_ms", state.optLong("duration", 0L))
+                    .put("remaining_ms", state.optLong("timerremained", 0L))
+                    .put("end_time", state.optLong("endtime", 0L)),
+            )
+        }
+        return JSONObject()
+            .put("ok", true)
+            .put("tool", "list_active_timers")
+            .put("items", items)
+            .put("count", items.length())
+            .put("truncated", items.length() >= limit)
+            .put("state", stateCode)
+            .put("state_label", timerStateLabel(stateCode))
+            .toString()
+    }
+
+    /** 计时器运行态只存在于时钟 App 的 SharedPreferences，通过 Provider 读取当前状态。 */
+    private fun queryTimerCountdown(): JSONObject? {
+        val query = "content query --uri content://$AOSP_CLOCK_AUTHORITY/timercountdown"
+        val direct = root.execute(query, timeoutMillis = 10_000L, maxOutputBytes = 8 * 1024)
+        val output = if (direct.ok && direct.stdout.contains("Row:")) {
+            direct.stdout
+        } else {
+            // 应用沙箱的挂载视图可能看不到时钟 Provider，退回 init 命名空间再查一次。
+            root.execute(
+                "nsenter -t 1 -m -- /system/bin/sh -c ${shellQuote(query)}",
+                timeoutMillis = 10_000L,
+                maxOutputBytes = 8 * 1024,
+            ).takeIf { it.ok }?.stdout
+        } ?: return null
+        val row = output.lineSequence().firstOrNull { it.trimStart().startsWith("Row:") }
+            ?: return if (output.contains("No result found")) {
+                JSONObject().put("timestate", TIMER_STATE_OFF)
+            } else {
+                null
+            }
+        val json = JSONObject()
+        row.substringAfter("Row:").trim().substringAfter(' ', "").trim()
+            .split(',')
+            .forEach { pair ->
+                val key = pair.substringBefore('=', "").trim()
+                val value = pair.substringAfter('=', "").trim()
+                if (key.isNotEmpty()) value.toLongOrNull()?.let { json.put(key, it) } ?: json.put(key, value)
+            }
+        return if (json.has("timestate")) json else null
+    }
+
+    private fun timerStateLabel(state: Int): String = when (state) {
+        TIMER_STATE_STOP -> "已停止"
+        TIMER_STATE_RUNNING -> "运行中"
+        TIMER_STATE_PAUSED -> "已暂停"
+        TIMER_STATE_OFF -> "空闲"
+        else -> "未知"
     }
 
     private fun searchClipboard(database: SQLiteDatabase, args: JSONObject): String {
@@ -132,21 +181,31 @@ internal class AgentPrivateDatabaseTools(
         synchronized(snapshotLock) {
             val userId = context.dataDir.parentFile?.name?.toIntOrNull()
                 ?: return@synchronized error(unavailableCode, "无法确定当前 Android 用户")
-            val sourcePath = source.path.replace("{user}", userId.toString())
-            val snapshot = createSnapshot(sourcePath, source.maxBytes)
+            val snapshot = createSnapshotFromCandidates(source, userId)
                 ?: return@synchronized error(unavailableCode, source.unavailableMessage)
             try {
-                runCatching {
-                    SQLiteDatabase.openDatabase(
-                        snapshot.absolutePath,
-                        null,
-                        SQLiteDatabase.OPEN_READONLY or SQLiteDatabase.NO_LOCALIZED_COLLATORS,
-                    ).use(block)
-                }.getOrElse { error(unavailableCode, source.unavailableMessage) }
+                val database =
+                    try {
+                        SQLiteDatabase.openDatabase(
+                            snapshot.absolutePath,
+                            null,
+                            SQLiteDatabase.OPEN_READONLY or SQLiteDatabase.NO_LOCALIZED_COLLATORS,
+                        )
+                    } catch (failure: android.database.sqlite.SQLiteException) {
+                        return@synchronized error(
+                            "CLOCK_SNAPSHOT_OPEN_FAILED",
+                            "时钟快照打开失败：${failure.message ?: "SQLiteException"}",
+                        )
+                    }
+                database.use { block(it) }
             } finally {
                 deleteSnapshot(snapshot)
             }
         }
+
+    /** 按候选路径依次尝试：优先走 /data_mirror（不受应用沙箱挂载遮蔽），再退回常规路径。 */
+    private fun createSnapshotFromCandidates(source: DatabaseSource, userId: Int): File? =
+        source.paths(userId).firstNotNullOfOrNull { createSnapshot(it, source.maxBytes) }
 
     private fun createSnapshot(source: String, maxBytes: Long): File? {
         cleanupStaleSnapshots()
@@ -166,8 +225,10 @@ internal class AgentPrivateDatabaseTools(
                 append("cp ").append(shellQuote(extraSource)).append(' ').append(shellQuote(extraTarget)).append(" || exit 25; fi; ")
             }
         }
-        val result = root.execute(command, timeoutMillis = 15_000L, maxOutputBytes = 8 * 1024)
-        if (result.ok) return snapshot
+        if (root.execute(command, timeoutMillis = 15_000L, maxOutputBytes = 8 * 1024).ok) return snapshot
+        // 应用沙箱的挂载视图可能看不到目标目录，退回 init 命名空间再复制一次。
+        val namespaced = "nsenter -t 1 -m -- /system/bin/sh -c ${shellQuote(command)}"
+        if (root.execute(namespaced, timeoutMillis = 15_000L, maxOutputBytes = 8 * 1024).ok) return snapshot
         deleteSnapshot(snapshot)
         return null
     }
@@ -209,12 +270,19 @@ internal class AgentPrivateDatabaseTools(
     private fun SQLiteDatabase.hasColumns(table: String, required: Set<String>): Boolean =
         tableColumns(table).containsAll(required)
 
-    private fun SQLiteDatabase.tableColumns(table: String): Set<String> = runCatching {
+    /**
+     * 读取表列名。之前这里是 `runCatching{...}.getOrDefault(emptySet())`，把「库打不开 /
+     * 表不存在 / PRAGMA 失败」全吞成「空列集」，再被 hasColumns 判成结构不支持，最终对用户
+     * 报 CLOCK_SCHEMA_UNSUPPORTED —— 真正的失败原因（快照没拷到、库损坏）永久不可见。
+     * 现在异常照常上抛，由 readDatabase 的具名 catch 统一转成可诊断错误码。
+     */
+    private fun SQLiteDatabase.tableColumns(table: String): Set<String> {
         rawQuery("PRAGMA table_info($table)", null).use { cursor ->
             val name = cursor.getColumnIndex("name")
-            buildSet { while (cursor.moveToNext()) add(cursor.getString(name)) }
+            if (name < 0) return emptySet()
+            return buildSet { while (cursor.moveToNext()) add(cursor.getString(name)) }
         }
-    }.getOrDefault(emptySet())
+    }
 
     private fun Cursor.toJson(): JSONObject = JSONObject().also { row ->
         for (index in 0 until columnCount) {
@@ -250,25 +318,49 @@ internal class AgentPrivateDatabaseTools(
     private fun error(code: String, message: String): String = JSONObject().put("ok", false).put("code", code).put("message", message).toString()
     private fun sensitive(content: String) = AgentModelClient.ToolResult(content = content, sensitive = true)
 
-    private data class DatabaseSource(val path: String, val maxBytes: Long, val unavailableMessage: String)
+    private data class DatabaseSource(
+        val candidatePaths: List<String>,
+        val maxBytes: Long,
+        val unavailableMessage: String,
+    ) {
+        fun paths(userId: Int): List<String> = candidatePaths.map { it.replace("{user}", userId.toString()) }
+    }
 
     private companion object {
         val snapshotLock = Any()
         const val SNAPSHOT_PREFIX = "eta-private-data-"
         const val MAX_FIELD_CHARS = 4_000
         const val DAY_MS = 24L * 60 * 60 * 1_000
+        const val AOSP_CLOCK_PACKAGE = "com.android.deskclock"
+        const val COLOROS_CLOCK_PACKAGE = "com.coloros.alarmclock"
+        const val AOSP_CLOCK_AUTHORITY = "com.android.deskclock"
+        const val TIMER_STATE_STOP = 0
+        const val TIMER_STATE_RUNNING = 1
+        const val TIMER_STATE_PAUSED = 2
+        const val TIMER_STATE_OFF = 3
         val CLOCK_DATABASE = DatabaseSource(
-            "/data/user_de/{user}/com.coloros.alarmclock/databases/alarms.db",
+            listOf(
+                "/data_mirror/data_de/null/{user}/$AOSP_CLOCK_PACKAGE/databases/alarms.db",
+                "/data_mirror/data_de/null/{user}/$COLOROS_CLOCK_PACKAGE/databases/alarms.db",
+                "/data/user_de/{user}/$AOSP_CLOCK_PACKAGE/databases/alarms.db",
+                "/data/user_de/{user}/$COLOROS_CLOCK_PACKAGE/databases/alarms.db",
+            ),
             32L * 1024 * 1024,
-            "ColorOS 时钟数据暂时不可访问",
+            "时钟数据暂时不可访问",
         )
         val CLIPBOARD_DATABASE = DatabaseSource(
-            "/data/user/{user}/com.sohu.inputmethod.sogouoem/databases/clipboard_db",
+            listOf(
+                "/data_mirror/data_ce/null/{user}/com.sohu.inputmethod.sogouoem/databases/clipboard_db",
+                "/data/user/{user}/com.sohu.inputmethod.sogouoem/databases/clipboard_db",
+            ),
             32L * 1024 * 1024,
             "当前输入法没有可访问的剪贴板历史",
         )
         val HEALTH_DATABASE = DatabaseSource(
-            "/data/system_ce/{user}/healthconnect/healthconnect.db",
+            listOf(
+                "/data_mirror/data_ce/null/{user}/healthconnect/healthconnect.db",
+                "/data/system_ce/{user}/healthconnect/healthconnect.db",
+            ),
             256L * 1024 * 1024,
             "系统健康数据暂时不可访问",
         )
