@@ -2106,7 +2106,7 @@
   <string name="prompt_snapshot_expand_all">展开全部文本</string>
   <string name="prompt_snapshot_export">导出这份快照…</string>
   <string name="prompt_snapshot_export_failed">导出失败</string>
-  <string name="prompt_snapshot_exported">已导出</string>
+  <string name="prompt_snapshot_exported">已导出到 下载/Eta</string>
   <string name="prompt_snapshot_hint">每轮请求发出前留一份：system 全文与工具描述全文；保留份数在下方「管理与清理」里可调（0 = 不记录）</string>
   <string name="prompt_snapshot_item">%1$s · %2$s</string>
   <string name="prompt_snapshot_keep_current">当前上限</string>

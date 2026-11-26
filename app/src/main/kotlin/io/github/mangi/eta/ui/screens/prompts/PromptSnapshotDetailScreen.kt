@@ -1,7 +1,9 @@
 package io.github.mangi.eta.ui.screens.prompts
 
-import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.result.contract.ActivityResultContracts
+import android.content.ContentValues
+import android.content.Context
+import android.os.Environment
+import android.provider.MediaStore
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
@@ -16,7 +18,6 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
@@ -64,12 +65,11 @@ internal fun PromptSnapshotDetailScreen(
     var baseName by remember { mutableStateOf(AgentRequestSnapshot.baseName()) }
     var expandedSegment by remember { mutableStateOf<Int?>(null) }
     var showTools by remember { mutableStateOf(false) }
-    // 导出目标只用文件名持有，跨 Activity 重建（SAF 文档选择器可能触发）不丢；
-    // 重建后文件本体可能已被 prune 淘汰，回调时重新按名取，取不到则按失败处理。
-    var pendingExportName by rememberSaveable { mutableStateOf<String?>(null) }
-    // SAF 选择器返回的 uri：先暂存，交给 LaunchedEffect 在 suspend 环境里执行 IO 复制，
-    // 避免在 rememberLauncherForActivityResult 的普通回调里直接调用 suspend 的 withContext。
-    var pendingExportUri by remember { mutableStateOf<android.net.Uri?>(null) }
+    // 导出触发信号：点「导出」+1，LaunchedEffect 检测到变化后切 IO 写系统下载目录。
+    // 不再走 DocumentsUI（ActivityResultContracts.CreateDocument）——该选择器启动时
+    // 同步枚举全部 DocumentsProvider，任一 provider 的 query 挂起会让 DocumentsUI 自身
+    // ANR（实测 PickActivity.onCreate→getMatchingRootsBlocking 等锁），导致「跳转文件夹」卡死。
+    var exportRequestId by remember { mutableStateOf(0) }
 
     // 后台加载当前快照 + 基准；baseName 变化（点「设为基准/清除」）时因 key 变化自动重算。
     LaunchedEffect(fileName, baseName) {
@@ -95,43 +95,18 @@ internal fun PromptSnapshotDetailScreen(
         loaded = true
     }
 
-    val exportLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.CreateDocument("application/json"),
-    ) { uri ->
-        // 只暂存 uri，实际导出交给 LaunchedEffect(pendingExportUri) 在协程里做 IO，不阻塞主线程。
-        pendingExportUri = uri
-    }
-
-    // 导出执行器：suspend 环境，取文件（Default）→ 流式复制（IO）→ 回主线程 toast。
-    LaunchedEffect(pendingExportUri) {
-        val uri = pendingExportUri ?: return@LaunchedEffect
-        val targetName = pendingExportName
-        pendingExportName = null
-        pendingExportUri = null
-        if (targetName == null) {
+    // 导出执行器：切后台读文件字节（IO）→ 写系统下载目录（IO）→ 回主线程 toast。
+    // 完全不经过 DocumentsUI，避免其启动时同步枚举 DocumentsProvider 触发自身 ANR。
+    LaunchedEffect(exportRequestId) {
+        if (exportRequestId == 0) return@LaunchedEffect
+        val targetFile = file
+        if (targetFile == null) {
             toast(context, context.getString(R.string.prompt_snapshot_export_failed))
             return@LaunchedEffect
         }
-        // 重建后文件本体可能已被 prune 淘汰，重新按名取（后台线程，避免主线程 IO）。
-        val target = withContext(Dispatchers.Default) {
-            AgentRequestSnapshot.list().firstOrNull { it.name == targetName }
+        val ok = withContext(Dispatchers.IO) {
+            writeSnapshotToDownloads(context, targetFile)
         }
-        if (target == null) {
-            toast(context, context.getString(R.string.prompt_snapshot_export_failed))
-            return@LaunchedEffect
-        }
-        val ok = runCatching {
-            val output = context.contentResolver.openOutputStream(uri)
-            if (output == null) {
-                false
-            } else {
-                // 流式复制在 IO 线程：避免主线程分配/复制整个文件的 byte[]，也避免阻塞 SAF 返回后的界面。
-                withContext(Dispatchers.IO) {
-                    target.inputStream().use { input -> output.use { input.copyTo(it) } }
-                }
-                true
-            }
-        }.getOrDefault(false)
         toast(context, context.getString(if (ok) R.string.prompt_snapshot_exported else R.string.prompt_snapshot_export_failed))
     }
 
@@ -235,9 +210,8 @@ internal fun PromptSnapshotDetailScreen(
                     summary = file?.name.orEmpty(),
                     startAction = { EtaPreferenceIcon(icon = Icons.Rounded.IosShare, tint = EtaPreferenceColors.Orange) },
                     onClick = {
-                        val target = file ?: return@EtaActionPreference
-                        pendingExportName = target.name
-                        exportLauncher.launch(target.name)
+                        // 不再启动 DocumentsUI 选择器，直接触发后台导出到系统下载目录。
+                        exportRequestId++
                     },
                 )
             }
@@ -453,3 +427,29 @@ private data class SnapshotDetailData(
 )
 
 private const val NAME_LIMIT = 10
+
+/** 导出快照到系统下载目录（Android 10+ 无需额外权限），绕开 DocumentsUI 选择器。 */
+private fun writeSnapshotToDownloads(context: Context, file: File): Boolean {
+    val name = "snapshot_${System.currentTimeMillis()}.json"
+    val values = ContentValues().apply {
+        put(MediaStore.MediaColumns.DISPLAY_NAME, name)
+        put(MediaStore.MediaColumns.MIME_TYPE, "application/json")
+        put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/Eta")
+        put(MediaStore.MediaColumns.IS_PENDING, 1)
+    }
+    val resolver = context.contentResolver
+    val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values) ?: return false
+    val ok = runCatching {
+        resolver.openOutputStream(uri)?.use { output ->
+            file.inputStream().use { input -> input.copyTo(output) }
+        }
+    }.isSuccess
+    if (ok) {
+        values.clear()
+        values.put(MediaStore.MediaColumns.IS_PENDING, 0)
+        resolver.update(uri, values, null, null)
+    } else {
+        resolver.delete(uri, null, null)
+    }
+    return ok
+}
