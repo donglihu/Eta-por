@@ -125,6 +125,7 @@ class VivoPersonalContextQueryTest {
                 (selection?.let { " WHERE $it" } ?: "") + (sort?.let { " ORDER BY $it" } ?: ""), args)
         }
         override fun insert(uri: Uri, values: ContentValues): Uri? = throw AssertionError("Write attempted")
+        override fun update(uri: Uri, values: ContentValues, selection: String?, args: Array<String>?): Int = throw AssertionError("Write attempted")
         override fun delete(uri: Uri, selection: String?, args: Array<String>?): Int = throw AssertionError("Write attempted")
         override fun call(uri: Uri, method: String, arg: String?, extras: Bundle): Bundle? = throw AssertionError("Write attempted")
         override fun applyBatch(authority: String, operations: ArrayList<ContentProviderOperation>): Array<ContentProviderResult> = throw AssertionError("Write attempted")

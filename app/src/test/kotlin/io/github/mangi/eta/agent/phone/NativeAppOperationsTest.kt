@@ -169,26 +169,10 @@ class NativeAppOperationsTest {
     }
 
     @Test
-    fun clockUsesTypedRepeatMaskAndRestoresDisabledStateOnTimeEdit() {
+    fun clockTimeEditUsesItemUriSoOtherAlarmsAreNotTouched() {
         val provider = FakeProvider()
-        val result =
-            PhoneOperations.execute(
-                context,
-                "set_alarm",
-                JSONObject()
-                    .put("hour", 8)
-                    .put("minute", 30)
-                    .put("repeat_days", org.json.JSONArray(listOf("mon", "wed", "fri"))),
-                userId = 0,
-                access = provider,
-            )
-        assertTrue(result.toString(), result.getBoolean("verified"))
-        assertEquals(
-            21.toByte(),
-            provider.createdAlarm!!.getByte("android.intent.extra.alarm.DAYS_OF_WEEK"),
-        )
-        assertFalse(provider.createdAlarm!!.containsKey("android.intent.extra.alarm.DAYS"))
-        provider.alarmEnabled = false
+        provider.addClockRow(7, 8, 30, 0, enabled = false)
+        provider.addClockRow(8, 6, 15, 0, enabled = true)
         val changed =
             PhoneOperations.execute(
                 context,
@@ -198,29 +182,114 @@ class NativeAppOperationsTest {
                 access = provider,
             )
         assertTrue(changed.toString(), changed.getBoolean("verified"))
-        assertFalse(provider.alarmEnabled)
-        assertTrue(provider.calls.indexOf("update_alarm") < provider.calls.indexOf("close_alarm"))
+        assertEquals(9, changed.getJSONObject("alarm").getInt("hour"))
+        assertEquals(0, changed.getJSONObject("alarm").getInt("minute"))
+        // 必须落到 item URI：Provider 的 dir 分支 update 会忽略 selection 改掉全部闹钟。
+        assertEquals("content://com.android.deskclock/alarm/7", provider.updatedUri.toString())
+        // 另一条闹钟必须原封不动。
+        val other = provider.clockRows.first { it.getAsLong("_id") == 8L }
+        assertEquals(6, other.getAsInteger("hour"))
+        assertEquals(15, other.getAsInteger("minutes"))
+        // 改时不应顺带启用原本关闭的闹钟。
+        assertFalse(changed.getJSONObject("alarm").getBoolean("enabled"))
+    }
+
+    @Test
+    fun clockCreateWritesThroughProviderAndComputesSingleShotTrigger() {
+        val provider = FakeProvider()
+        val result =
+            PhoneOperations.execute(
+                context,
+                "set_alarm",
+                JSONObject().put("hour", 7).put("minute", 45).put("label", "早课"),
+                userId = 0,
+                access = provider,
+            )
+        assertTrue(result.toString(), result.getBoolean("verified"))
+        val row = provider.clockRows.single()
+        assertEquals(7, row.getAsInteger("hour"))
+        assertEquals(45, row.getAsInteger("minutes"))
+        assertEquals("早课", row.getAsString("message"))
+        // 单次闹钟必须自己算 alarmtime，Provider 不会算。
+        assertTrue(row.getAsLong("alarmtime")!! > System.currentTimeMillis())
+    }
+
+    @Test
+    fun clockCreateWithRepeatDaysLeavesAlarmTimeZero() {
+        val provider = FakeProvider()
+        val result =
+            PhoneOperations.execute(
+                context,
+                "set_alarm",
+                JSONObject()
+                    .put("hour", 7)
+                    .put("minute", 45)
+                    .put("repeat_days", org.json.JSONArray(listOf("mon", "wed", "fri"))),
+                userId = 0,
+                access = provider,
+            )
+        assertTrue(result.toString(), result.getBoolean("verified"))
+        val row = provider.clockRows.single()
+        // 周一=1 + 周三=4 + 周五=16 = 21
+        assertEquals(21, row.getAsInteger("daysofweek"))
+        assertEquals(0L, row.getAsLong("alarmtime"))
     }
 
     @Test
     fun clockInvalidTimeCannotReachMutation() {
         val provider = FakeProvider()
+        provider.addClockRow(7, 8, 30, 0, enabled = true)
         val result = PhoneOperations.execute(context, "set_alarm",
             JSONObject().put("hour", -1).put("minute", 0), userId = 0, access = provider)
         assertEquals("INVALID_ARGUMENT", result.getString("code"))
-        assertNull(provider.createdAlarm)
+        assertNull(provider.updatedUri)
+        assertNull(provider.insertedUri)
     }
 
     @Test
     fun clockIgnoresExtraFieldsWithoutChangingProviderTarget() {
         val provider = FakeProvider()
-        val result = PhoneOperations.execute(context, "set_alarm",
-            JSONObject().put("hour", 8).put("minute", 30).put("provider_uri", "content://anything"),
+        provider.addClockRow(7, 8, 30, 0, enabled = true)
+        val result = PhoneOperations.execute(context, "set_alarm_enabled",
+            JSONObject().put("alarm_id", "7").put("enabled", false).put("provider_uri", "content://anything"),
             userId = 0, access = provider)
+        assertTrue(result.toString(), result.getBoolean("verified"))
+        assertEquals("content://com.android.deskclock/alarm/7", provider.updatedUri.toString())
+        assertFalse(result.getJSONObject("alarm").getBoolean("enabled"))
+    }
+
+    @Test
+    fun clockDeleteRemovesRowAndVerifiesAbsence() {
+        val provider = FakeProvider()
+        provider.addClockRow(7, 8, 30, 0, enabled = true)
+        val result = PhoneOperations.execute(context, "delete_alarm",
+            JSONObject().put("alarm_id", "7"), userId = 0, access = provider)
+        assertTrue(result.toString(), result.getBoolean("verified"))
+        assertEquals(0, provider.clockRows.size)
+        assertEquals("content://com.android.deskclock/alarm/7", provider.deletedUri.toString())
+    }
+
+    @Test
+    fun clockMissingIdReportsNotFound() {
+        val provider = FakeProvider()
+        val result = PhoneOperations.execute(context, "delete_alarm",
+            JSONObject().put("alarm_id", "999"), userId = 0, access = provider)
+        assertEquals("ALARM_NOT_FOUND", result.getString("code"))
+    }
+
+    @Test
+    fun clockListReturnsRepeatDaysAndAlarmTime() {
+        val provider = FakeProvider()
+        provider.addClockRow(7, 8, 30, 21, enabled = true, label = "早课")
+        val result = PhoneOperations.execute(context, "list_alarms",
+            JSONObject().put("enabled_only", true), userId = 0, access = provider)
         assertTrue(result.toString(), result.getBoolean("ok"))
-        assertEquals(8, provider.alarmHour)
-        assertEquals(30, provider.alarmMinute)
-        assertEquals(1, provider.calls.count { it == "add_alarm" })
+        val item = result.getJSONArray("items").getJSONObject(0)
+        assertEquals(7L, item.getLong("alarm_id"))
+        assertEquals(21, item.getInt("repeat_mask"))
+        assertEquals(listOf("mon", "wed", "fri"), (0 until item.getJSONArray("repeat_days").length())
+            .map { item.getJSONArray("repeat_days").getString(it) })
+        assertEquals("早课", item.getString("label"))
     }
 
     private fun event() =
@@ -242,6 +311,8 @@ class NativeAppOperationsTest {
         var noteError = false
         var notesReady = true
         var deletedUri: Uri? = null
+        var updatedUri: Uri? = null
+        var insertedUri: Uri? = null
         val calls = mutableListOf<String>()
         var createdAlarm: Bundle? = null
         var alarmEnabled = true
@@ -279,6 +350,15 @@ class NativeAppOperationsTest {
                         reminders
                             .filter { args == null || it.getAsString("event_id") == args[0] }
                             .map { v -> v.keySet().associateWith { v.get(it) } }
+                    "alarm" ->
+                        clockRows
+                            .filter { row ->
+                                args == null || selection?.let { sel ->
+                                    val id = args.firstOrNull()?.toLongOrNull()
+                                    !sel.contains("_id") || row.getAsLong("_id") == id
+                                } ?: true
+                            }
+                            .map { v -> v.keySet().associateWith { v.get(it) } }
                     else -> emptyList()
                 }
             return MatrixCursor(columns).apply {
@@ -304,41 +384,75 @@ class NativeAppOperationsTest {
                         .appendQueryParameter("result", if (noteError) "error" else "success")
                         .appendQueryParameter("message", "private-server-message")
                         .build()
+                "alarm" -> {
+                    insertedUri = uri
+                    val id = (clockRows.maxOfOrNull { it.getAsLong("_id")!! } ?: 0L) + 1
+                    clockRows +=
+                        ContentValues(values).apply {
+                            put("_id", id)
+                            put("deleteAfterUse", 0)
+                        }
+                    uri.buildUpon().appendPath(id.toString()).build()
+                }
                 else -> null
             }
         }
 
+        override fun update(uri: Uri, values: ContentValues, selection: String?, args: Array<String>?): Int {
+            updatedUri = uri
+            if (uri.pathSegments.firstOrNull() != "alarm") return 0
+            // 真机 Provider 的 dir 分支会忽略 selection 改掉全部闹钟；这里复刻该行为，
+            // 让「误用 dir URI」在测试里直接表现为数据被改坏，而不是悄悄通过。
+            if (uri.pathSegments.size < 2) {
+                clockRows =
+                    clockRows.map { row -> ContentValues(row).apply { putAll(values) } }.toMutableList()
+                return clockRows.size
+            }
+            val id = uri.pathSegments[1].toLongOrNull() ?: args?.firstOrNull()?.toLongOrNull() ?: return 0
+            var affected = 0
+            clockRows =
+                clockRows.map { row ->
+                    if (row.getAsLong("_id") != id) row
+                    else {
+                        affected++
+                        ContentValues(row).apply { putAll(values) }
+                    }
+                }.toMutableList()
+            return affected
+        }
+
         override fun delete(uri: Uri, selection: String?, args: Array<String>?): Int {
             deletedUri = uri
-            return 0
+            if (uri.pathSegments.firstOrNull() != "alarm") return 0
+            val id = uri.pathSegments.getOrNull(1)?.toLongOrNull()
+                ?: args?.firstOrNull()?.toLongOrNull()
+                ?: return 0
+            val before = clockRows.size
+            clockRows = clockRows.filterNot { it.getAsLong("_id") == id }.toMutableList()
+            return before - clockRows.size
         }
 
         override fun call(uri: Uri, method: String, arg: String?, extras: Bundle): Bundle {
             calls += method
-            when (method) {
-                "add_alarm" -> {
-                    createdAlarm = Bundle(extras)
-                    alarmHour = extras.getInt("android.intent.extra.alarm.HOUR")
-                    alarmMinute = extras.getInt("android.intent.extra.alarm.MINUTES")
-                    repeatMask = extras.getByte("android.intent.extra.alarm.DAYS_OF_WEEK").toInt()
+            return Bundle()
+        }
+
+        /** 模拟小米时钟 alarms 表：query 返回当前行，update/delete 改内存并记调用。 */
+        var clockRows = mutableListOf<ContentValues>()
+
+        fun addClockRow(id: Long, hour: Int, minute: Int, mask: Int, enabled: Boolean, label: String = "") {
+            clockRows +=
+                ContentValues().apply {
+                    put("_id", id)
+                    put("hour", hour)
+                    put("minutes", minute)
+                    put("daysofweek", mask)
+                    put("alarmtime", 0L)
+                    put("enabled", if (enabled) 1 else 0)
+                    put("message", label)
+                    put("vibrate", 1)
+                    put("deleteAfterUse", 0)
                 }
-                "update_alarm" -> {
-                    alarmHour = extras.getInt("alarm_hour")
-                    alarmMinute = extras.getInt("alarm_minute")
-                    alarmEnabled = true
-                }
-                "close_alarm" -> alarmEnabled = false
-                "enable_alarm" -> alarmEnabled = true
-            }
-            return Bundle().apply {
-                putInt("result", 1)
-                putLongArray("alarm_id_list", longArrayOf(7))
-                putIntArray("alarm_hour_list", intArrayOf(alarmHour))
-                putIntArray("alarm_min_list", intArrayOf(alarmMinute))
-                putBooleanArray("alarm_state_list", booleanArrayOf(alarmEnabled))
-                putIntArray("alarm_repeat_set_list", intArrayOf(repeatMask))
-                putStringArray("alarm_label_list", arrayOf(""))
-            }
         }
 
         override fun applyBatch(
