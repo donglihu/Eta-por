@@ -351,16 +351,49 @@ internal object AutoBackupRunner {
             }
             return AutoBackupResult.Skipped("数据没有变化")
         }
+        // 体积闸门：自动（闹钟/启动）触发的全量导出必须先在预算内，否则不碰 Linux 容器。
+        // 历史事故：恢复旧设置后 includeLinux=true，16 GB 的 chroot 被打进 zip，
+        // 广播 10 秒预算内必超时，系统 ANR 杀进程，用户看到的是「启动一会就闪退」。
+        val requestedFull = io.github.mangi.eta.data.model.AutoBackupFormat.isFull(settings.autoBackupFormat) ||
+            settings.autoBackupIncludeLinux
+        val estimatedBytes = if (requestedFull) {
+            EtaFullBackupArchive.estimateExportBytes(context, includeLinuxEnvironment = settings.autoBackupIncludeLinux)
+        } else {
+            0L
+        }
+        val gate = AutoBackupSizeGate.decide(
+            requestedFull = requestedFull,
+            automatic = !force,
+            estimatedBytes = estimatedBytes,
+        )
+        val includeLinux = settings.autoBackupIncludeLinux && gate is AutoBackupSizeGate.Decision.Full
+        val full = gate is AutoBackupSizeGate.Decision.Full
+        val note = when (gate) {
+            is AutoBackupSizeGate.Decision.Full -> ""
+            is AutoBackupSizeGate.Decision.DegradeToJson ->
+                "自动备份已跳过 Linux 容器：待打包体积 " + formatBytes(gate.estimatedBytes) +
+                    " 超过自动上限 " + formatBytes(gate.limitBytes) +
+                    "；需要连容器一起备份请手动点「立即备份一次」。"
+        }
+        if (note.isNotEmpty()) AndroidAgentLogger.warn("Auto backup degraded: " + note)
         return runNow(
             context = context,
             keep = AutoBackupKeepCount.normalize(settings.autoBackupKeepCount),
             fingerprint = fingerprint,
             customDirectory = settings.autoBackupDirectory,
             treeUri = settings.autoBackupTreeUri,
-            format = settings.autoBackupFormat,
-            includeLinux = settings.autoBackupIncludeLinux,
+            full = full,
+            includeLinux = includeLinux,
+            note = note,
             now = now,
         )
+    }
+
+    private fun formatBytes(bytes: Long): String = when {
+        bytes >= 1024L * 1024L * 1024L -> String.format(Locale.US, "%.1f GB", bytes / 1024.0 / 1024.0 / 1024.0)
+        bytes >= 1024L * 1024L -> String.format(Locale.US, "%.1f MB", bytes / 1024.0 / 1024.0)
+        bytes >= 1024L -> String.format(Locale.US, "%.1f KB", bytes / 1024.0)
+        else -> bytes.toString() + " B"
     }
 
     /** 轻量指纹：只读三个计数，不碰数据库文件本身。取不到时返回空串（空串不做跳过判断）。 */
@@ -378,8 +411,9 @@ internal object AutoBackupRunner {
         fingerprint: String,
         customDirectory: String,
         treeUri: String,
-        format: String,
+        full: Boolean,
         includeLinux: Boolean,
+        note: String,
         now: Long,
     ): AutoBackupResult {
         val storage = storage(customDirectory, treeUri)
@@ -406,8 +440,6 @@ internal object AutoBackupRunner {
             }
             .forEach { storage.deleteName(it.name) }
 
-        // 勾了「含完整 Linux 环境」就必须产全量包：否则用户以为备份了容器，实际只有一份 JSON。
-        val full = io.github.mangi.eta.data.model.AutoBackupFormat.isFull(format) || includeLinux
         val stamp = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date(now))
         val targetName = if (full) {
             "$FULL_PREFIX$stamp$FULL_SUFFIX"
@@ -418,6 +450,20 @@ internal object AutoBackupRunner {
         // SAF 目录里 createDocument 遇到同名会自动加 " (1)" 后缀，先删掉同名残留保证名字稳定。
         storage.deleteName(tempName)
         storage.deleteName(targetName)
+        // 先记账再干活：导出可能被系统在广播预算内直接杀掉，进程连 catch/finally 都跑不到。
+        // 旧实现只在成功或 catch 里推进 lastAt，被 ANR 杀掉时 lastAt 原地不动，
+        // 下次启动又立刻到期，于是「启动 → 备份 → 被杀 → 再启动」无限循环。
+        // 这里在真正开始导出前就把尝试时间落盘，代价是失败时也要等一个周期才重试（手动不受影响），
+        // 换来的是任何死法都不会把用户锁进重启循环。
+        runCatching {
+            SettingsDataStore.setAutoBackupState(
+                lastAt = now,
+                fingerprint = fingerprint,
+                fileName = targetName,
+                error = note,
+                errorAt = if (note.isBlank()) 0L else now,
+            )
+        }
         val handle = storage.create(tempName)
             ?: return fail(now, "备份文件创建失败：" + storage.label)
         return try {
@@ -450,6 +496,8 @@ internal object AutoBackupRunner {
                     lastAt = System.currentTimeMillis(),
                     fingerprint = fingerprint,
                     fileName = targetName,
+                    error = note,
+                    errorAt = if (note.isBlank()) 0L else now,
                 )
             }
             AutoBackupResult.Done(targetName, conversationCount, kept)

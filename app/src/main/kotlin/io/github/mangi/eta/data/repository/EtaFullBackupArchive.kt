@@ -198,6 +198,34 @@ internal object EtaFullBackupArchive {
     }
 
     /**
+     * 估算一次导出会打包多少字节（只统计文件大小，不读内容）。
+     *
+     * 给 [AutoBackupSizeGate] 用：自动备份必须在动手之前就知道会不会超预算，
+     * 否则等写完 16 GB 才发现超时，进程早就被系统杀掉了。
+     * 只遍历元数据，本机 16 GB / 数万文件的 chroot 也在百毫秒级。
+     */
+    fun estimateExportBytes(
+        context: Context,
+        includeLinuxEnvironment: Boolean = false,
+    ): Long {
+        val dataDir = runCatching { context.applicationContext.dataDir }.getOrNull() ?: return 0L
+        var total = 0L
+        includeTop.forEach { top ->
+            val root = File(dataDir, top)
+            if (!root.isDirectory) return@forEach
+            val walk = runCatching {
+                root.walkTopDown()
+                    .onEnter { dir -> !excluded(dir.relativeTo(dataDir).invariantSeparatorsPath, includeLinuxEnvironment) }
+                    .filter { it.isFile }
+                    .forEach { file -> total += runCatching { file.length() }.getOrDefault(0L) }
+            }
+            // 目录不可读就当作估不出来：返回 0 让闸门放行，不因一次权限抖动误判成「体积超限」。
+            if (walk.isFailure) return 0L
+        }
+        return total
+    }
+
+    /**
      * 导出全量包。
      *
      * [output] 由调用方负责关闭；这里只往里写 zip 条目。
