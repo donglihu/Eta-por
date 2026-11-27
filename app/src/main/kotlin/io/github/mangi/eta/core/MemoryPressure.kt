@@ -69,6 +69,26 @@ internal object MemoryPressure {
     }
 
     /**
+     * 额外占用 [bytes] 的准入判断：给「还能不能再开一块屏」这类硬门槛用。
+     *
+     * 两层口径叠一起，缺一层就会漏：
+     * 1. 档位已经是 [Level.Critical] 直接拒 —— 这时任何新增分配都可能打在已贴顶的堆上
+     *    （2026-11-25 三次 OOM 都是贴顶后连 16 字节分配都失败，不是单个大对象）；
+     * 2. 预算不够 [bytes] 也拒。
+     *
+     * 系统水位读不到（-1）时只用堆水位判：不凭空放行，也不凭空拦。早前灵屏那边自己解析
+     * `/proc/meminfo`，读失败还 `?: true` 双重 fail-open，等于「看不见就当够」。
+     */
+    fun admit(bytes: Long): Boolean = admits(snapshot(), bytes)
+
+    /** 纯函数版准入，便于 JVM 断言。 */
+    fun admits(value: Snapshot, bytes: Long): Boolean {
+        if (classify(value) == Level.Critical) return false
+        val available = value.availableBytes
+        return available < 0L || available >= bytes
+    }
+
+    /**
      * 读 `/proc/meminfo` 的 MemAvailable。
      *
      * 失败返回 -1 而不是 0：0 会被判定成「系统几乎没内存」，从而把正常设备误降到 Critical。
