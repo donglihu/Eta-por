@@ -13,6 +13,9 @@ import org.json.JSONObject
 
 /** 组装每次 run 的系统约束、历史与当前用户输入。 */
 internal object AgentPromptBuilder {
+    /** 读技能正文的工具名；技能索引的注入判据就是「目录里有没有它」。 */
+    private const val SKILLS_READ_TOOL = "skills_read"
+
     fun buildInitialMessages(
         config: AgentModelClient.ModelConfig,
         prompt: String,
@@ -33,8 +36,12 @@ internal object AgentPromptBuilder {
         expert: Expert? = null,
         /** 工具按需加载：注入延迟工具组索引；与 [buildSystemMessages] 的开关同源。 */
         toolGroupLoading: Boolean = false,
+        /** 组索引正文；null 表示用静态分组表生成（不含 MCP 动态组）。 */
+        groupIndex: String? = null,
+        /** 本 run 真正下发到目录里的工具名；见 [buildSystemMessages] 的同名参数。 */
+        availableToolNames: Set<String>? = null,
     ): JSONArray {
-        val messages = buildSystemMessages(config, skillContext, memoryContext, rootAvailable, roleplayContext, executionContext, virtualScreenEnabled, virtualScreenFallbackEnabled, customization, planMode, jailbreak, expert, toolGroupLoading)
+        val messages = buildSystemMessages(config, skillContext, memoryContext, rootAvailable, roleplayContext, executionContext, virtualScreenEnabled, virtualScreenFallbackEnabled, customization, planMode, jailbreak, expert, toolGroupLoading, groupIndex, availableToolNames)
         val chatOnly = LocalToolProfileStore.current(config.providerId, config.model) == LocalToolProfile.CHAT
         history.forEach { item ->
             val json = runCatching { AgentConversationCodec.toJsonObject(item) }.getOrNull() ?: return@forEach
@@ -74,6 +81,18 @@ internal object AgentPromptBuilder {
          * 把「一次前缀重付」变成两次（tools + system 双改）。
          */
         toolGroupLoading: Boolean = false,
+        /**
+         * 组索引正文；null 时用静态分组表生成（不含本 run 的 MCP 动态组）。
+         * 由 `AgentModelClient` 传入 `AgentToolGroupView.indexMessage()`，让 MCP 组行也进索引。
+         */
+        groupIndex: String? = null,
+        /**
+         * 本 run 真正下发到目录里的工具名；null 表示调用方没有目录信息，退回按工具档推导。
+         *
+         * 技能索引必须跟着目录走：索引里列着技能、目录里却没有 `skills_read`，
+         * 模型要么照着索引去调一个不存在的工具，要么把技能正文编出来。
+         */
+        availableToolNames: Set<String>? = null,
     ): JSONArray {
         val messages = JSONArray()
         val custom = customization.takeIf { it.active }
@@ -271,15 +290,18 @@ internal object AgentPromptBuilder {
         }
         roleplayContext?.personaMessage()?.let(messages::put)
         buildMemorySystemMessage(memoryContext, writable = roleplayContext == null)?.let(messages::put)
-        // 技能索引只在真正带 skills_list / skills_read 的「正常」档注入：否则模型看得到目录却读不到正文，
+        // 技能索引只在目录里真有 skills_read 时注入：否则模型看得到索引却读不到正文，
         // 既白占上下文，又会诱使它编造技能内容。
+        // 判据按「本 run 真正下发的工具名」而不是按工具档：白名单/专家/逐工具开关都可能把
+        // skills_read 从目录里拿掉，只有目录才说真话；没有目录信息时（null）退回按工具档推导。
         val activeProfile = LocalToolProfileStore.current(config.providerId, config.model)
-        if (activeProfile == LocalToolProfile.FULL) {
+        val skillToolsAvailable = availableToolNames?.contains(SKILLS_READ_TOOL) ?: (activeProfile == LocalToolProfile.FULL)
+        if (skillToolsAvailable) {
             buildSkillSystemMessage(skillContext)?.let(messages::put)
         }
         // 按需加载的组索引：只在 FULL 档注入（CHAT 档不声明工具，索引只会诱导模型瞎调）。
         if (toolGroupLoading && activeProfile == LocalToolProfile.FULL) {
-            messages.put(systemMessage(AgentToolGroups.indexMessage()))
+            messages.put(systemMessage(groupIndex ?: AgentToolGroups.indexMessage()))
         }
         custom?.let { value -> customInstructionsMessage(value) }?.let(messages::put)
         // 计划约束放系统提示最前面：整段系统提示很长，末尾那条最容易被稀释；
