@@ -446,8 +446,15 @@ internal class AgentLocalTools(
                 }
             }
             if (virtualUi) {
-                if (!VirtualScreenSession.prepareForRun(virtualScreenOwner, browserRunId)) {
-                    return@runCatching textResult(errorResult("DISPLAY_BUSY", "灵屏正被其他任务使用"))
+                val prepared = VirtualScreenSession.prepareForRun(virtualScreenOwner, browserRunId)
+                if (prepared != VirtualScreenSession.PrepareOutcome.OK) {
+                    return@runCatching textResult(
+                        if (prepared == VirtualScreenSession.PrepareOutcome.NO_MEMORY) {
+                            errorResult("INSUFFICIENT_MEMORY", "可用内存不足，已开的灵屏占用较多；先关掉一块灵屏或后台应用再试")
+                        } else {
+                            errorResult("DISPLAY_BUSY", "灵屏正被其他任务使用")
+                        }
+                    )
                 }
                 val result = virtualUiExecutor?.invoke(toolCall.name, args) ?: virtualUiTools.execute(toolCall.name, args)
                 VirtualScreenSession.recordOperation(virtualScreenOwner, browserRunId, toolCall.name, JSONObject(result.content).optBoolean("ok"))
@@ -455,9 +462,17 @@ internal class AgentLocalTools(
             }
             when (toolCall.name) {
                 "virtual_screen" -> if (virtualRouting.usesPrimary) textResult(errorResult("MAIN_SCREEN_ROUTE_ACTIVE", "本次任务已获准改用主屏，请使用普通 UI 工具并重新观察"))
-                    else if (!VirtualScreenSession.prepareForRun(virtualScreenOwner, browserRunId)) textResult(errorResult("DISPLAY_BUSY", "灵屏正被其他任务使用"))
-                    else VirtualScreenSession.execute(context, virtualScreenOwner, args, closed::get, browserRunId).let { result ->
-                        if (args.optString("action") == "close") result else handleVirtualResult(toolCall.name, result)
+                    else VirtualScreenSession.prepareForRun(virtualScreenOwner, browserRunId).let { prepared ->
+                        when (prepared) {
+                            VirtualScreenSession.PrepareOutcome.OK ->
+                                VirtualScreenSession.execute(context, virtualScreenOwner, args, closed::get, browserRunId).let { result ->
+                                    if (args.optString("action") == "close") result else handleVirtualResult(toolCall.name, result)
+                                }
+                            VirtualScreenSession.PrepareOutcome.NO_MEMORY ->
+                                textResult(errorResult("INSUFFICIENT_MEMORY", "可用内存不足，已开的灵屏占用较多；先关掉一块灵屏或后台应用再试"))
+                            VirtualScreenSession.PrepareOutcome.RUN_BUSY ->
+                                textResult(errorResult("DISPLAY_BUSY", "灵屏正被其他任务使用"))
+                        }
                     }
                 in AgentTaskTools.names -> AgentModelClient.ToolResult(AgentTaskTools(context).execute(toolCall.name, args), sensitive = true)
                 "ask_user" -> textResult(askUser(args))
