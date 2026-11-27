@@ -15,13 +15,20 @@ package io.github.mangi.eta.agent.model
  *    计划（update_plan）、上下文（get_current_context）、记忆（memory_*）、技能正文（skills_read）、
  *    任务与子代理编排。提示词里直接点名这些工具（`AgentPromptBuilder` 的技能索引段就写着
  *    「先调用 skills_read 读取对应 SKILL.md」），把它们延迟会导致「提示词教模型用、请求里没有」的错位。
- * 3. **MCP 工具不参与分组**。它们是第三方 schema，体积不可控、生命周期随 server，
- *    延迟它们等于给所有 MCP 用户的既有用法断言一次行为变更；本期只对本地目录做 hold。
+ * 3. **MCP 工具不进静态分组表，但参与按需加载**。它们是第三方 schema，体积不可控、生命周期随
+ *    server，写进常量表会随 server 增删漂移；因此走**动态组**：每个已连接 server 一个
+ *    `mcp:<serverPart8>` 组（成员/摘要来自 run 开始时冻结的 [io.github.mangi.eta.agent.mcp.McpRunSnapshot]）。
+ *    动态组**不放全局可变状态**——por 允许并发 run（同会话没有忙碌锁、子代理与体验复盘并行），
+ *    全局注入会让不同 run 互相覆盖、还会把上一个 run 的 server 列表泄露给下一个 run。
+ *    每个 run 用 [AgentToolGroupView] 冻结一份视图，沿链路显式传递；静态表保持全局只读。
  */
 internal object AgentToolGroups {
 
     /** 常驻组 id：成员始终随请求下发，不经 `tools_use_group` 打开。 */
     const val BASIC = "basic"
+
+    /** MCP 动态组 id 前缀：`mcp:<serverId>`。与 `McpRunSnapshot.MCP_GROUP_PREFIX` 保持一致。 */
+    const val MCP_GROUP_PREFIX = "mcp:"
 
     /** 组索引行里出现的组顺序即这里声明的顺序，保证系统提示字节稳定。 */
     private val definitions: List<Group> = listOf(
@@ -143,7 +150,7 @@ internal object AgentToolGroups {
     /** 分组表覆盖的全部工具名（含常驻组）。 */
     val toolNames: Set<String> get() = byTool.keys
 
-    /** `basic` 之外的组：只有这些组需要模型显式打开。 */
+    /** `basic` 之外的组：只有这些组需要模型显式打开（静态表；MCP 动态组见 [AgentToolGroupView]）。 */
     val deferredGroups: List<Group> get() = definitions.filterNot(Group::resident)
 
     /** 工具所属组；未分组（含 executionOnly 与 MCP 工具）返回 null。 */
@@ -154,15 +161,19 @@ internal object AgentToolGroups {
     /** 组内成员；组不存在返回 null。 */
     fun members(id: String): Set<String>? = byId[id]?.toolNames
 
+    /** 是否 MCP 动态组 id（`mcp:` 前缀）。 */
+    fun isMcpGroupId(id: String): Boolean = id.startsWith(MCP_GROUP_PREFIX)
+
     /**
      * 系统提示里的组索引段。
      *
      * 内容**只依赖可选组集合**，不依赖「已打开哪些组」：否则每开一次组就要重写 system，
      * 把「一次前缀重付」变成两次（tools + system 双改）。
+     * @param groups 组列表；run 级视图传入「静态延迟组 + 本 run 的 MCP 动态组」。
      */
-    fun indexMessage(): String = buildString {
+    fun indexMessage(groups: List<Group> = deferredGroups): String = buildString {
         appendLine("延迟加载的工具组（schema 未随本轮请求下发，调用前先打开）：")
-        deferredGroups.forEach { group ->
+        groups.forEach { group ->
             appendLine("- ").append(group.id).append("：").append(group.summary)
         }
         append(
@@ -176,4 +187,60 @@ internal object AgentToolGroups {
     /** 供单测断言「分组表恰好覆盖目录里的工具」。 */
     internal fun ungrouped(names: Set<String>): Set<String> =
         names.filterNot { it in toolNames || it in executionOnly || it.startsWith("mcp_") }.toSet()
+}
+
+/**
+ * 一次 run 冻结的分组视图（[AgentToolGroups] 静态表 + 本 run 的 MCP 动态组）。
+ *
+ * 动态组刻意不放全局可变状态：por 允许并发 run（同会话无忙碌锁，子代理与体验复盘并行），
+ * 全局注入会让不同 run 互相覆盖，还会把上一个 run 的 server 列表泄露给下一个 run。
+ * 视图在 run 开始时由快照派生一次，随 [AgentToolGroupSession] 全程持有，构造后只读。
+ */
+internal class AgentToolGroupView private constructor(
+    private val mcpGroups: Map<String, AgentToolGroups.Group>,
+    private val truncationNotice: String?,
+) {
+    /** 本次 run 的全部可选组：静态延迟组在前，MCP 动态组按注入顺序殿后。 */
+    val deferredGroups: List<AgentToolGroups.Group> = AgentToolGroups.deferredGroups + mcpGroups.values
+
+    /** 工具所属组：先查静态表，再查本 run 的 MCP 动态组成员。 */
+    fun groupOf(toolName: String): String? =
+        AgentToolGroups.groupOf(toolName)
+            ?: mcpGroups.entries.firstOrNull { toolName in it.value.toolNames }?.key
+
+    fun group(id: String): AgentToolGroups.Group? = AgentToolGroups.group(id) ?: mcpGroups[id]
+
+    fun members(id: String): Set<String>? = group(id)?.toolNames
+
+    /** 组索引段：静态表口径 + 本 run 的 MCP 行；有截断时追加一行显式说明。 */
+    fun indexMessage(): String = buildString {
+        append(AgentToolGroups.indexMessage(deferredGroups))
+        truncationNotice?.let { append("\n").append(it) }
+    }
+
+    companion object {
+        /** 纯静态视图（无 MCP 动态组）：OFF 档、既有测试与「目录里没有 mcp_ 工具」的 run。 */
+        fun static(): AgentToolGroupView = AgentToolGroupView(emptyMap(), null)
+
+        /**
+         * 从 run 冻结的 MCP 快照构造视图。
+         * @param serverGroups `mcp:<serverPart8>` → 模型侧工具名集合（与 modelToolName 同源派生）。
+         * @param summaries 组 id → 一行摘要（server 展示名 + 前 6 个工具）。
+         * @param truncationNotice 超出单 run 上限的显式说明；null 表示无截断。
+         */
+        fun of(
+            serverGroups: Map<String, Set<String>>,
+            summaries: Map<String, String>,
+            truncationNotice: String? = null,
+        ): AgentToolGroupView = AgentToolGroupView(
+            mcpGroups = serverGroups.map { (id, names) ->
+                id to AgentToolGroups.Group(
+                    id = id,
+                    summary = summaries[id] ?: "MCP 服务器动态组（${names.size} 个工具）",
+                    toolNames = names,
+                )
+            }.toMap(),
+            truncationNotice = truncationNotice,
+        )
+    }
 }
