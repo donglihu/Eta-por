@@ -66,7 +66,7 @@ val skillToolsAvailable = availableToolNames?.contains(SKILLS_READ_TOOL)
 ```
 
 - 传了目录名 → 只按目录判（目录里没有 `skills_read` 就不注入）；
-- `null` → 退回旧判据，既有调用方与 17 个测试行为不变。
+- `null` → 退回旧判据，既有调用方与既有测试行为不变。
 
 `AgentModelClient` 相应把「先算目录、再建 messages」的顺序调正：`compactedAdditionalTools` 与局部 `toolsFor()` 前移到 `buildInitialMessages` 之前，得到 `initialTools` / `initialToolNames`；`toolsForRound()` 的重建分支用**当轮** `toolNames(nextTools)` 重算，避免 Root 授权变化时索引与目录重新拆开。
 
@@ -77,19 +77,22 @@ val skillToolsAvailable = availableToolNames?.contains(SKILLS_READ_TOOL)
 | 项 | 结果 |
 | --- | --- |
 | `:app:compileDebugKotlin` | BUILD SUCCESSFUL |
-| 定向用例：`--tests *AgentToolGroups* *AgentToolDirectory* *AgentToolCatalog* *AgentToolPolicy* *AgentToolRequirements* *ToolCountProbe* *ToolCapabilityProjection* *AgentToolGuard* *AgentToolReviewPolicy* *AgentToolCallValidator* *Mcp* *AgentPromptBuilderTest*` | 114 tests，112 通过，2 失败（见 §4） |
+| 定向用例：`--tests *AgentToolGroups* *AgentToolDirectory* *AgentToolCatalog* *AgentToolPolicy* *AgentToolRequirements* *ToolCountProbe* *ToolCapabilityProjection* *AgentToolGuard* *AgentToolReviewPolicy* *AgentToolCallValidator* *Mcp* *AgentPromptBuilderTest*` | **114 tests，112 通过，2 失败**（见 §4，均为既有漂移） |
 | 新增 `McpRunSnapshotProjectionTest`（7 例） | 全通过：组 id 与 `modelToolName` 同源、无参=全量、按已开组过滤、投影不影响 `resolve()`、摘要带个数、截断按 server 上报、空快照不发任何工具 |
-| 全量 `:app:testDebugUnitTest` | 2448 tests，182 失败，全部为环境类（`SystemClock.elapsedRealtime not mocked`、`sh: CreateProcess error=2`、Windows 符号链接权限、Room 迁移用例在 Windows 上的路径差异、Robolectric nativeruntime、堆内存 Critical） |
+| 新增 `AgentPromptBuilderTest.skillIndexFollowsTheDeclaredToolNamesInsteadOfTheToolProfile` | 通过：目录有 `skills_read` → 索引在；没有 → 索引消失；`null` → 退回旧判据；开组加载但目录无 `skills_read` → 组索引在、技能索引不在 |
+| 全量 `:app:testDebugUnitTest` | **2460 tests，180 failed，8 skipped**；失败集合与 P0-1 阶段同树跑出的 180 例一致，全部为环境类：`SystemClock.elapsedRealtime not mocked`、`sh: CreateProcess error=2`、Windows 符号链接权限、Windows 路径冒号、Robolectric nativeruntime、堆内存 Critical |
 
 ## 4. 已知遗留（**非本批改动引入**）
 
 `AgentPromptBuilderTest` 有两例失败：`messagesKeepSystemHistoryAndCurrentImageInputInStableOrder`、`browserAndSkillMessagesAreConditionalAndStructurallyComplete`，断言 `expected:<[system ×4, user]> but was:<[system ×5, user]>`。
 
-根因是 `526c7e4`（合入专家中心）在系统提示里新增了一段「用户可以让你直接创建或修改可召唤的专家」，而这两个用例的期望条数没跟着更新。诊断输出（临时用例 dump）显示 5 条 system 依次是：主系统段、网页段、**专家段**、subagent 段、技能索引段。与本批改动无关：两例在本批改动之前就同样失败，且都不传 `availableToolNames`（走 `null` 回退，行为与改动前逐字节一致）。
+根因是 `526c7e4`（合入专家中心）在系统提示里新增了一段「用户可以让你直接创建或修改可召唤的专家」，而这两个用例的期望条数没跟着更新。诊断输出（临时用例 dump）显示 5 条 system 依次是：主系统段、网页段、**专家段**、subagent 段、技能索引段。
 
-未改这两个用例的原因：修它需要同步调整 `getJSONObject(2..6)` 的下标，属于专家中心那条线的测试对齐，混进本 PR 会让责任边界变糊。
+与本批改动无关：这两例在本批改动之前就同样失败；且它们都不传 `availableToolNames`（走 `null` 回退，行为与改动前逐字节一致）。
+
+未改这两例的原因：修它要连带把 `getJSONObject(2..6)` 的下标整体后移，属于专家中心那条线的测试对齐，混进本批会让责任边界变糊。
 
 ## 5. 回滚
 
-- 业务回滚：`Prefs.Keys.TOOL_GROUP_LOADING_OFF` 一档关掉组加载，目录回到全量、MCP 回到全量、`tool_call`/`tools_use_group` 不下发。
-- 代码回滚：只需回退 `AgentToolDirectory.holdDeferredGroups` 的调用点与 `AgentModelClient.compactedAdditionalTools` 的剔除分支，其余（`McpRunSnapshot` 的投影签名）在 OFF 档是空操作。
+- 业务回滚：`Prefs.Keys.TOOL_GROUP_LOADING_OFF` 一档关掉组加载，目录回到全量、MCP 回到全量、`tool_call` / `tools_use_group` 不下发。
+- 代码回滚：只需回退 `AgentToolDirectory.holdDeferredGroups` 的调用点与 `AgentModelClient.compactedAdditionalTools` 的剔除分支；`McpRunSnapshot` 的投影签名在 OFF 档是空操作，可以留着。
