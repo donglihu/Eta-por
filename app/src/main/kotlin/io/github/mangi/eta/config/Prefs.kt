@@ -56,6 +56,19 @@ internal object Prefs {
          * getBoolean 读同名字符串键直接抛 ClassCastException。
          */
         const val AGENT_DISABLED_TOOLS = "agent_disabled_tools"
+        /**
+         * 工具按需加载档位（`off` / `group`），默认 `group`。
+         *
+         * 与 [AGENT_DISABLED_TOOLS] 一样是字符串键，不放进 [BOOLEAN_DEFAULTS]。
+         * 写 `off` 是全量声明的回滚开关：目录回到改动前的样子，字节级不变。
+         */
+        const val AGENT_TOOL_GROUP_LOADING = "agent_tool_group_loading"
+
+        /** [AGENT_TOOL_GROUP_LOADING] 的取值：全量声明（回滚开关）。 */
+        const val TOOL_GROUP_LOADING_OFF = "off"
+
+        /** [AGENT_TOOL_GROUP_LOADING] 的取值：按组加载（默认）。 */
+        const val TOOL_GROUP_LOADING_GROUP = "group"
         const val AGENT_THINKING_ENABLED = "agent_thinking_enabled"
         const val AGENT_DEFAULT_REASONING_EFFORT = "agent_default_reasoning_effort"
         const val AGENT_AUTO_COMPACTION_ENABLED = "agent_auto_compaction_enabled"
@@ -166,6 +179,22 @@ internal object Prefs {
     fun getString(key: String): String {
         return remote?.getString(key, "") ?: ""
     }
+
+    /**
+     * 工具按需加载档位：`off`、`group`，或空串表示「未设置」。
+     *
+     * 未设置**不等于** `group`：档位裁决交给
+     * [io.github.mangi.eta.agent.model.AgentToolGroupLoadingPolicy]，由它按 `providerType`
+     * 灰度（`custom` 这类自建中转先不放开）。若这里把未设置归一成 `group`，
+     * 灰度白名单就永远走不到，等于对所有 provider 一起改行为。
+     *
+     * 读本地 Agent 配置（不依赖 Xposed 远程配置），因为这是 Runtime 侧的行为开关；
+     * 读失败按「未设置」处理，不让一次读盘失败改变裁决结果。
+     */
+    fun toolGroupLoadingMode(preferences: SharedPreferences? = localAgent ?: remote): String =
+        runCatching {
+            preferences?.getString(Keys.AGENT_TOOL_GROUP_LOADING, null)
+        }.getOrNull()?.trim()?.lowercase().orEmpty()
 
     /**
      * 自动压缩阈值（上下文窗口占用百分比，0 = 关闭）。

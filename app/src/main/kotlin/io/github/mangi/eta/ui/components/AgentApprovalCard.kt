@@ -68,7 +68,23 @@ internal data class AgentApprovalUi(
     val body: String = "",
     val options: List<AgentApprovalOptionUi> = emptyList(),
     val allowMultiple: Boolean = false,
-)
+    /**
+     * 来源：审批卡（guard）还是模型提问（ask）。
+     *
+     * 只影响文案，不影响裁决语义（语义在 ApprovalVerdictPolicy 里定）。
+     * 「跳过」在两种卡上含义完全不同：审批卡上等于拒绝执行，提问卡上只是「这题不答」。
+     * 用同一个词会让用户以为「跳过这一步 = 不做这一步」，按钮上必须说清是哪一种。
+     */
+    val source: String = SOURCE_GUARD,
+) {
+    /** 这张卡是系统拦下的危险动作，而不是模型在提问。 */
+    val isGuard: Boolean get() = source != SOURCE_ASK
+
+    companion object {
+        const val SOURCE_GUARD = "guard"
+        const val SOURCE_ASK = "ask"
+    }
+}
 
 @Composable
 internal fun AgentApprovalCard(
@@ -80,7 +96,12 @@ internal fun AgentApprovalCard(
     onChooseFreeform: (String, List<String>) -> Unit = { _, _ -> },
     /** 正在卡内输入：告诉宿主收起底部聊天输入框，避免两个输入框同时在场。 */
     onEditingChanged: (Boolean) -> Unit = {},
-    /** 跳过：不回答，让模型自己往下走。 */
+    /**
+     * 跳过：用户不在这张卡上做选择。
+     *
+     * guard 卡上等同「拒绝执行」——工具侧以 USER_REJECTED 收尾、不会执行；
+     * ask 卡上是「这题我不答，你自己往下走」。两种语义由 ApprovalVerdictPolicy 决定。
+     */
     onSkip: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
@@ -145,10 +166,14 @@ internal fun AgentApprovalCard(
             // 输入态：选项全部收起，屏上只留这一个可写的地方。
             val pickedLabels = approval.options.filter { it.id in picked }.map { it.label }
             Text(
-                text = if (pickedLabels.isEmpty()) {
-                    "在这里写你的答案，发送后这张卡就收起来。"
-                } else {
-                    "已选：${pickedLabels.joinToString("、")}。下面是补充，发送时一起交上去。"
+                text = when {
+                    pickedLabels.isNotEmpty() ->
+                        "已选：${pickedLabels.joinToString("、")}。下面是补充，发送时一起交上去。"
+                    // guard 卡：用户写的是修改意见，原操作仍然不会执行——说清这一点，
+                    // 否则用户会以为「写句话就能让它继续」（2026-11-26 审核 P0-2 的语义部分）。
+                    approval.isGuard ->
+                        "写下你的修改意见。原操作不会执行，它会按你的意见重新规划。"
+                    else -> "在这里写你的答案，发送后这张卡就收起来。"
                 },
                 style = MiuixTheme.textStyles.footnote1,
                 color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
@@ -375,7 +400,9 @@ internal fun AgentApprovalCard(
             verticalAlignment = Alignment.CenterVertically,
         ) {
             TextButton(
-                text = "跳过",
+                // guard 卡上「跳过」等于拒绝执行，按钮必须直说；
+                // 提问卡上它确实只是「这题不答」，保留原词。
+                text = if (approval.isGuard) "拒绝执行" else "跳过",
                 onClick = onSkip,
                 minWidth = 0.dp,
                 minHeight = 30.dp,

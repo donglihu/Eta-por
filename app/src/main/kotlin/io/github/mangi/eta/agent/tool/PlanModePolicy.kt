@@ -57,6 +57,10 @@ internal object PlanModePolicy {
         "tasks_list",
         "tasks_triggers",
         "tasks_history",
+        // 打开工具组只改一次 run 内的可见性，不碰设备也不碰文件；被计划模式拦下会让
+        // 计划阶段的只读探索因为「组没打开」直接失败。`tool_call` 不在这里：
+        // 它的只读性取决于内层工具，交给解包后的真名去判。
+        io.github.mangi.eta.agent.model.AgentToolGroupCatalog.USE_GROUP,
     )
 
     fun isReadOnlyTool(name: String): Boolean =

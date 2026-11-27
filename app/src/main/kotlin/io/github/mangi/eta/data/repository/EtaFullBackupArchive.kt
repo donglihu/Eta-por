@@ -6,6 +6,7 @@ import android.system.Os
 import android.system.OsConstants
 import io.github.mangi.eta.core.AndroidAgentLogger
 import io.github.mangi.eta.core.safeLogType
+import io.github.mangi.eta.data.db.EtaDatabase
 import java.io.File
 import java.io.InputStream
 import java.io.OutputStream
@@ -197,6 +198,132 @@ internal object EtaFullBackupArchive {
         return excludedRelative.any { name == it || name.startsWith("$it/") }
     }
 
+    /** SQLite 伴生日志文件的后缀：主库原文件离开它们就是不一致的。 */
+    private val SQLITE_SIDECAR_SUFFIXES = listOf("-wal", "-shm", "-journal")
+
+    /** 是否是 SQLite 伴生文件（`-wal` / `-shm` / `-journal`）。 */
+    internal fun isSqliteSidecar(relativePath: String): Boolean =
+        SQLITE_SIDECAR_SUFFIXES.any { relativePath.endsWith(it, ignoreCase = true) }
+
+    /**
+     * 导出时是否收录这个相对路径（纯逻辑，可直接在 JVM 上断言）。
+     *
+     * 伴生文件一律不收：`-wal` 里是还没 checkpoint 进主库的最近提交，把它和主库一起
+     * 打进包，还原时等于拿旧日志去盖当前库的日志。主库内容的完整性由导出前的
+     * `PRAGMA wal_checkpoint(TRUNCATE)` 保证，不靠把日志一起搬。
+     */
+    internal fun shouldExport(relative: String, includeLinuxEnvironment: Boolean = false): Boolean =
+        relative.isNotBlank() &&
+            !relative.contains("..") &&
+            !isSqliteSidecar(relative) &&
+            !excluded(relative, includeLinuxEnvironment)
+
+    /** 还原时对单个归档条目的处置。 */
+    internal enum class RestoreDecision {
+        /** 铺到暂存区。 */
+        KEEP,
+
+        /** 归档里的 stale 伴生文件：丢弃，绝不落盘。 */
+        DROP_SIDECAR,
+
+        /** 越界路径、被排除目录等：丢弃。 */
+        DROP_OTHER,
+    }
+
+    /** 单个归档条目的处置（纯逻辑）。 */
+    internal fun restoreDecision(relative: String, includeLinuxEnvironment: Boolean = false): RestoreDecision = when {
+        relative.isBlank() || relative.contains("..") -> RestoreDecision.DROP_OTHER
+        isSqliteSidecar(relative) -> RestoreDecision.DROP_SIDECAR
+        excluded(relative, includeLinuxEnvironment) -> RestoreDecision.DROP_OTHER
+        else -> RestoreDecision.KEEP
+    }
+
+    /** 归档条目清单的过滤结果，纯逻辑。 */
+    internal data class RestoreEntryFilter(
+        val keep: List<String>,
+        val droppedSidecars: List<String>,
+        val droppedOther: List<String>,
+    )
+
+    /** 把归档里的条目清单分成「铺回去」「丢弃的 stale 日志」「其余丢弃」三堆。 */
+    internal fun filterRestoreEntries(
+        entries: List<String>,
+        includeLinuxEnvironment: Boolean = false,
+    ): RestoreEntryFilter {
+        val keep = ArrayList<String>(entries.size)
+        val sidecars = ArrayList<String>()
+        val other = ArrayList<String>()
+        entries.forEach { name ->
+            when (restoreDecision(name, includeLinuxEnvironment)) {
+                RestoreDecision.KEEP -> keep += name
+                RestoreDecision.DROP_SIDECAR -> sidecars += name
+                RestoreDecision.DROP_OTHER -> other += name
+            }
+        }
+        return RestoreEntryFilter(keep, sidecars, other)
+    }
+
+    /**
+     * 删掉某个数据库主文件旁边的 `-wal` / `-shm` / `-journal`，返回删掉的文件名。
+     *
+     * 还原前必须先删：新铺回来的主库原文件配上当前库里残留的旧 WAL，SQLite 会按旧日志
+     * 回放，轻则回滚到导出前的状态，重则直接判定库损坏。
+     */
+    internal fun deleteSqliteSidecars(databaseFile: File): List<String> {
+        val removed = ArrayList<String>(SQLITE_SIDECAR_SUFFIXES.size)
+        SQLITE_SIDECAR_SUFFIXES.forEach { suffix ->
+            val sidecar = File(databaseFile.path + suffix)
+            if (sidecar.exists() && sidecar.delete()) removed += sidecar.name
+        }
+        return removed
+    }
+
+    /** checkpoint 的判定结果；[ok] 为 false 时导出必须放弃。 */
+    internal data class WalCheckpointVerdict(val ok: Boolean, val detail: String)
+
+    /**
+     * `PRAGMA wal_checkpoint(TRUNCATE)` 三个返回值的判定（纯逻辑）。
+     *
+     * 返回值是 `busy|log|checkpointed`：
+     * - `log < 0`：库不在 WAL 模式（实测返回 `0|-1|-1`），没有日志要合，视为通过；
+     * - `checkpointed >= log`：全部日志帧都已合进主库，数据完整，可以出包；
+     * - `checkpointed < log`：还有帧留在 `-wal` 里，只拷主库会丢数据，必须拒绝。
+     *
+     * `busy` 的语义只是「TRUNCATE 阶段无法把 `-wal` 收缩到 0 字节」，反映文件大小，
+     * 不反映数据是否已合进主库。实测 sqlite3 3.53.1：读事务挡着时返回 `1|202|202`，
+     * 用 `immutable=1` 直读主库拿到 200 行全在。所以 `busy` 不能单独构成拒绝理由，
+     * 只有 `checkpointed < log` 才代表包内数据不完整（2026-11-27 审核必修 2）。
+     */
+    internal fun walCheckpointVerdict(busy: Int, logFrames: Int, checkpointedFrames: Int): WalCheckpointVerdict =
+        when {
+            logFrames < 0 -> WalCheckpointVerdict(true, "not_wal")
+            // 数据是否已合进主库只看 checkpointed；busy 只反映文件收缩受阻，不影响包内数据完整性。
+            checkpointedFrames >= logFrames -> WalCheckpointVerdict(
+                true,
+                if (busy != 0) "frames=$logFrames busy=$busy(未收缩)" else "frames=$logFrames",
+            )
+            else -> WalCheckpointVerdict(false, "checkpointed=$checkpointedFrames/$logFrames busy=$busy")
+        }
+
+    /**
+     * 对正在使用的库执行 `PRAGMA wal_checkpoint(TRUNCATE)`。
+     *
+     * 导出前必须把 WAL 合进主库：包里拷的是 `private/databases/eta.db` 这个主库原文件，
+     * 未 checkpoint 的最近提交只存在 `-wal` 里，只拷主库会备份出一份旧数据
+     * （2026-11-26 审核 P1-3；已用 sqlite3 实测复现：主库 0 行、库内实际 2 行）。
+     */
+    private fun checkpointWal(context: Context): WalCheckpointVerdict {
+        val cursor = EtaDatabase.get(context).openHelper.writableDatabase
+            .query("PRAGMA wal_checkpoint(TRUNCATE)")
+        return cursor.use {
+            if (!it.moveToFirst() || it.columnCount < 3) {
+                WalCheckpointVerdict(false, "no_row")
+            } else {
+                walCheckpointVerdict(it.getInt(0), it.getInt(1), it.getInt(2))
+            }
+        }
+    }
+
     /**
      * 估算一次导出会打包多少字节（只统计文件大小，不读内容）。
      *
@@ -217,6 +344,8 @@ internal object EtaFullBackupArchive {
                 root.walkTopDown()
                     .onEnter { dir -> !excluded(dir.relativeTo(dataDir).invariantSeparatorsPath, includeLinuxEnvironment) }
                     .filter { it.isFile }
+                    // 与 export 用同一判据：伴生日志不进包，也不该计入预估体积。
+                    .filter { shouldExport(it.relativeTo(dataDir).invariantSeparatorsPath, includeLinuxEnvironment) }
                     .forEach { file -> total += runCatching { file.length() }.getOrDefault(0L) }
             }
             // 目录不可读就当作估不出来：返回 0 让闸门放行，不因一次权限抖动误判成「体积超限」。
@@ -241,7 +370,24 @@ internal object EtaFullBackupArchive {
         var fileCount = 0
         var byteCount = 0L
         var conversations = 0
-        val zip = ZipOutputStream(output.buffered(), Charsets.UTF_8)
+        // 先把 WAL 合进主库，再动 zip。checkpoint 失败就不产出包：包里拷的是主库原文件，
+        // 拿一份没合日志的主库当备份，等于给用户一份「看起来成功、实际少了最近提交」的包。
+        onPhase("full_checkpoint")
+        val checkpoint = runCatching { checkpointWal(appContext) }.getOrElse { error ->
+            if (error is CancellationException) throw error
+            AndroidAgentLogger.warn("Full backup checkpoint threw: type=" + error.safeLogType())
+            WalCheckpointVerdict(false, "threw:" + error.safeLogType())
+        }
+        if (!checkpoint.ok) {
+            AndroidAgentLogger.warn("Full backup aborted: wal checkpoint failed " + checkpoint.detail)
+            throw IllegalStateException(
+                "数据库 WAL 合并失败（" + checkpoint.detail + "），已放弃生成全量备份，避免产出不一致的包",
+            )
+        }
+        // 不要再把 output 包一层 BufferedOutputStream：这一层的关闭权不在本函数手里
+        // （output 由调用方 use{} 关闭，这里只 finish）。缓冲层没人 flush 时，最后 8KB
+        // ——恰好是中央目录尾部与 EOCD——会留在内存里被丢弃，产物变成「没有 PK\x05\x06」的残包。
+        val zip = ZipOutputStream(output, Charsets.UTF_8)
         try {
             onPhase("full_json")
             zip.putNextEntry(ZipEntry(JSON_ENTRY).apply { time = System.currentTimeMillis() })
@@ -259,7 +405,8 @@ internal object EtaFullBackupArchive {
                 for (file in files) {
                     currentCoroutineContext().ensureActive()
                     val relative = file.relativeTo(dataDir).invariantSeparatorsPath
-                    if (excluded(relative, includeLinuxEnvironment)) continue
+                    // 跳过 -wal/-shm/-journal：主库内容已 checkpoint，日志进包只会污染还原。
+                    if (!shouldExport(relative, includeLinuxEnvironment)) continue
                     try {
                         zip.putNextEntry(ZipEntry("$PRIVATE_DIR/$relative").apply { time = file.lastModified() })
                         file.inputStream().use { input ->
@@ -298,7 +445,9 @@ internal object EtaFullBackupArchive {
             runCatching { zip.closeEntry() }
             throw error
         } finally {
+            // finish 只负责写 zip 结构与 EOCD，不保证把数据推到底层流；显式 flush 才算落盘完成。
             runCatching { zip.finish() }
+            runCatching { zip.flush() }
         }
         EtaFullBackupSummary(
             conversationCount = conversations,
@@ -327,6 +476,7 @@ internal object EtaFullBackupArchive {
         privateRoot.mkdirs()
         var fileCount = 0
         var byteCount = 0L
+        val droppedSidecars = ArrayList<String>()
         val buffer = ByteArray(DEFAULT_BUFFER_SIZE * 4)
         ZipInputStream(input.buffered()).use { zip ->
             while (true) {
@@ -342,11 +492,10 @@ internal object EtaFullBackupArchive {
                     continue
                 }
                 val relative = name.removePrefix("$PRIVATE_DIR/")
-                if (relative.isBlank() || relative.contains("..")) {
-                    zip.closeEntry()
-                    continue
-                }
-                if (excluded(relative, includeLinuxEnvironment)) {
+                // 旧归档里可能带着导出时的 -wal/-shm/-journal。它们是导出那一刻的日志，
+                // 配上还原后的主库只会把库回滚或直接判损坏，一律丢弃。
+                if (restoreDecision(relative, includeLinuxEnvironment) != RestoreDecision.KEEP) {
+                    if (isSqliteSidecar(relative)) droppedSidecars += relative
                     zip.closeEntry()
                     continue
                 }
@@ -365,6 +514,12 @@ internal object EtaFullBackupArchive {
                 fileCount++
             }
         }
+        if (droppedSidecars.isNotEmpty()) {
+            AndroidAgentLogger.info(
+                "Full backup restore dropped stale sqlite sidecars: count=" + droppedSidecars.size +
+                    " names=" + droppedSidecars.joinToString(","),
+            )
+        }
         EtaFullBackupSummary(privateFiles = fileCount, privateBytes = byteCount, totalBytes = byteCount)
     }
 
@@ -376,6 +531,10 @@ internal object EtaFullBackupArchive {
      *
      * 必须在 Room / DataStore 打开前执行；databases 里的 `-wal` / `-shm` 先删掉，
      * 避免旧库原文件配上新日志导致 SQLite 校验失败。
+     *
+     * 失败语义（2026-11-26 审核）：单文件失败时记下错误，整体返回 false，
+     * **不删暂存区**——保留现场，让用户能重试或手工捞出数据；早先失败只 warn 一句，
+     * 暂存区照样被删，等于把唯一一份新数据也丢了。
      */
     fun applyPendingRestore(context: Context): Boolean {
         val appContext = context.applicationContext
@@ -384,26 +543,44 @@ internal object EtaFullBackupArchive {
         if (!privateRoot.isDirectory) return false
         val dataDir = appContext.dataDir
         var restored = 0
-        return runCatching {
+        var droppedSidecars = 0
+        var failure: Throwable? = null
+        try {
             privateRoot.walkTopDown().filter { it.isFile }.forEach { source ->
                 val relative = source.relativeTo(privateRoot).invariantSeparatorsPath
                 if (relative.isBlank() || relative.contains("..")) return@forEach
+                // 暂存区里残留的伴生文件（旧版本 stage 会铺进来）直接丢掉，不参与覆盖。
+                if (isSqliteSidecar(relative)) {
+                    droppedSidecars++
+                    return@forEach
+                }
                 val target = File(dataDir, relative)
                 target.parentFile?.mkdirs()
                 if (relative.startsWith("databases/")) {
-                    File(target.path + "-wal").delete()
-                    File(target.path + "-shm").delete()
-                    File(target.path + "-journal").delete()
+                    // 铺主库原文件之前先清掉目标位置残留的旧日志，否则 SQLite 会拿旧 WAL
+                    // 回放新库，出现回滚甚至判定损坏。
+                    deleteSqliteSidecars(target)
                 }
                 source.copyTo(target, overwrite = true)
                 restored++
             }
-            deleteRecursively(staging)
-            AndroidAgentLogger.info("Full backup restore applied: files=$restored")
-            true
-        }.onFailure {
-            AndroidAgentLogger.warn("Full backup restore failed: type=${it.safeLogType()}")
-        }.getOrDefault(false)
+        } catch (error: Throwable) {
+            // 单个文件失败（空间不足、权限、文件被占用）都会走到这里。
+            // 不吞：留着暂存区，并把原因交给上层记录。
+            failure = error
+        }
+        if (failure != null) {
+            io.github.mangi.eta.core.AndroidAgentLogger.warn(
+                "Full backup restore incomplete: files=$restored type=${failure.safeLogType()}" +
+                    "，暂存区已保留以便重试",
+            )
+            return false
+        }
+        deleteRecursively(staging)
+        io.github.mangi.eta.core.AndroidAgentLogger.info(
+            "Full backup restore applied: files=$restored droppedSidecars=$droppedSidecars",
+        )
+        return true
     }
 
     /** 从全量包里只取出 `eta-backup.json`，交给现有导入链路。 */
@@ -414,7 +591,9 @@ internal object EtaFullBackupArchive {
         ZipInputStream(input.buffered()).use { zip ->
             while (true) {
                 val entry = zip.nextEntry ?: break
-                if (!entry.isDirectory && entry.name.substringAfterLast('/') == JSON_ENTRY) {
+                // 必须精确匹配顶层条目名：只看 basename 会把 private/files/ 里用户自己
+                // 命名为 eta-backup.json 的文件当成备份正文取出来（2026-11-26 审核）。
+                if (!entry.isDirectory && entry.name == JSON_ENTRY) {
                     target.outputStream().use { out -> zip.copyTo(out) }
                     found = true
                     zip.closeEntry()

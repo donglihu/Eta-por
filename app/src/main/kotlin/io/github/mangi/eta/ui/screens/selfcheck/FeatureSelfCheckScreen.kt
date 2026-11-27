@@ -17,6 +17,7 @@ import io.github.mangi.eta.core.CrashRecorder
 import io.github.mangi.eta.core.SharedStorage
 import io.github.mangi.eta.data.datastore.SettingsDataStore
 import io.github.mangi.eta.data.db.ChunkedTextDao
+import io.github.mangi.eta.data.db.ChunkedTextFailureReason
 import io.github.mangi.eta.data.db.EtaDatabase
 import io.github.mangi.eta.data.db.TextStoreMaintenance
 import io.github.mangi.eta.ui.components.EtaArrowPreference
@@ -187,15 +188,27 @@ internal fun FeatureSelfCheckScreen(onBack: () -> Unit) {
                         if (!busy) {
                             busy = true
                             scope.launch {
+                                // 失败原因必须落到提示里：trimOversized 走 trimToTail → restoreTextTail，
+                                // 引用头损坏 / 分块缺失会抛，旧写法 getOrNull() 只剩一句没有原因的「瘦身失败」。
+                                var failureReason: String? = null
                                 val done = withContext(Dispatchers.IO) {
-                                    runCatching { TextStoreMaintenance.trimOversized(EtaDatabase.get(context)) }.getOrNull()
+                                    try {
+                                        TextStoreMaintenance.trimOversized(EtaDatabase.get(context))
+                                    } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                                        throw cancelled
+                                    } catch (failure: Throwable) {
+                                        failureReason = ChunkedTextFailureReason.of(failure)
+                                        null
+                                    }
                                 }
                                 busy = false
-                                android.widget.Toast.makeText(
-                                    context,
-                                    done?.let { "瘦身完成：${it.trimmedFields} 个字段 · 省 ${it.savedChars} 字符" } ?: "瘦身失败",
-                                    android.widget.Toast.LENGTH_LONG,
-                                ).show()
+                                val message = when {
+                                    done != null -> "瘦身完成：${done.trimmedFields} 个字段 · 省 ${done.savedChars} 字符" +
+                                        if (done.failedFields > 0) " · ${done.failedFields} 个字段失败（已记日志）" else ""
+                                    failureReason != null -> "瘦身失败（原因：$failureReason），详见诊断日志"
+                                    else -> "瘦身失败"
+                                }
+                                android.widget.Toast.makeText(context, message, android.widget.Toast.LENGTH_LONG).show()
                                 round += 1
                             }
                         }

@@ -37,7 +37,18 @@ internal object RunControl {
     val state: StateFlow<RunControlState> = _state.asStateFlow()
 
     private val listeners = CopyOnWriteArrayList<(RunControlState) -> Unit>()
-    private val mainHandler = Handler(Looper.getMainLooper())
+
+    /**
+     * 主线程 Handler：延迟到第一次真正需要投递时才创建。
+     *
+     * 早先是饿汉字段，于是「只是清一下暂停标记」也会在类初始化时去碰
+     * `Looper.getMainLooper()`——纯 JVM 单测里那是 stub，直接
+     * `ExceptionInInitializerError` 把调用方（审批裁决 `resume()`）一起带崩，
+     * 于是 skip() 这类逻辑只能靠 Robolectric 测，而它在 arm64 上会被静默跳过。
+     *
+     * 没有监听者时 [notifyListeners] 直接返回，压根不会触碰这个字段，真机行为不变。
+     */
+    private val mainHandler by lazy { Handler(Looper.getMainLooper()) }
 
     /** 记住 run 属于哪个会话：输入框和卡片靠它把「会话」映射回 runId。 */
     fun bindRun(runId: String, conversationKey: String) {

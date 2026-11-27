@@ -88,6 +88,12 @@ internal object AgentToolRequirements {
             "ask_user",
             // 计划清单：纯本地状态写入口，不需要 Root / 无障碍 / 系统权限。
             "update_plan",
+            // 按需加载的两个入口：只改 run 内开组状态、或把调用转发给真实工具，
+            // 自身不碰设备也不碰文件 → NONE（不进资源闸门，不占串行槽）。
+            // 不登记的后果：project() 会把它们静默跳过（目录里没有 → 机制不可用），
+            // 且 ToolSelectionItems 按 rootRequirement 分组时直接抛 Missing tool requirements。
+            io.github.mangi.eta.agent.model.AgentToolGroupCatalog.USE_GROUP,
+            io.github.mangi.eta.agent.model.AgentToolGroupCatalog.CALL,
             // 文本输入类（input_text / replace_text / clear_text / paste_text）是 **executionOnly**：
             // 它们已不在模型目录里（AgentToolCatalog 不再声明，单测 executionOnly 断言钉住），
             // 只留作旧 transcript 重放兼容。因此不占 SCREEN 槽——真正的屏幕动作由调用方的

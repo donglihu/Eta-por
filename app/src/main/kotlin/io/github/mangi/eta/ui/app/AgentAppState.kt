@@ -113,7 +113,6 @@ import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
-import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Deferred
@@ -149,6 +148,16 @@ internal class AgentAppState(
 
     /** 进行中的 run 记在 [conversationRuns] 里，用它当并发计数。 */
     private fun hasRunCapacity(): Boolean = conversationRuns.size < maxConcurrentRuns
+    /**
+     * 会话补载失败的日志出口。
+     *
+     * 纯 JVM 单测里 android.jar 是 stub，任何 `android.util.Log` 都抛 `RuntimeException("Stub!")`，
+     * 日志必须可替换（与 [io.github.mangi.eta.data.db.EtaDatabase.quarantineLogSink] 同一模式），
+     * 否则「失败必须可见」这条契约只能在被 arm64 静默跳过的 Robolectric 里验证。
+     */
+    @androidx.annotation.VisibleForTesting
+    internal var conversationLoadLogSink: ((String) -> Unit)? = null
+
     /** 最近一次请求被裁掉的轮次/条数：只用于顶栏提示，界面与数据库都不删。 */
     var historyTrimNotice by mutableStateOf<Pair<Int, Int>?>(null)
         private set
@@ -219,10 +228,28 @@ internal class AgentAppState(
     /** 内部最多记 8 条，侧栏只显示 3 条，多的折叠。 */
     private val recentOpenedLimit = 8
 
-    private var recentOpenedIds: List<String> = loadRecentOpenedIds()
+    /**
+     * 「最近打开」的会话 id。
+     *
+     * 早先在构造函数里 `runBlocking { SettingsDataStore.settings() }` 读 DataStore，
+     * 首次读取要整文件解析，直接卡在主线程（2026-11-26 审核）。
+     * 现在构造时置空、异步补读；补读完成前侧栏「最近打开」少几条，不影响其它功能，
+     * 写回也改成投递到 scope，不再 runBlocking 阻塞主线程。
+     * 真正的异步补读放在 [conversationPaneState] 声明之后（见 init 块），
+     * 否则会读到尚未初始化的属性。
+     */
+    private var recentOpenedIds: List<String> = emptyList()
 
-    private fun loadRecentOpenedIds(): List<String> = runCatching {
-        runBlocking { SettingsDataStore.settings().recentOpenedConversationIds }
+    /**
+     * 构造之后是否已经发生过一次本地写入（[noteRecentOpened]）。
+     *
+     * 补读是异步的：用户在补读完成前点了会话，本地已经记了新的一条，这时再用磁盘值
+     * 整体覆盖就会把刚点的那条抹掉。有本地写入时改为「磁盘值并入内存值」而不是覆盖。
+     */
+    private var recentOpenedTouched = false
+
+    private suspend fun loadRecentOpenedIds(): List<String> = runCatching {
+        SettingsDataStore.settings().recentOpenedConversationIds
     }.getOrDefault("")
         .split(',')
         .map { it.trim() }
@@ -230,8 +257,8 @@ internal class AgentAppState(
         .take(recentOpenedLimit)
 
     private fun persistRecentOpened(ids: List<String>) {
-        runCatching {
-            runBlocking {
+        scope.launch {
+            runCatching {
                 SettingsDataStore.updateSettings {
                     it.copy(recentOpenedConversationIds = ids.joinToString(","))
                 }
@@ -240,6 +267,7 @@ internal class AgentAppState(
     }
 
     private fun noteRecentOpened(conversationId: String) {
+        recentOpenedTouched = true
         val updated = (listOf(conversationId) + recentOpenedIds.filterNot { it == conversationId })
             .take(recentOpenedLimit)
         recentOpenedIds = updated
@@ -313,6 +341,24 @@ internal class AgentAppState(
         observeRuntimeSelection()
         observeDefaultReasoningPreferences()
         runtimeRecoveryInProgress.set(true)
+        scope.launch(Dispatchers.IO) {
+            // 「最近打开」异步补读：必须放在 conversationPaneState 初始化之后，
+            // 也必须在主线程之外（datastore 首次读要解析整个文件）。
+            val loaded = loadRecentOpenedIds()
+            if (loaded.isNotEmpty()) {
+                withContext(Dispatchers.Main) {
+                    // 补读期间用户已经点过会话：内存值更新，磁盘值只能并入，不能整体覆盖。
+                    val merged = if (recentOpenedTouched) {
+                        (recentOpenedIds + loaded.filterNot { it in recentOpenedIds })
+                            .take(recentOpenedLimit)
+                    } else {
+                        loaded
+                    }
+                    recentOpenedIds = merged
+                    conversationPaneState = conversationPaneState.copy(recentOpenedIds = merged)
+                }
+            }
+        }
         scope.launch(Dispatchers.IO) {
             try {
                 recoverRuntimeRuns()
@@ -4014,6 +4060,11 @@ internal class AgentAppState(
     /**
      * #006：启动只把选中会话读进内存，其余会话只放元数据。
      * 用户切过来时在这里按需补载；失败保留占位状态，不阻塞其它操作。
+     *
+     * 失败必须可见（2026-11-26 审核 P1-4）：旧写法 `runCatching { }.getOrNull()` 把
+     * [io.github.mangi.eta.data.db.ChunkedTextDao.restoreTextTail] 抛出的「引用头损坏 /
+     * 分块缺失」压成 null，用户点开会话毫无反应、也没有一行日志。现在三态结果分开，
+     * 失败既写日志也贴结果卡，占位状态保留以便重试。
      */
     private fun ensureConversationLoaded(conversationId: String) {
         if (conversationId !in partiallyLoadedConversationIds) return
@@ -4021,13 +4072,17 @@ internal class AgentAppState(
         val placeholderInput = conversationsById[conversationId]?.input.orEmpty()
         val job = scope.launch {
             try {
-                val loaded = runCatching {
-                    AgentConversationStore.loadConversation(appContext, conversationId)
-                }.getOrNull()
-                if (loaded != null) {
-                    withContext(Dispatchers.Main.immediate) {
-                        applyLoadedConversation(conversationId, loaded, placeholderInput)
+                when (val outcome = loadConversationOutcome(conversationId, "ensure") {
+                        AgentConversationStore.loadConversation(appContext, conversationId)
+                    }) {
+                    is ConversationLoadOutcome.Loaded -> withContext(Dispatchers.Main.immediate) {
+                        applyLoadedConversation(conversationId, outcome.state, placeholderInput)
                     }
+                    is ConversationLoadOutcome.Failed -> withContext(Dispatchers.Main.immediate) {
+                        reportConversationLoadFailure(conversationId, outcome)
+                    }
+                    // 会话行已不存在：占位状态没有东西可补，静默跳过不是吞异常。
+                    ConversationLoadOutcome.Missing -> Unit
                 }
             } finally {
                 withContext(Dispatchers.Main.immediate) { conversationLoadJobs.remove(conversationId) }
@@ -4036,16 +4091,41 @@ internal class AgentAppState(
         conversationLoadJobs[conversationId] = job
     }
 
-    /** suspend 版本：运行时恢复要在写入前确认目标会话已完整加载。 */
+    /**
+     * suspend 版本：运行时恢复要在写入前确认目标会话已完整加载。
+     *
+     * 失败时同样上报（日志 + 结果卡）：这里曾经 `?: return`，恢复轨迹会往占位状态里写，
+     * 用户看到的是「历史突然少了一段」而不是任何错误。
+     */
     private suspend fun awaitConversationLoaded(conversationId: String) {
         if (conversationId !in partiallyLoadedConversationIds) return
         val placeholderInput = conversationsById[conversationId]?.input.orEmpty()
-        val loaded = runCatching {
-            AgentConversationStore.loadConversation(appContext, conversationId)
-        }.getOrNull() ?: return
-        withContext(Dispatchers.Main.immediate) {
-            applyLoadedConversation(conversationId, loaded, placeholderInput)
+        when (val outcome = loadConversationOutcome(conversationId, "await") {
+                AgentConversationStore.loadConversation(appContext, conversationId)
+            }) {
+            is ConversationLoadOutcome.Loaded -> withContext(Dispatchers.Main.immediate) {
+                applyLoadedConversation(conversationId, outcome.state, placeholderInput)
+            }
+            is ConversationLoadOutcome.Failed -> withContext(Dispatchers.Main.immediate) {
+                reportConversationLoadFailure(conversationId, outcome)
+            }
+            ConversationLoadOutcome.Missing -> Unit
         }
+    }
+
+    /**
+     * 补载失败的唯一出口：写诊断日志，并在该会话的结果卡上给出可见错误。
+     *
+     * 只在用户当前正看着这个会话时弹卡：后台补载（运行时恢复、导入后重载）不抢用户的界面焦点，
+     * 但日志一行都不会少。
+     */
+    private fun reportConversationLoadFailure(
+        conversationId: String,
+        failure: ConversationLoadOutcome.Failed,
+    ) {
+        ConversationLoadFailure.emit(failure, conversationLoadLogSink)
+        if (conversationId != selectedConversationId) return
+        showCommandResult(CommandResultUi(title = failure.userMessage(), isError = true))
     }
 
     private fun applyLoadedConversation(

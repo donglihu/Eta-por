@@ -36,6 +36,17 @@ internal class AgentLoop(
     private val toolsForRound: (() -> JSONArray)? = null,
     /** 远端（MCP）工具名：它们的参数 schema 属于第三方服务器，循环只转发不预检。 */
     private val remoteToolNames: Set<String> = emptySet(),
+    /**
+     * 按需加载的 run 级状态；null 表示本 run 走 `OFF` 档（全量声明，不解包）。
+     *
+     * 与 [deferredSchemas] 一起由 [AgentModelClient] 装配：前者决定「允许转发哪些真名」，
+     * 后者给内层真名提供参数 schema。
+     */
+    private val groupSession: AgentToolGroupSession? = null,
+    /** 被目录摘下的延迟工具参数 schema（工具名 → parameters）。 */
+    private val deferredSchemas: Map<String, JSONObject> = emptyMap(),
+    /** 工具能力页关掉的工具名：转发时按同一个错误码拒绝，与 OFF 档直调口径一致。 */
+    private val disabledToolNames: Set<String> = emptySet(),
     private val modelRetry: AgentModelRetry = AgentModelRetry(),
     private val sessionId: String = java.util.UUID.randomUUID().toString(),
     /**
@@ -71,7 +82,7 @@ internal class AgentLoop(
     )
 
     private var availableToolNames = emptySet<String>()
-    private var toolCallValidator = AgentToolCallValidator(localToolsOnly(tools))
+    private var toolCallValidator = AgentToolCallValidator(localToolsOnly(tools), deferredSchemas)
     private val accumulatedReasoning = StringBuilder()
     private val thinkingBlockStartMs = mutableMapOf<Pair<Int, Int>, Long>()
     private val sensitiveToolCallIds = linkedSetOf<String>()
@@ -154,7 +165,7 @@ internal class AgentLoop(
             availableToolNames = (0 until roundTools.length()).mapNotNullTo(mutableSetOf()) { index ->
                 roundTools.optJSONObject(index)?.optJSONObject("function")?.optString("name")
             }
-            toolCallValidator = AgentToolCallValidator(localToolsOnly(roundTools))
+            toolCallValidator = AgentToolCallValidator(localToolsOnly(roundTools), deferredSchemas)
             publishTranscript()
             if (purpose.allowsTools) context.compact()
             val requestMessages = AssistantScreenContextProjection.project(
@@ -475,20 +486,57 @@ internal class AgentLoop(
     ): ToolOutcome {
         runController.throwIfCancelled()
         if (toolCall.name !in availableToolNames) {
+            // 按需加载档下，模型最常见的错是「知道工具名就直接调」。这里给出组名与两条命令，
+            // 而不是笼统的「未提供」——后者会让它换工具硬凑。
+            val (code, message) = if (groupSession != null) {
+                AgentToolGroupCatalog.notAvailableMessage(toolCall.name)
+            } else {
+                "TOOL_NOT_AVAILABLE" to "工具未在本轮能力目录中提供，请使用当前可用工具"
+            }
             return rejectedToolOutcome(
                 round = round,
                 toolCall = toolCall,
-                code = "TOOL_NOT_AVAILABLE",
-                message = "工具未在本轮能力目录中提供，请使用当前可用工具",
+                code = code,
+                message = message,
             )
         }
         val roundCall = if (toolCall.round == round) toolCall else toolCall.copy(round = round)
+        // 按需加载：`tool_call` 必须在进入任何闸门之前还原成真实工具调用。
+        // 解包放在这里（而不是 AgentLocalTools 里递归）是刻意的：计划模式、专家白名单、
+        // 工具白名单、复盘白名单、能力码、资源域键、审批卡与逐工具开关看到的都必须是真名，
+        // 否则等于给所有被禁工具开一条叫 tool_call 的通用后门。
+        val resolved = groupSession?.let { session ->
+            // `tools_use_group` 必须先于解包处理：它自己不是转发，也不该落到 toolExecutor
+            // （那里没有这个工具的分支，会回 UNKNOWN_TOOL）。
+            if (roundCall.name == AgentToolGroupCatalog.USE_GROUP) {
+                return openGroupOutcome(round, roundCall, session)
+            }
+            AgentToolGroupCatalog.resolve(roundCall, session.openedGroups(), disabledToolNames)
+        } ?: AgentToolGroupCatalog.EffectiveCall.Direct(roundCall)
+        val effective = when (resolved) {
+            is AgentToolGroupCatalog.EffectiveCall.Direct -> roundCall
+            is AgentToolGroupCatalog.EffectiveCall.Rejected -> return rejectedToolOutcome(
+                round = round,
+                toolCall = roundCall,
+                code = resolved.code,
+                message = resolved.message,
+            )
+            is AgentToolGroupCatalog.EffectiveCall.Forwarded -> {
+                EtaTrace.log(
+                    "perf.tool.forwarded",
+                    "outer=${resolved.outer.name} inner=${resolved.inner.name} group=${resolved.group}",
+                )
+                // 内层沿用 outer 的 id：会话里一条 tool_calls 对应一条 tool 结果，
+                // 界面与 transcript 都按 id 配对，换成内层自造 id 会让结果无处落地。
+                resolved.inner.copy(id = roundCall.id, round = round)
+            }
+        }
         // 远端（MCP）工具的参数 schema 属于第三方服务器：这里只转发，不拿本地副本做预检。
-        if (toolCall.name !in remoteToolNames) {
-            toolCallValidator.validate(roundCall)?.let { validationError ->
+        if (effective.name !in remoteToolNames) {
+            toolCallValidator.validate(effective)?.let { validationError ->
                 return rejectedToolOutcome(
                     round = round,
-                    toolCall = roundCall,
+                    toolCall = effective,
                     code = "INVALID_TOOL_ARGUMENTS",
                     message = validationError,
                 )
@@ -498,26 +546,26 @@ internal class AgentLoop(
         onEvent(
             AgentEvent.ToolStarted(
                 round = round,
-                toolCallId = roundCall.id,
-                name = roundCall.name,
-                argsPreview = traceFormatter.summarizeArguments(roundCall),
-                command = traceFormatter.displayCommand(roundCall),
+                toolCallId = effective.id,
+                name = effective.name,
+                argsPreview = traceFormatter.summarizeArguments(effective),
+                command = traceFormatter.displayCommand(effective),
             )
         )
 
         // 参数解析不许静默降级：坏 JSON 会让域键退化（FS 变 workspace、SCREEN 变 main），
         // 等于把「串行」悄悄降成「不串行」，所以直接在调用前拒掉，让模型看到 INVALID_TOOL_ARGUMENTS。
-        val rawArguments = roundCall.argumentsJson
+        val rawArguments = effective.argumentsJson
         val args = if (rawArguments.isBlank()) {
             JSONObject()
         } else {
             try {
                 JSONObject(rawArguments)
             } catch (error: JSONException) {
-                EtaTrace.log("perf.tool.args_invalid", "name=${roundCall.name} err=${error.message}")
+                EtaTrace.log("perf.tool.args_invalid", "name=${effective.name} err=${error.message}")
                 return rejectedToolOutcome(
                     round = round,
-                    toolCall = roundCall,
+                    toolCall = effective,
                     code = "INVALID_TOOL_ARGUMENTS",
                     message = "工具参数不是合法 JSON：${error.message}",
                 )
@@ -528,13 +576,13 @@ internal class AgentLoop(
             // 并发会话共用一块屏幕、一条终端、一套系统设置：按资源域排队，而不是一把全局锁。
             // 关闭开关（AgentResourceGate.enabled = false）时退回旧的全局锁，行为与改动前一致。
             AgentResourceGate.dispatch(
-                toolName = roundCall.name,
+                toolName = effective.name,
                 args = args,
                 conversationKey = conversationKey,
                 action = args.optString("action"),
                 isCancelled = { runController.isCancelled },
             ) {
-                toolExecutor.execute(roundCall)
+                toolExecutor.execute(effective)
             }
         } catch (busy: AgentResourceGate.GateTimeout) {
             AgentModelClient.ToolResult(
@@ -569,12 +617,67 @@ internal class AgentLoop(
                     .toString(),
             )
         }
-        if (result.sensitive || AgentSensitiveToolPolicy.isSensitive(roundCall.name)) {
-            sensitiveToolCallIds += roundCall.id
+        if (result.sensitive || AgentSensitiveToolPolicy.isSensitive(effective.name)) {
+            sensitiveToolCallIds += effective.id
         }
 
-        emitToolFinished(round, roundCall, result)
-        return ToolOutcome(roundCall, result)
+        emitToolFinished(round, effective, result)
+        return ToolOutcome(effective, result)
+    }
+
+    /**
+     * `tools_use_group` 的执行体：只改 run 内状态，不碰设备、不碰文件。
+     *
+     * 放在 loop 而不是 [io.github.mangi.eta.agent.tool.AgentLocalTools] 里，是因为
+     * 这个状态的作用域就是一次 run（[groupSession]），执行器实例可能被多个 run 复用；
+     * 而且它必须在解包之前处理，否则会落到 toolExecutor 的 `UNKNOWN_TOOL` 分支。
+     */
+    private fun openGroupOutcome(
+        round: Int,
+        call: AgentModelClient.ToolCall,
+        session: AgentToolGroupSession,
+    ): ToolOutcome {
+        val args = runCatching { JSONObject(call.argumentsJson.ifBlank { "{}" }) }.getOrNull()
+        val groupId = args?.optString("group")?.trim().orEmpty()
+        if (groupId.isEmpty()) {
+            return rejectedToolOutcome(
+                round = round,
+                toolCall = call,
+                code = "INVALID_TOOL_ARGUMENTS",
+                message = "缺少 group 参数；可选组：" +
+                    AgentToolGroups.deferredGroups.joinToString("、") { it.id },
+            )
+        }
+        val rejection = session.open(groupId)
+        if (rejection != null) {
+            return completedOutcome(round, call, AgentModelClient.ToolResult(rejection))
+        }
+        val members = AgentToolGroups.members(groupId).orEmpty()
+        EtaTrace.log("perf.tools.group_open", "group=$groupId tools=${members.size} round=$round")
+        return completedOutcome(
+            round = round,
+            call = call,
+            result = AgentModelClient.ToolResult(AgentToolGroupCatalog.openedReceipt(groupId, members)),
+        )
+    }
+
+    /** 正常走完（有 ToolStarted / ToolFinished 事件对）的执行结果收口。 */
+    private fun completedOutcome(
+        round: Int,
+        call: AgentModelClient.ToolCall,
+        result: AgentModelClient.ToolResult,
+    ): ToolOutcome {
+        onEvent(
+            AgentEvent.ToolStarted(
+                round = round,
+                toolCallId = call.id,
+                name = call.name,
+                argsPreview = traceFormatter.summarizeArguments(call),
+                command = traceFormatter.displayCommand(call),
+            )
+        )
+        emitToolFinished(round, call, result)
+        return ToolOutcome(call, result)
     }
 
     private fun rejectedToolOutcome(

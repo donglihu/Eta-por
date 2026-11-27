@@ -55,6 +55,10 @@ jobs:
     steps:
       - name: 检出代码
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          # 本 job 持有签名 secrets；不让 checkout 把 token 写进 .git/config，
+          # 与 verify job 保持一致（纵深防御，2026-11-26 审核）。
+          persist-credentials: false
 
       - name: 配置构建环境
         uses: ./.github/actions/setup-build

@@ -4,6 +4,7 @@ import io.github.mangi.eta.agent.runtime.AgentMemoryGate
 import io.github.mangi.eta.core.EtaTrace
 import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * 重任务（编译 / 构建 / 解包 / 长命令）互斥闸门。
@@ -12,8 +13,13 @@ import java.util.concurrent.TimeUnit
  * 1. 重命令同一时间只跑一个；
  * 2. 内存紧张（剩余 <1200MB）时不让重命令开跑，避免在峰值上再叠一个峰值；
  * 3. 一开始等不到槽位就**当场**给出"已排队"提示，而不是拖到超时才报错；
- * 4. 槽位用信号量管理：正常结束、异常中断都在 finally 里释放；再加一层残留自检，
- *    持锁线程已死或持锁超过 10 分钟时强制释放，避免"锁残留"把后续任务全堵死。
+ * 4. 槽位用信号量管理，并配一个「只释放一次」的持有者票据：正常结束、异常中断都在
+ *    finally 里归还；线程被杀、或持锁超过 10 分钟时，残留自检代为归还。
+ *
+ * 第 4 条的「只释放一次」是硬要求：早先自检里直接 `slot.release()`，而原持有者结束时
+ * 还会在 finally 里再 release 一次，一次超时就把 permits 变成 2，此后两条重命令能并发
+ * 进入——正是这道闸门要避免的 OOM（2026-11-26 审核）。
+ *
  * 轻命令（ls、cat、grep 之类）完全不受影响。
  */
 internal object HeavyCommandGate {
@@ -42,33 +48,53 @@ internal object HeavyCommandGate {
         "baksmali", "smali", "dex2jar", "jadx", "gcc ", "g++ ", "clang",
     )
 
-    /** 用信号量而不是可重入锁：信号量允许任意线程释放，残留时才能被兜底回收。 */
+    /**
+     * 一次成功的占用。
+     *
+     * [released] 保证「占用 → 归还」严格一一对应：无论是 finally 归还还是残留自检代还，
+     * 第二次调用一定是空操作，permits 不会被放大。
+     */
+    private class Holder(val thread: Thread, val acquiredAt: Long) {
+        private val released = AtomicBoolean(false)
+
+        fun releaseOnce(): Boolean {
+            if (!released.compareAndSet(false, true)) return false
+            slot.release()
+            return true
+        }
+
+        fun heldTooLong(now: Long): Boolean = now - acquiredAt > STALE_HOLD_MS
+    }
+
+    /** 用信号量而不是可重入锁：残留线程已死时，才能由别人代为归还。 */
     private val slot = Semaphore(1, true)
 
     @Volatile
-    private var ownerThread: Thread? = null
-
-    @Volatile
-    private var acquiredAt = 0L
+    private var holder: Holder? = null
 
     fun isHeavy(command: String): Boolean {
         val text = command.lowercase()
         return heavyPatterns.any { pattern -> text.contains(pattern) }
     }
 
-    /** 残留自检：持锁线程已死或持锁过久，就强制把槽位放回去。 */
+    /**
+     * 残留自检：持有者线程已死、或持锁超过 10 分钟，就代为归还这一次占用的槽位。
+     *
+     * 只有「确实还没归还过」才会 release（见 [Holder.releaseOnce]），所以原持有者随后
+     * 走到 finally 时不会造成第二次归还。
+     */
     private fun releaseIfStale() {
-        if (slot.availablePermits() > 0) return
-        val owner = ownerThread
-        val ownerGone = owner != null && !owner.isAlive
-        val heldTooLong = acquiredAt > 0L && System.currentTimeMillis() - acquiredAt > STALE_HOLD_MS
-        if (!ownerGone && !heldTooLong) return
-        ownerThread = null
-        acquiredAt = 0L
-        slot.release()
+        val current = holder ?: return
+        val ownerGone = !current.thread.isAlive
+        val tooLong = current.heldTooLong(System.currentTimeMillis())
+        if (!ownerGone && !tooLong) return
+        if (holder !== current) return
+        holder = null
+        val released = current.releaseOnce()
         EtaTrace.log(
             "heavy.stale-release",
-            "检测到重任务槽位残留（owner=${owner?.name.orEmpty()} 已死=$ownerGone 超时=$heldTooLong），已强制释放",
+            "检测到重任务槽位残留（owner=${current.thread.name} 已死=$ownerGone 超时=$tooLong），" +
+                "已代为归还=$released",
         )
     }
 
@@ -109,16 +135,16 @@ internal object HeavyCommandGate {
             }
             if (tight) Thread.sleep(POLL_MS)
         }
-        ownerThread = Thread.currentThread()
-        acquiredAt = System.currentTimeMillis()
+        val acquired = Holder(Thread.currentThread(), System.currentTimeMillis())
+        holder = acquired
         EtaTrace.log("heavy.start", command.take(80))
         return try {
             block()
         } finally {
-            // 正常结束和异常中断都走这里；槽位绝不留给自己以外的下一次调用。
-            ownerThread = null
-            acquiredAt = 0L
-            slot.release()
+            // 正常结束和异常中断都走这里；[releaseOnce] 保证即使自检已经代还过，
+            // 这里也不会再归还一次（槽位绝不留给自己以外的下一次调用，也绝不多还）。
+            if (holder === acquired) holder = null
+            acquired.releaseOnce()
             EtaTrace.log("heavy.end", command.take(80))
         }
     }

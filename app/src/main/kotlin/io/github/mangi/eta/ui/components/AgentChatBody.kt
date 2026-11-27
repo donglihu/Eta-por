@@ -1125,6 +1125,9 @@ internal fun AgentConversationMessages(
                                 AgentApprovalOptionUi(it.id, it.label, it.description)
                             },
                             allowMultiple = approval.allowMultiple,
+                            // 卡上的「跳过」在两种来源下语义不同，UI 必须知道自己是哪一种：
+                            // 审批卡改成「拒绝执行」，提问卡保留「跳过」。
+                            source = approval.source,
                         ),
                         onChoose = { id ->
                             // 返回非空 = 模型主动提问那条线：那一轮已经结束，

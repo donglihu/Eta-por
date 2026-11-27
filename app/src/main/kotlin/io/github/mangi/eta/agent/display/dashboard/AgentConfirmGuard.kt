@@ -286,9 +286,10 @@ internal object AgentConfirmGuard {
         args: org.json.JSONObject,
         runId: String = "",
     ): ConfirmDraft? {
+        // 免批签名用完整命令/路径：截断会让「前 N 字符相同」的不同操作共用一次批准。
         val target = when (toolName) {
-            "terminal", "terminal_job", "terminal_daemon" -> args.optString("command").take(40)
-            else -> args.optString("path").take(40)
+            "terminal", "terminal_job", "terminal_daemon" -> args.optString("command")
+            else -> args.optString("path")
         }
         return register(
             context = context,
@@ -318,9 +319,11 @@ internal object AgentConfirmGuard {
         runId: String = "",
     ): ConfirmDraft? {
         val draft = ConfirmRiskDetector.inspectTool(toolName, args) ?: return null
+        // 免批签名要用完整命令/路径：截断会让「前 N 字符相同」的不同操作共用一次批准。
+        // 卡片显示那边自己会截断，这里只负责判定身份。
         val target = when (toolName) {
-            "terminal", "terminal_job", "terminal_daemon" -> args.optString("command").take(40)
-            else -> args.optString("path").take(40)
+            "terminal", "terminal_job", "terminal_daemon" -> args.optString("command")
+            else -> args.optString("path")
         }
         return register(
             context = context,
@@ -418,8 +421,21 @@ internal object AgentConfirmGuard {
         // 裁决 slot 必须先于卡片可见创建：工具线程 awaitVerdict 与 UI 点选都可能立即发生，
         // 若 UI 先 completeVerdict 而 slot 不存在会返回 false，裁决就丢了。
         verdictResults.putIfAbsent(pending.token, VerdictSlot())
+        // 同会话换卡时，旧卡会从列表里消失，但它的工具线程还挂在 awaitVerdict 上。
+        // 早先只把旧卡从列表过滤掉，旧 token 的 slot 仍在 → 卡看不见、takeIfCurrent
+        // 永远找不到 → 只能等 30 分钟超时（2026-11-26 审核）。
+        // 这里给被顶掉的旧 token 写一条 superseded 结果并唤醒，让它立刻以失败语义收尾。
+        val evicted = mutablePendings.value.filter { it.conversationKey == owner && it.token != pending.token }
         mutatePendings { current ->
             current.filter { it.conversationKey != owner && !it.expired() } + pending
+        }
+        evicted.forEach { old ->
+            EtaTrace.log("confirm.superseded", "token=${old.token} title=${old.title.take(40)}")
+            val slot = verdictResults[old.token] ?: return@forEach
+            slot.reply = "这一单已被同一会话里更新的确认请求取代，本次没有执行。" +
+                "请不要重试，先看最新的那张卡。"
+            slot.rejected = true
+            slot.latch.countDown()
         }
         // 这里不设 pauseRun() 标记（早先命中即 pause 实测翻车：模型拿到 NEED_CONFIRM 收尾、
         // run 变 terminal，resumeRun() 找不到活动 run，界面卡死）。改为：run 不结束，
@@ -614,10 +630,18 @@ internal object AgentConfirmGuard {
             "（未选：${others.joinToString("、")}。用户之后如果说要改，以他最新的说法为准。）"
         }
         val text = "用户对「${current.title}」选择了：$joined。请按这些选择继续，不要再问一遍。$hint"
-        AndroidAgentLogger.info("Prompt chosen many token=$token count=${labels.size}")
-        EtaTrace.log("confirm.chooseMany", "count=${labels.size} title=${current.title.take(40)}")
+        // 同一类 fail-open 的兜底（[ApprovalVerdictPolicy.manyRejects]）：
+        // guard 卡只有勾中「批准」类选项才算放行；只勾拒绝类必须以失败语义收尾。
+        // 当前 guard 卡不开放多选（allowMultiple 恒为 false），这里不改变已有行为，
+        // 只是将来放开多选时不必再回来补一次。
+        val rejected = ApprovalVerdictPolicy.manyRejects(current.source, optionIds)
+        AndroidAgentLogger.info("Prompt chosen many token=$token count=${labels.size} rejected=$rejected")
+        EtaTrace.log(
+            "confirm.chooseMany",
+            "count=${labels.size} title=${current.title.take(40)} rejected=$rejected",
+        )
         resume(context)
-        return if (completeVerdict(token, text)) null else text
+        return if (completeVerdict(token, text, rejected = rejected)) null else text
     }
 
     /**
@@ -641,33 +665,44 @@ internal object AgentConfirmGuard {
         val extraLabels = extraIds.mapNotNull { id ->
             current.options.firstOrNull { it.id == id }?.label
         }.distinct()
-        val reply = if (extraLabels.isEmpty()) {
-            "用户对「${current.title}」自己填写了：$answer。请按这个回答继续，不要再问一遍。"
-        } else {
-            "用户对「${current.title}」勾选了「${extraLabels.joinToString("、")}」，另外补充：$answer。" +
-                "请把勾选项和这段补充一起当作他的答案。"
-        }
-        AndroidAgentLogger.info("Prompt freeform token=$token")
-        EtaTrace.log("confirm.freeform", "title=${current.title.take(40)}")
+        // 来源决定语义（见 [ApprovalVerdictPolicy.freeformRejects]）：
+        // - guard 卡：用户写的是「怎么改」，不是「批准」→ 原工具仍然拒绝，模型按意见重新规划；
+        // - ask 卡：用户写的是答案 → 保持放行，按答案继续。
+        // 早先这里不带 rejected，于是 guard 卡上写一句「改成 /sdcard」照样让被拦的命令执行（P0-2）。
+        val rejected = ApprovalVerdictPolicy.freeformRejects(current.source)
+        val reply = ApprovalVerdictPolicy.freeformReply(
+            source = current.source,
+            title = current.title,
+            answer = answer,
+            extraLabels = extraLabels,
+        )
+        AndroidAgentLogger.info("Prompt freeform token=$token rejected=$rejected")
+        EtaTrace.log("confirm.freeform", "title=${current.title.take(40)} rejected=$rejected")
         resume(context)
-        return if (completeVerdict(token, reply)) null else reply
+        return if (completeVerdict(token, reply, rejected = rejected)) null else reply
     }
 
     /**
-     * 跳过：不回答，让模型自己往下走。
+     * 跳过：用户不想在这张卡上做选择。
      *
-     * 和「拒绝」的区别：拒绝是「这件事别做」，跳过是「这个问题我不答」。
-     * 没有这个出口，用户遇到不想答的问题只能关掉卡片重开一段对话。
+     * 两种来源语义不同，不能一刀切（[ApprovalVerdictPolicy.skipRejects]）：
+     * - guard 卡（系统拦下的危险动作）：「跳过」= 我不同意做这一步 → `rejected = true`，
+     *   工具侧以 `USER_REJECTED` 收尾、绝不执行。早先不传 rejected，用户点「跳过」反而
+     *   让被拦的 `cp /sdcard/x /system/y` 真跑了一遍（2026-11-26 审核 P0-2 fail-open）。
+     * - ask 卡（模型自己拿不准的提问）：「跳过」= 这题我不答，你自己往下走 → 保持放行。
      */
     fun skip(context: Context?, token: String, conversationId: String = ""): String? {
         val current = takeIfCurrent(token) ?: return null
         clearNotification(context, token)
-        val reply = "用户跳过了「${current.title}」，没有选也没有回答。" +
-            "不要重复问同一个问题，按你认为最合理的方式继续；若这一步不可撤销，就停下来说明为什么需要他决定。"
-        AndroidAgentLogger.info("Prompt skipped token=$token")
-        EtaTrace.log("confirm.skip", "title=${current.title.take(40)}")
+        val rejected = ApprovalVerdictPolicy.skipRejects(current.source)
+        val reply = ApprovalVerdictPolicy.skipReply(current.source, current.title)
+        AndroidAgentLogger.info("Prompt skipped token=$token source=${current.source} rejected=$rejected")
+        EtaTrace.log(
+            "confirm.skip",
+            "title=${current.title.take(40)} source=${current.source} rejected=$rejected",
+        )
         resume(context)
-        return if (completeVerdict(token, reply)) null else reply
+        return if (completeVerdict(token, reply, rejected = rejected)) null else reply
     }
 
     /**
@@ -681,6 +716,70 @@ internal object AgentConfirmGuard {
 
     fun reject(context: Context?, token: String, conversationId: String = ""): String? =
         choose(context, token, PromptOptionId.REJECT, conversationId)
+
+    /** 该会话是否已挂着一张提问卡（审批卡不算占用，见 [ask] 的说明）。 */
+    private fun hasPendingAsk(owner: String): Boolean = mutablePendings.value.any {
+        it.conversationKey == owner && !it.expired() && it.source == PendingApproval.SOURCE_ASK
+    }
+
+    /**
+     * 挂一张提问卡（不含等待）：`ask()` 用它挂卡，单测用它构造 ask 来源的卡。
+     *
+     * 返回值是 token；同会话已有提问卡时返回 null（由调用方回 PROMPT_PENDING）。
+     * 抽出来是为了让「ask 卡的跳过 / 自由输入语义没被 guard 的修复误伤」能在纯 JVM 里测到，
+     * 不必为了一张卡去跑整条 ask → awaitVerdict 阻塞链路。
+     */
+    internal fun registerAsk(
+        context: Context?,
+        question: String,
+        body: String,
+        options: List<PromptOption>,
+        allowMultiple: Boolean = false,
+        runId: String = "",
+    ): String? {
+        // 前置条件由调用方保证（[ask] 负责校验并回 PROMPT_PENDING / INVALID_ASK）：
+        // 校验放在两处会各自长出一套错误码，最终界面和模型读到两种说法。
+        if (question.isBlank() || options.count { it.label.isNotBlank() } < 2) return null
+        val clean = options.filter { it.label.isNotBlank() }
+        val owner = conversationOfRun(runId).ifBlank { currentConversation }
+        val pending = PendingApproval(
+            token = nextToken(),
+            risk = ConfirmRisk.IRREVERSIBLE,
+            title = question.take(60),
+            fields = emptyList(),
+            // 不再强制静默：用户不在 App 里时必须能收到提醒，否则他根本不知道有人在等回答。
+            // 在不在前台由 notify 用 AppForeground 判断。
+            quiet = false,
+            subject = "",
+            body = body,
+            options = clean,
+            allowMultiple = allowMultiple,
+            conversationKey = owner,
+            source = PendingApproval.SOURCE_ASK,
+            runId = runId,
+        )
+        // 同会话换卡时旧卡会从列表消失：给它的工具线程写一条 superseded 结果并唤醒，
+        // 否则那条线程只能等 30 分钟超时（与 register() 同一处理，2026-11-26 审核）。
+        val evictedAsks = mutablePendings.value
+            .filter { it.conversationKey == owner && it.token != pending.token }
+        mutatePendings { current ->
+            current.filter { it.conversationKey != owner && !it.expired() } + pending
+        }
+        // 同样预建裁决 slot，避免 UI 先裁决时 slot 不存在导致丢失。
+        verdictResults.putIfAbsent(pending.token, VerdictSlot())
+        evictedAsks.forEach { old ->
+            EtaTrace.log("confirm.superseded", "token=${old.token} title=${old.title.take(40)}")
+            val slot = verdictResults[old.token] ?: return@forEach
+            slot.reply = "这个问题已经被同一会话里更新的确认请求取代，本轮不需要回答了。"
+            slot.rejected = true
+            slot.latch.countDown()
+        }
+        // 提问也要发通知：用户可能正在别的应用里，不提醒他根本不知道有人在等。
+        // （早先只有拦截路径调了 notify，提问这条线一直是静默的。）
+        context?.let { runCatching { notify(it, pending) } }
+        AndroidAgentLogger.info("Ask user: ${question.take(40)} options=${clean.size}")
+        return pending.token
+    }
 
     /**
      * AI 主动提问：带选项、暂停 run、等用户选。
@@ -701,11 +800,7 @@ internal object AgentConfirmGuard {
         // 但审批卡（资金 / 隐私 / 不可撤销）不算占用：它和「向用户提问」是两件事，
         // 之前只要有任何待答卡就返回 PROMPT_PENDING，导致模型在有待审批时永远问不出问题，
         // 用户只看到审批弹窗、看不到带选项的提问（实测踩到）。
-        val owner = conversationOfRun(runId).ifBlank { currentConversation }
-        val existing = mutablePendings.value.firstOrNull {
-            it.conversationKey == owner && !it.expired() && it.source == PendingApproval.SOURCE_ASK
-        }
-        if (existing != null) {
+        if (hasPendingAsk(conversationOfRun(runId).ifBlank { currentConversation })) {
             return JSONObject()
                 .put("ok", false)
                 .put("code", "PROMPT_PENDING")
@@ -721,35 +816,31 @@ internal object AgentConfirmGuard {
                 .put("message", "ask_user 至少需要一句问题和两个选项。")
                 .toString()
         }
-        val pending = PendingApproval(
-            token = nextToken(),
-            risk = ConfirmRisk.IRREVERSIBLE,
-            title = question.take(60),
-            fields = emptyList(),
-            // 不再强制静默：用户不在 App 里时必须能收到提醒，否则他根本不知道有人在等回答。
-            // 在不在前台由 notify 用 AppForeground 判断。
-            quiet = false,
-            subject = "",
+        val token = registerAsk(
+            context = context,
+            question = question,
             body = body,
             options = clean,
             allowMultiple = allowMultiple,
-            conversationKey = owner,
-            source = PendingApproval.SOURCE_ASK,
             runId = runId,
-        )
-        mutatePendings { current ->
-            current.filter { it.conversationKey != owner && !it.expired() } + pending
-        }
-        // 同样预建裁决 slot，避免 UI 先裁决时 slot 不存在导致丢失。
-        verdictResults.putIfAbsent(pending.token, VerdictSlot())
-        // 提问也要发通知：用户可能正在别的应用里，不提醒他根本不知道有人在等。
-        // （早先只有拦截路径调了 notify，提问这条线一直是静默的。）
-        context?.let { runCatching { notify(it, pending) } }
+        ) ?: return JSONObject()
+            .put("ok", false)
+            .put("code", "PROMPT_PENDING")
+            .put("message", "已经有一张卡在等用户回答，不要重复提问；等他答完再问下一题。")
+            .toString()
         // 提问也走 awaitVerdict 阻塞：工具线程挂起等用户裁决（reverse 的 Condition.await 语义），
         // 不设 pauseRun 标记、不结束 run、不新发消息；用户点选后同一 run 继续。
         // run 若被取消会经 isCancelled 中断等待（ask 的调用方传入 isRunCancelled）。
-        AndroidAgentLogger.info("Ask user: ${question.take(40)} options=${clean.size}")
-        val outcome = awaitVerdict(pending.token, isCancelled = isCancelled)
+        val outcome = awaitVerdict(token, isCancelled = isCancelled)
+        val pending = mutablePendings.value.firstOrNull { it.token == token }
+            ?: PendingApproval(
+                token = token,
+                risk = ConfirmRisk.IRREVERSIBLE,
+                title = question.take(60),
+                fields = emptyList(),
+                quiet = false,
+                source = PendingApproval.SOURCE_ASK,
+            )
         val verdict = outcome?.reply
         if (verdict == null) {
             // 超时（默认 30 分钟）仍无人应答 / run 被取消：回到旧的 AWAITING_USER 收尾，避免 run 永久挂死。
@@ -869,9 +960,20 @@ internal object AgentConfirmGuard {
         }
     }
 
-    /** 主体签名：风险 + 卡片标题 + 控件文本。同一个「立即支付」按钮落在这里。 */
-    private fun subjectOf(draft: ConfirmDraft, target: String?): String =
-        draft.risk.name + "|" + draft.title + "|" + target.orEmpty().trim().take(24)
+    /**
+     * 主体签名：风险 + 卡片标题 + 控件文本。
+     *
+     * `target` 必须用**完整**内容，不能截断：早先取前 24 字符当键，于是用户批准过一次
+     * `su -c 'rm -rf /data/local/tmp/eta/build'`，24 小时内所有前 24 字符相同、后缀任意的
+     * 命令都免确认——把「同一次操作」放大成「同一类前缀」（2026-11-26 审核）。
+     * 截断位置已经由调用方按需控制（[inspectTool] 给的是整条命令，不截断）。
+     */
+    private fun subjectOf(draft: ConfirmDraft, target: String?): String {
+        val text = target.orEmpty().trim()
+        // 归一化空白：`rm  -rf   /` 与 `rm -rf /` 是同一件事，不该因为空格不同就各拦一次。
+        val normalized = text.replace(Regex("""\s+"""), " ")
+        return draft.risk.name + "|" + draft.title + "|" + normalized
+    }
 
     /** 一小时窗口内的通知预算；超出就只留会话卡，不再响人。 */
     private fun takeNotifyBudget(): Boolean = synchronized(notifyWindow) {

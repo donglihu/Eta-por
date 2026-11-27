@@ -6,9 +6,25 @@ import androidx.room.Database
 import androidx.room.Room
 import androidx.room.RoomDatabase
 import androidx.room.migration.Migration
+import androidx.sqlite.db.SupportSQLiteDatabase
+import androidx.sqlite.db.SupportSQLiteOpenHelper
+import androidx.sqlite.db.framework.FrameworkSQLiteOpenHelperFactory
+import java.io.File
 
 /** 结构版本的唯一来源：@Database 与自检页共用，文案里不再写字面量。 */
 internal const val ETA_DB_SCHEMA_VERSION = 36
+
+/**
+ * 隔离动作本身失败时的可观测出口。
+ *
+ * 触发条件：磁盘满、目录只读、权限不足——文件搬不走，但也不能让 App 带着一个
+ * 打不开的库静默崩溃。日志里已写明原因，再把这条异常交给调用方，调用方拿到的是
+ * 「隔离没做成」这个明确事实，而不是 Room 抛出的、与真实原因无关的 IllegalStateException。
+ */
+internal class EtaDatabaseQuarantineException(
+    message: String,
+    cause: Throwable? = null,
+) : IllegalStateException(message, cause)
 
 @Database(
     entities = [
@@ -52,11 +68,27 @@ internal abstract class EtaDatabase : RoomDatabase() {
 
         fun get(context: Context): EtaDatabase =
             instance ?: synchronized(this) {
-                instance ?: Room.databaseBuilder(
-                    context.applicationContext,
-                    EtaDatabase::class.java,
-                    "eta.db",
-                )
+                instance ?: run {
+                    val appContext = context.applicationContext
+                    // 隔离必须先于任何一次打开：一旦 Room 打开并判定无迁移路径，
+                    // 用户数据就已经被 DROP 掉了，再改名只剩空壳。
+                    // 隔离动作自身失败（磁盘满/目录只读/权限不足）时只记日志不阻断：
+                    // 隔离是「保数据」的加分项，不能反过来变成启动崩溃的原因。
+                    runQuarantineForStartup {
+                        quarantineIfUnmigratable(appContext)
+                    }
+                    Room.databaseBuilder(
+                        appContext,
+                        EtaDatabase::class.java,
+                        "eta.db",
+                    )
+                    // 上面的启动前判定只按「文件头 + 探针」猜可迁移性，猜错有两种方向：
+                    // 猜成「不可迁移」会误搬完好库（见 quarantineIfUnmigratable 的探针兜底），
+                    // 猜成「可迁移」会让 Room 在首次打开时抛 IllegalStateException 打崩启动。
+                    // 后者由这个工厂在真正打开的那一刻兜住：无迁移路径 → 隔离原库 → 重建空库。
+                    .openHelperFactory(
+                        quarantineOnOpenFailureFactory(appContext.getDatabasePath("eta.db")),
+                    )
                     .addMigrations(
                         MIGRATION_6_7,
                         MIGRATION_7_8,
@@ -93,10 +125,490 @@ internal abstract class EtaDatabase : RoomDatabase() {
                         override fun onCreate(db: androidx.sqlite.db.SupportSQLiteDatabase) { createTextChunkCleanup(db) }
                         override fun onOpen(db: androidx.sqlite.db.SupportSQLiteDatabase) { createTextChunkCleanup(db) }
                     })
-                    .fallbackToDestructiveMigration(dropAllTables = true)
                     .build()
                     .also { instance = it }
+                }
             }
+
+        /**
+         * 启动路径上的隔离兜底：隔离失败只留下可见日志，不把异常抛给启动方。
+         *
+         * [quarantineIfUnmigratable] 在文件搬不走时会抛 [EtaDatabaseQuarantineException]，
+         * 那是「隔离没做成」的明确事实，不是启动必须失败的理由——`EtaApp.onCreate` 的
+         * `guard("agentTaskRecover")` 只记日志，之后的 ProviderRepository.init、AgentAppState
+         * 等 UI 路径照样会再调 [get]，异常从 [get] 里冒出去只会把启动打崩。
+         *
+         * 只吞隔离异常本身：其它异常（OOM、SecurityException 等）照原样上抛，
+         * 不用一个宽口径 catch 把真实缺陷一起藏起来。
+         */
+        @VisibleForTesting
+        internal fun runQuarantineForStartup(quarantine: () -> Unit) {
+            try {
+                quarantine()
+            } catch (error: EtaDatabaseQuarantineException) {
+                // 文案必须与实现一致：这里既没有只读打开，也没有新建兜底——原库原样交给
+                // Room，无迁移路径时照样抛 IllegalStateException。真正的「隔离 + 重建空库」
+                // 兜底在首次打开处（见 [withRoomOpenFallback]），不在这里。写成「以只读/
+                // 新建方式打开」会把排查方向带到一条不存在的兜底上。
+                emitQuarantineLog(
+                    "启动前隔离未完成，数据库仍按原样打开（可能因无迁移路径而失败）：" +
+                        (error.message ?: error.javaClass.simpleName),
+                    error = true,
+                )
+            }
+        }
+
+        /**
+         * 打开数据库之前，先处理「没有迁移路径」的两种情况。
+         *
+         * 早先这里挂了 `fallbackToDestructiveMigration(dropAllTables = true)`：
+         * 老库（v1～v5，迁移链从 6→7 才开始）或无迁移的降级安装，会被 Room 直接 DROP 掉
+         * 全部表——会话、消息、model_providers（含明文 api_key）、MCP 配置、token 统计全没，
+         * 而且 release 包不抛异常、UI 无任何提示（2026-11-26 审核）。
+         *
+         * 现在改成「隔离而非销毁」：把库连同 -wal/-shm/-journal 改名成
+         * `eta.db.broken-<ts>` 留在原地，再让 Room 建新库。用户可以自己把文件捞出来导出，
+         * 数据不会在用户不知情的情况下消失。
+         *
+         * 版本号先从 SQLite 文件头读（偏移 60，大端 4 字节），不必先打开库：
+         * 打开就意味着已经错过隔离时机；只有 -wal 非空、头部可能陈旧时才退化成
+         * 只读打开读真实版本（见纯文件版本）。
+         */
+        @VisibleForTesting
+        internal fun quarantineIfUnmigratable(context: Context): File? =
+            quarantineIfUnmigratable(context.getDatabasePath("eta.db"))
+
+        /**
+         * 隔离判定的纯文件版本：不碰 Context，可直接用纯 JVM 单测覆盖。
+         *
+         * 版本号优先从 SQLite 文件头读（偏移 60，大端 4 字节），不必先打开库：
+         * 打开就意味着已经错过隔离时机。但 WAL 模式下文件头可能是陈旧的（见下方
+         * hasPendingWal 分支），此时才退化成只读打开读真实 user_version。
+         */
+        @VisibleForTesting
+        internal fun quarantineIfUnmigratable(
+            file: File,
+            walVersionProbe: (File) -> Int = ::readUserVersionByOpening,
+            walRescueProbe: (File) -> Int = ::readUserVersionBySnapshot,
+        ): File? {
+            val key = canonicalKey(file)
+            synchronized(quarantineLock) {
+                // 幂等：本进程已隔离过这个路径，直接返回同一个 broken 文件。
+                // 既不再复制第二份，也不返回 null 让调用方误判「库没事」。
+                quarantined[key]?.let { return it }
+                if (!file.exists() || !file.isFile) return null
+                // 长度为 0 是首次启动的空占位，Room 会自己初始化；不把「第一次启动」误判成灾难。
+                if (file.length() == 0L) return null
+                val headerVersion = readUserVersion(file)
+                // 读不出版本（magic 不匹配 / 头部截断 / 读失败）不再「交给 Room 自己报」：
+                // Room 构建会抛 IllegalStateException 把启动路径打崩，用户没有恢复入口。
+                // 这类库与「版本不可迁移」同等处理——隔离，然后建空库。
+                val version = when {
+                    headerVersion < 0 -> UNKNOWN_SCHEMA_VERSION
+                    headerVersion == 0 -> UNKNOWN_SCHEMA_VERSION
+                    isMigratableVersion(headerVersion) -> return null
+                    hasPendingWal(file) -> {
+                        val probed = walVersionProbe(file)
+                        if (probed <= 0) {
+                            // 探针读不出 ≠ 库坏了：-shm 拿不到写权限、库被别的进程独占、目录只读，
+                            // 都会让常规只读打开必返 -1，而库可能完全完好。把「读不出」直接当成
+                            // 「不可迁移」再搬走文件，用户下次启动看到的就是空库，原库已经不在原位。
+                            // 所以先做一次 WAL 感知的快照读取：能读出真实版本就按真实版本判定。
+                            val rescued = walRescueProbe(file)
+                            if (rescued > 0 && isMigratableVersion(rescued)) {
+                                emitQuarantineLog(
+                                    "WAL 版本探测失败（header=$headerVersion），快照只读读出真实版本 " +
+                                        "$rescued 可迁移；不隔离，也不留副本",
+                                    error = false,
+                                )
+                                return null
+                            }
+                            if (rescued > 0) {
+                                // 快照读出的真实版本确实不可迁移：这才是该隔离的情况，按它判定。
+                                rescued
+                            } else {
+                                // 连快照都读不出：既证明不了可迁移，也证明不了不可迁移。
+                                // 不搬走原库，先留一份完整副本（主库 + -wal/-shm）保底，再放行让
+                                // Room 自己试；Room 打不开时由首次打开兜底隔离（副本仍在）。
+                                val copy = copyForProbeFailure(file)
+                                emitQuarantineLog(
+                                    "WAL 版本探测失败（header=$headerVersion）；已留副本 " +
+                                        "${copy?.name ?: "<复制失败，无副本>"}，仍尝试打开原库",
+                                    error = true,
+                                )
+                                return null
+                            }
+                        } else if (isMigratableVersion(probed)) {
+                            return null
+                        } else {
+                            probed
+                        }
+                    }
+                    else -> headerVersion
+                }
+                val reason = when {
+                    version == UNKNOWN_SCHEMA_VERSION ->
+                        "无法判定 schema 版本（文件头不是 SQLite、已截断或读取失败，header=$headerVersion）"
+                    version < MIN_MIGRATABLE_VERSION ->
+                        "schema $version 低于迁移链起点 $MIN_MIGRATABLE_VERSION"
+                    else ->
+                        "schema $version 高于当前 $ETA_DB_SCHEMA_VERSION（降级安装）"
+                }
+                return moveToBroken(file, key, reason)
+            }
+        }
+
+        /**
+         * 把主库连同 `-wal`/`-shm`/`-journal` 一起改名成 `eta.db.broken-<ts>`。
+         *
+         * 抽出来是因为有两条调用路径：[quarantineIfUnmigratable] 的版本判定分支，以及
+         * Room 首次打开失败后的兜底。两条都必须做到同一件事——sidecar 跟着走，否则残留的
+         * `-wal` 会被新库当成自己的日志，直接损坏新库。
+         */
+        private fun moveToBroken(file: File, key: String, reason: String): File {
+            val parent = file.parentFile
+                ?: throw quarantineFailure(file, "$reason；库文件没有父目录，无法改名")
+            val broken = uniqueBrokenTarget(file, parent)
+            if (!moveFile(file, broken)) {
+                throw quarantineFailure(file, "$reason；改名到 ${broken.name} 失败（磁盘满/权限/目录只读）")
+            }
+            val sidecarFailures = mutableListOf<String>()
+            listOf("-wal", "-shm", "-journal").forEach { suffix ->
+                val sidecar = File(parent, file.name + suffix)
+                if (!sidecar.exists()) return@forEach
+                if (!moveFile(sidecar, File(broken.path + suffix))) sidecarFailures += suffix
+            }
+            if (sidecarFailures.isNotEmpty()) {
+                // 残留的 -wal 会被新库当成自己的日志，直接损坏新库，所以必须失败可见。
+                throw quarantineFailure(
+                    file,
+                    "$reason；主库已隔离为 ${broken.name}，但日志文件移动失败：${sidecarFailures.joinToString()}",
+                )
+            }
+            quarantined[key] = broken
+            emitQuarantineLog(
+                "$reason，原库已隔离为 ${broken.name}，将新建空库",
+                error = false,
+            )
+            return broken
+        }
+
+        /** 读不出版本时的哨兵值：与「版本号不可迁移」走同一条隔离路径。 */
+        @VisibleForTesting
+        internal const val UNKNOWN_SCHEMA_VERSION = -1
+
+        /** 同进程隔离锁：幂等判定、缓存写入、文件改名必须在同一临界区里。 */
+        private val quarantineLock = Any()
+
+        /** 已隔离：原库 canonical 路径 → broken 文件。 */
+        private val quarantined = HashMap<String, File>()
+
+        /**
+         * 单测注入的日志出口。
+         *
+         * 纯 JVM 单测里 android.jar 是 stub，任何 android.util.Log 调用都抛 RuntimeException("Stub!")，
+         * 所以日志必须可替换，不能让它把隔离这件事本身变成异常。
+         */
+        @VisibleForTesting
+        internal var quarantineLogSink: ((String) -> Unit)? = null
+
+        private fun canonicalKey(file: File): String =
+            runCatching { file.canonicalPath }.getOrDefault(file.absolutePath)
+
+        /** 同秒内多次隔离（时钟回拨、跨进程）不能互相覆盖：撞名就加序号。 */
+        private fun uniqueBrokenTarget(file: File, parent: File): File =
+            uniqueSuffixTarget(file, parent, ".broken-")
+
+        /** [uniqueBrokenTarget] 的通用版：`.broken-` 与 `.probefail-` 共用同一套撞名规则。 */
+        private fun uniqueSuffixTarget(file: File, parent: File, marker: String): File {
+            val stamp = java.text.SimpleDateFormat("yyyyMMdd-HHmmss", java.util.Locale.US)
+                .format(java.util.Date())
+            var candidate = File(parent, file.name + marker + stamp)
+            var index = 2
+            while (candidate.exists()) {
+                candidate = File(parent, file.name + marker + stamp + "-" + index)
+                index++
+            }
+            return candidate
+        }
+
+        /**
+         * 先试 rename（同目录、原子、零拷贝），失败再退化成复制+删除。
+         * 任一步失败都把半成品目标清掉，不留一个看起来像备份的空壳。
+         */
+        private fun moveFile(source: File, target: File): Boolean {
+            if (runCatching { source.renameTo(target) }.getOrDefault(false)) return true
+            if (!runCatching { source.copyTo(target, overwrite = true) }.isSuccess) {
+                runCatching { target.delete() }
+                return false
+            }
+            if (!source.delete()) {
+                runCatching { target.delete() }
+                return false
+            }
+            return true
+        }
+
+        private fun quarantineFailure(file: File, detail: String): EtaDatabaseQuarantineException {
+            val message = "eta.db 隔离失败（${file.path}）：$detail"
+            emitQuarantineLog(message, error = true)
+            return EtaDatabaseQuarantineException(message)
+        }
+
+        private fun emitQuarantineLog(message: String, error: Boolean) {
+            val sink = quarantineLogSink
+            if (sink != null) {
+                runCatching { sink(message) }
+                return
+            }
+            runCatching {
+                if (error) {
+                    io.github.mangi.eta.core.AndroidAgentLogger.error(message)
+                } else {
+                    io.github.mangi.eta.core.AndroidAgentLogger.warn(message)
+                }
+            }
+        }
+
+        /** 读 SQLite 文件头的 user_version（偏移 60，大端 int）。读不出返回 -1。 */
+        private fun readUserVersion(file: File): Int = runCatching {
+            java.io.RandomAccessFile(file, "r").use { raf ->
+                if (raf.length() < 100) return@use -1
+                val magic = ByteArray(16)
+                raf.readFully(magic)
+                if (String(magic, Charsets.US_ASCII) != "SQLite format 3\u0000") return@use -1
+                // user_version 是 SQLite 头部大端 4 字节；RandomAccessFile.readInt() 本身即大端，
+                // 再反一次会把 36 读成 604241920。
+                raf.seek(60L)
+                raf.readInt()
+            }
+        }.getOrDefault(-1)
+
+        /** 版本号落在迁移链覆盖区间内，就不该隔离。 */
+        private fun isMigratableVersion(version: Int): Boolean =
+            version >= MIN_MIGRATABLE_VERSION && version <= ETA_DB_SCHEMA_VERSION
+
+        /**
+         * 常规探针失败后的第二次尝试：把主库 + `-wal`/`-shm` 快照到临时目录再只读打开。
+         *
+         * 为什么不直接用 `immutable=1` 读原路径：immutable 会**忽略 `-wal`**，读到的是陈旧的
+         * 文件头版本。实测（sqlite3 3.46.1）一个头 v5、WAL 里已提交 v36 的库，`immutable=1`
+         * 读到 5 且数据 0 行，`mode=ro` 读到 36 且数据 1 行。用 immutable 判可迁移性，正好会
+         * 把完好的库判成不可迁移。
+         *
+         * 快照方案绕开的正是常规探针失败的两个原因：原路径的 `-shm` 拿不到写权限、原库被别的
+         * 进程独占。副本在临时目录里，`-wal`/`-shm` 齐全且可写，读到的就是真实版本。
+         *
+         * 读不出返回 [UNKNOWN_SCHEMA_VERSION]。
+         */
+        private fun readUserVersionBySnapshot(file: File): Int {
+            val parent = file.parentFile ?: return UNKNOWN_SCHEMA_VERSION
+            val snapshotDir = runCatching {
+                java.nio.file.Files.createTempDirectory("eta-db-walprobe").toFile()
+            }.getOrElse { error ->
+                emitQuarantineLog(
+                    "WAL 快照目录创建失败（${error.javaClass.simpleName}），跳过快照探测",
+                    error = true,
+                )
+                return UNKNOWN_SCHEMA_VERSION
+            }
+            try {
+                val snapshot = File(snapshotDir, file.name)
+                // 主库与 sidecar 都要拷：只拷主库会读到陈旧头，正是 immutable 的错。
+                runCatching { file.copyTo(snapshot, overwrite = true) }
+                    .getOrElse { error ->
+                        emitQuarantineLog(
+                            "WAL 快照复制失败（${error.javaClass.simpleName}），跳过快照探测",
+                            error = true,
+                        )
+                        return UNKNOWN_SCHEMA_VERSION
+                    }
+                listOf("-wal", "-shm").forEach { suffix ->
+                    val sidecar = File(parent, file.name + suffix)
+                    if (sidecar.isFile) {
+                        runCatching { sidecar.copyTo(File(snapshotDir, snapshot.name + suffix), overwrite = true) }
+                    }
+                }
+                return readUserVersionByOpening(snapshot)
+            } finally {
+                runCatching { snapshotDir.deleteRecursively() }
+            }
+        }
+
+        /**
+         * 探针彻底失败时的保底：留一份完整副本，名字带 `.probefail-<ts>`。
+         *
+         * 只复制不移动：原库留在原位，Room 照常尝试打开。副本是给用户捞数据用的保底——
+         * 真打不开时，首次打开兜底会把原库隔离成 `.broken-`，副本则保证「探针读不出的那一刻
+         * 到底长什么样」也被留存下来。
+         *
+         * 返回真实生成的副本文件；复制失败返回 null（调用方把 null 写进日志，不假装成功）。
+         */
+        private fun copyForProbeFailure(file: File): File? {
+            val parent = file.parentFile ?: return null
+            val target = uniqueSuffixTarget(file, parent, ".probefail-")
+            val copied = runCatching { file.copyTo(target, overwrite = true) }.isSuccess
+            if (!copied) {
+                runCatching { target.delete() }
+                return null
+            }
+            listOf("-wal", "-shm").forEach { suffix ->
+                val sidecar = File(parent, file.name + suffix)
+                if (sidecar.isFile) {
+                    runCatching { sidecar.copyTo(File(parent, target.name + suffix), overwrite = true) }
+                }
+            }
+            return target
+        }
+
+        /**
+         * Room 首次打开失败的兜底：无迁移路径时隔离原库并重建空库。
+         *
+         * 位置选择的依据（对 Room 2.8.5 反编译确认）：`databaseBuilder().build()` 本身不打开
+         * 数据库，连接在首次 query 时由 `SupportSQLiteDriver.open()` →
+         * `SupportSQLiteOpenHelper.getWritableDatabase()` 触发，而
+         * `getWritableDatabase()` 会抛 `IllegalStateException`
+         * （"A migration from N was required but not found..."）。所以在
+         * `openHelperFactory` 上包一层，正好罩住「真正打开」的那一次调用。
+         *
+         * 隔离只在第一次失败时做一次：重建的空库再次失败（磁盘满、目录只读）时不再搬文件，
+         * 直接把原异常抛出去——那时再搬也救不了启动，藏起来只会掩盖真实原因。
+         */
+        @VisibleForTesting
+        internal fun quarantineOnOpenFailureFactory(
+            dbFile: File,
+            delegate: SupportSQLiteOpenHelper.Factory = FrameworkSQLiteOpenHelperFactory(),
+        ): SupportSQLiteOpenHelper.Factory = object : SupportSQLiteOpenHelper.Factory {
+            override fun create(
+                configuration: SupportSQLiteOpenHelper.Configuration,
+            ): SupportSQLiteOpenHelper = wrapOpenHelper(dbFile, delegate.create(configuration))
+        }
+
+        /**
+         * 把兜底套在真实 helper 上。
+         *
+         * 单独抽出来是为了能被纯 JVM 单测直接驱动：`Configuration` 需要 `Context`，纯 JVM 里
+         * android.jar 是 stub，构造不出来。直接传 helper 就绕开了这层，接线的验证不再依赖
+         * Robolectric（aarch64 上会被静默跳过）。
+         */
+        @VisibleForTesting
+        internal fun wrapOpenHelper(
+            dbFile: File,
+            helper: SupportSQLiteOpenHelper,
+        ): SupportSQLiteOpenHelper = object : SupportSQLiteOpenHelper {
+            override val databaseName: String? get() = helper.databaseName
+            override fun setWriteAheadLoggingEnabled(enabled: Boolean) =
+                helper.setWriteAheadLoggingEnabled(enabled)
+
+            override val writableDatabase: SupportSQLiteDatabase
+                get() = openOrQuarantine(dbFile) { helper.writableDatabase }
+
+            override val readableDatabase: SupportSQLiteDatabase
+                get() = openOrQuarantine(dbFile) { helper.readableDatabase }
+
+            override fun close() = helper.close()
+        }
+
+        /**
+         * 跑一次真实的打开动作；只接 `IllegalStateException` 这一种。
+         *
+         * 只接这一种是有意的：磁盘满、权限不足抛的是 `SQLiteException`，那些不是「无迁移路径」，
+         * 搬走库既救不了启动也会误导排查方向。接住 `IllegalStateException` 后隔离 + 重开一次
+         * 空库；重开仍失败就把新异常抛出去，不静默。
+         */
+        @VisibleForTesting
+        internal fun <T> openOrQuarantine(dbFile: File, open: () -> T): T {
+            return try {
+                open()
+            } catch (error: IllegalStateException) {
+                val key = canonicalKey(dbFile)
+                val alreadyQuarantined = synchronized(quarantineLock) { quarantined.containsKey(key) }
+                if (alreadyQuarantined) throw error
+                val broken = try {
+                    synchronized(quarantineLock) {
+                        if (!dbFile.isFile) {
+                            // 库文件已经不在原位：没有可隔离的东西，原异常照抛。
+                            throw error
+                        }
+                        moveToBroken(
+                            dbFile,
+                            key,
+                            "Room 打开失败（${error.message ?: error.javaClass.simpleName}）",
+                        )
+                    }
+                } catch (quarantineError: EtaDatabaseQuarantineException) {
+                    emitQuarantineLog(
+                        "Room 打开失败后隔离未完成，异常继续上抛：" +
+                            (quarantineError.message ?: quarantineError.javaClass.simpleName),
+                        error = true,
+                    )
+                    throw error
+                }
+                emitQuarantineLog(
+                    "Room 打开失败，已隔离为 ${broken.name} 并重建空库",
+                    error = false,
+                )
+                // 隔离后原路径已让开，这一次打开建的是新空库；再失败就把异常交出去。
+                open()
+            }
+        }
+
+        /**
+         * `<db>-wal` 存在且有内容，说明可能有未 checkpoint 的提交。
+         *
+         * 只判「存在且 > 0 字节」：不解析 WAL 帧格式。帧解析要跟着 SQLite 的
+         * checksum 与 salt 规则走，写错会把真实版本读成垃圾值，比多开一次库风险更大。
+         */
+        private fun hasPendingWal(file: File): Boolean {
+            val parent = file.parentFile ?: return false
+            val wal = File(parent, file.name + "-wal")
+            return wal.isFile && wal.length() > 0L
+        }
+
+        /**
+         * 只读打开数据库读真实 user_version（WAL 里已提交的版本以这里为准）。
+         *
+         * 返回 -1 表示读不出来：文件不是库、被别的进程独占、纯 JVM 单测里 android.jar 是
+         * stub（任何 android.database 调用抛 RuntimeException("Stub!")），或者 WAL 库在
+         * 只读目录下拿不到 -shm 写权限。调用方按「读不出来就保守隔离」处理：
+         * 没有 destructive fallback 兜底，放行等于让 Room 抛异常打崩启动路径。
+         */
+        private fun readUserVersionByOpening(file: File): Int {
+            return try {
+                val database = android.database.sqlite.SQLiteDatabase.openDatabase(
+                    file.absolutePath,
+                    null,
+                    android.database.sqlite.SQLiteDatabase.OPEN_READONLY,
+                )
+                try {
+                    database.rawQuery("PRAGMA user_version", null).use { cursor ->
+                        if (cursor.moveToFirst()) cursor.getInt(0) else -1
+                    }
+                } finally {
+                    database.close()
+                }
+            } catch (e: RuntimeException) {
+                // SQLiteException 是 RuntimeException 子类，这里一并接住：库被独占、不是 SQLite、
+                // 只读目录拿不到 -shm 写权限、以及纯 JVM 单测里 android.jar 是 stub 抛的
+                // RuntimeException("Stub!") 都落这里。只降级成「读不出」，不上抛。
+                // 降级本身是可见的：这里留一条节流日志，调用方据此走「保守隔离」分支。
+                runCatching {
+                    io.github.mangi.eta.core.AndroidAgentLogger.warnThrottled(
+                        key = "db-wal-version-probe-failed",
+                    ) { "WAL 版本探测失败（${e.javaClass.simpleName}: ${e.message}），按保守隔离处理" }
+                }
+                -1
+            }
+        }
+
+        /**
+         * 迁移链的最低起点：第一条迁移是 6→7。
+         *
+         * 比它还老的库（v1～v5）今天没有补齐迁移的路径，只能隔离——但这个常量是「隔离判据」，
+         * 不是「允许删数据」的许可：将来补上 1→6 迁移时把它改成 1 即可。
+         */
+        @VisibleForTesting
+        internal const val MIN_MIGRATABLE_VERSION = 6
 
         @VisibleForTesting
         internal fun closeForTests() {

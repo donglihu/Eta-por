@@ -440,6 +440,9 @@ internal class SubagentExecutor(
                 operationId = "${toolCall.id}-$subagentId",
                 toolFilter = profile::filterTools,
                 planToolsEnabled = false,
+                // 子代理工具少，且目录要再按 profile 裁剪；按组 hold 会先摘掉 schema，
+                // 让 profile 白名单作用在一个只剩两个入口的目录上。
+                toolGroupLoading = false,
                 onEvent = { childEvent ->
                     if (abortCode == null) {
                         when (childEvent) {

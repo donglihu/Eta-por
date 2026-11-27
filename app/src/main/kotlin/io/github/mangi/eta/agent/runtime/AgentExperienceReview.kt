@@ -151,6 +151,8 @@ internal object AgentExperienceReview {
                             memoryContext = memoryContext,
                             restrictedToolNames = names,
                             planToolsEnabled = false,
+                            // 复盘的白名单只有记忆与技能写入，按组 hold 会把目录摘得只剩入口。
+                            toolGroupLoading = false,
                             toolExecutor = AgentModelClient.ToolExecutor { call ->
                                 checkCurrent()
                                 // 复盘走的是同一条执行链，逐工具开关同样生效：复盘只允许写记忆/技能，

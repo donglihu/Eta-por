@@ -311,6 +311,17 @@ class AgentLiveActionReceiver : BroadcastReceiver() {
 internal object AgentLiveCoordinator {
     private var store: AgentControlStore? = null
 
+    /**
+     * 接管结束通知用的作用域。
+     *
+     * 早先每次 endTakeover 都新建一个 CoroutineScope 且不持有引用，
+     * 既无法取消也无法在测试里等待（2026-11-26 审核）。
+     * 这里用一个进程级作用域，IO 派发，元素之间互不阻塞。
+     */
+    private val takeoverScope = kotlinx.coroutines.CoroutineScope(
+        kotlinx.coroutines.SupervisorJob() + kotlinx.coroutines.Dispatchers.IO,
+    )
+
     private var runControlConsumer: ((io.github.mangi.eta.agent.runtime.RunControlState) -> Unit)? = null
 
     fun attach(store: AgentControlStore) {
@@ -433,7 +444,9 @@ internal object AgentLiveCoordinator {
         val app = context.applicationContext
         val notice = "【人工接管结束】用户刚在灵屏里手动操作过，页面状态可能已变化。" +
             "请先 observe_screen 重新读屏，再决定下一步，不要沿用接管前的页面记忆。"
-        kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
+        // 用本类自带的作用域：每次 endTakeover 新建 CoroutineScope 且无取消句柄，
+        // 内层 runCatching 结构一变就会漏掉未捕获异常（2026-11-26 审核）。
+        takeoverScope.launch {
             runCatching { io.github.mangi.eta.agent.display.VirtualScreenSession.observeForViewer(app) }
             // 灵屏可能正被某个子智能体占着。这种情况下消息必须投给它：父 Agent 收到也改变不了
             // 正在跑的子循环，等于没说。没有子智能体占用时，才回退到父运行。

@@ -516,11 +516,13 @@ internal object VirtualScreenFloatWindow {
         dashboardJob = null
         dashboardView = null
         dashboardExpanded.value = false
+        // 先摘回调再置空：早先是 rootView = null 之后才 removeCallbacks(...)，
+        // 那时变量已经是 null，等于空操作，回调留在旧 View 上（2026-11-26 审核）。
+        rootView?.removeCallbacks(pendingTakeover)
         rootView = null; surfaceView = null; triggerBar = null; lp = null; dotsButton = null
         info = null; lastFrameId = 0; collapsed = false; frameAspect = 0f
         stopTouchPump()
         stopTiltWatcher()
-        rootView?.removeCallbacks(pendingTakeover)
         // 浮窗退场：释放观看档。接管页在前台时会自己持有接管档，互不覆盖。
         VirtualScreenSession.setWatchProfile("float", null)
     }

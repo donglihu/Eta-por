@@ -51,6 +51,15 @@ internal abstract class BackupHandle(val name: String) {
 
     /** 整包结构校验：普通文件走文件版，SAF 走 Uri 版。 */
     abstract fun verifyFullBackup(context: Context): EtaFullBackupArchive.EtaFullBackupCheck
+
+    /**
+     * 改名之前把已写入的字节真正落盘。
+     *
+     * 不落盘就直接 rename 的后果：断电/进程被杀时目录项换成了新名字，但数据块还没刷到
+     * 存储，得到一个「名字对、内容截断」的包（2026-11-26 审核）。
+     * 默认实现返回 true；个别落点无法 sync 时按「尽力而为」处理，不阻断备份。
+     */
+    open fun syncBeforeRename(): Boolean = true
 }
 
 /** 普通文件目录落点（应用专属目录、确实可写的外部目录）。 */
@@ -73,6 +82,12 @@ internal class FileBackupStorage(val dir: File) : BackupStorage {
                 runCatching { file.outputStream() }.getOrNull()
 
             override fun delete(): Boolean = !file.exists() || file.delete()
+
+            /** 打开一次只读句柄把数据刷到存储（fsync 需要可写句柄，这里用 rw）。 */
+            override fun syncBeforeRename(): Boolean = runCatching {
+                java.io.RandomAccessFile(file, "rw").use { it.fd.sync() }
+                true
+            }.getOrDefault(false)
 
             override fun renameTo(newName: String): Boolean {
                 val target = File(dir, newName)
@@ -216,6 +231,14 @@ internal class SafBackupStorage(
 
         override fun verifyFullBackup(context: Context): EtaFullBackupArchive.EtaFullBackupCheck =
             EtaFullBackupArchive.verify(context, documentUri)
+
+        /** SAF 落点：借 FileDescriptor.sync 把已写字节落盘，再交给 rename。 */
+        override fun syncBeforeRename(): Boolean = runCatching {
+            resolver.openFileDescriptor(documentUri, "rw")?.use { pfd ->
+                pfd.fileDescriptor.sync()
+            }
+            true
+        }.getOrDefault(false)
     }
 
     private companion object {

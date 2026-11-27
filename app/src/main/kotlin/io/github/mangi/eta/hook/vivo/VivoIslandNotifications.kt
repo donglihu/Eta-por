@@ -68,6 +68,21 @@ internal class VivoIslandNotifications(
         )
     }
 
+    // 接收器不注销：本实例是 Xposed 注入进程里的常驻单例，进程结束即随进程回收。
+    //
+    // 为什么没有 unregisterReceiver：
+    // - 唯一创建点在 VivoHooks.kt:73，来自拦截 com.vivo.ai.copilot.CopilotApp.onCreate，
+    //   Application.onCreate 每个进程只跑一次；VivoHooks 是 object，islandNotifications 是
+    //   @Volatile 字段，赋值即终态，不存在「重建实例」的正常路径；
+    // - ModuleMain 只在 onPackageReady 里调一次 VivoHooks.install，且未实现
+    //   onHotReloading / onHotReloaded，hookHandles 也没有 unhook 路径（见 ModuleMain.kt:28 注释
+    //   「当前未启用热重载」），所以没有「卸载钩子时顺手注销」的时机；
+    // - 注册用的是 context.applicationContext（不是 Activity），进程活着期间它就是合法上下文。
+    //
+    // 2026-11-26 审核曾据此新增 release()，但全仓零调用，属死代码，已删除；
+    // 真要卸载请走「进程退出」，不要在 hook 里手工注销——多实例竞争时反而会让
+    // 通知点击落到已失效的会话上。
+
     fun start(
         runId: String,
         conversationKey: String,

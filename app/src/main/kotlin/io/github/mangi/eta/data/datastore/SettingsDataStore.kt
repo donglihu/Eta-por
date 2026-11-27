@@ -25,10 +25,15 @@ import io.github.mangi.eta.data.model.WebToolsSettings
 import kotlinx.serialization.json.Json
 import io.github.mangi.eta.data.model.Settings
 import java.io.IOException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.launch
 
 internal object SettingsDataStore {
     private val SPEECH_SETTINGS = stringPreferencesKey("speech_settings_v1")
@@ -194,9 +199,24 @@ internal object SettingsDataStore {
     @Volatile
     private var toolReviewModeCache: String = "standard"
 
+    /**
+     * 灵屏开关的进程内缓存。
+     *
+     * 事件热路径（每个 ToolStarted、每个 overlay 事件）都要判这一个布尔值，早先每判一次就
+     * `runBlocking { settings() }` 读一遍 DataStore：I/O 抖动会直接拖慢事件链，异常还会
+     * 打断事件处理（2026-11-26 审核）。与工具审查档位同一口径：设置流发射时同步进来，
+     * 运行期只读内存。
+     */
+    @Volatile
+    private var virtualScreenEnabledCache: Boolean = false
+
     /** 应用上下文：仅用于解析应用专属目录，避免在无 Context 的调用点猜路径。 */
     @Volatile
     private var appContext: Context? = null
+
+    /** 缓存预热订阅：进程内唯一一条，重复 init 不重复起。 */
+    @Volatile
+    private var warmupJob: Job? = null
 
     fun cachedAutoBackupDirectory(): String = autoBackupDirectoryCache
 
@@ -210,10 +230,37 @@ internal object SettingsDataStore {
      */
     fun cachedToolReviewMode(): String = toolReviewModeCache
 
+    /**
+     * 灵屏开关的同步读取入口：事件流在热路径上判它，不能每次挂起读盘。
+     *
+     * 缺省 false 与 `Settings.virtualScreenEnabled` 的缺省值一致，不会因为「还没读到」
+     * 就把界面切到灵屏。
+     */
+    fun cachedVirtualScreenEnabled(): Boolean = virtualScreenEnabledCache
+
     fun init(context: Context) {
         if (!::dataStore.isInitialized) {
             appContext = context.applicationContext
             dataStore = context.applicationContext.dataStore
+        }
+        startCacheWarmup()
+    }
+
+    /**
+     * 常驻预热进程内缓存。
+     *
+     * [cachedVirtualScreenEnabled] 这类同步读取入口必须在「还没有任何界面订阅设置流」时
+     * 也能拿到真实值。早先缓存只在有人 collect [settingsFlow] 时刷新，而灵屏判定发生在
+     * AgentRuntimeService 的事件热路径上——它可能先于任何设置页启动，缓存还是缺省 false，
+     * 灵屏就会被误判成关闭（2026-11-26 自查发现，本次修复引入的回归）。
+     *
+     * 这里在 init 阶段就起一条只读订阅，把缓存灌满并跟随变更；用独立作用域，
+     * 与任何界面生命周期无关。
+     */
+    private fun startCacheWarmup() {
+        if (warmupJob != null) return
+        warmupJob = CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
+            settingsFlow().collect { /* 缓存由 settingsFlow 的 map 段写入，这里只需保持订阅 */ }
         }
     }
 
@@ -237,6 +284,8 @@ internal object SettingsDataStore {
                     // 工具调用审查档位同样缓存到进程内：工具执行链同步读，不能每次都落盘。
                     toolReviewModeCache = io.github.mangi.eta.agent.tool.ToolReviewMode
                         .normalized(settings.toolReviewMode)
+                    // 灵屏开关也进缓存：事件热路径每来一个 ToolStarted 都要判，不能读盘。
+                    virtualScreenEnabledCache = settings.virtualScreenEnabled
                     // 预算滑杆值随设置一起同步到注入侧缓存，运行期读取零 IO。
                     io.github.mangi.eta.agent.memory.MemoryBudgetPolicy.apply(
                         settings.memoryCoreBudgetChars,

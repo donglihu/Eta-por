@@ -67,10 +67,17 @@ internal object PhoneOperation {
         return value
     }
 
+    /**
+     * 读取原始记录 ID。
+     *
+     * 同时接受数字与数字文本：工具契约声明的是 `text(...)`，但 list 类工具把 id 作为
+     * 数字输出时，模型会照抄返回体回填数字（`alarm_id: 7`），早先只接受文本就报
+     * 「alarm_id 必须是文本」——契约与生产者对不上，模型侧完全没有可用路径。
+     * 现在以文本为主、数字兼容，两边都能走通（2026-11-26 审核）。
+     */
     fun id(args: JSONObject, key: String): Long {
-        val value = text(args, key, true, 19)!!
-        if (!Regex("[0-9]{1,19}").matches(value)) error("INVALID_ARGUMENT", "$key 必须是原始记录 ID")
-        return value.toLongOrNull()?.takeIf { it > 0 }
+        if (!args.has(key)) error("INVALID_ARGUMENT", "缺少 $key")
+        return AlarmVerification.parseId(args.opt(key))
             ?: error("INVALID_ARGUMENT", "$key 必须是有效原始记录 ID")
     }
 

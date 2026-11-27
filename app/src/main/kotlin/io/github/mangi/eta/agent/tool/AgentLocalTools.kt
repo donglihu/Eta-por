@@ -18,6 +18,7 @@ import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.SystemClock
+import io.github.mangi.eta.agent.display.dashboard.ApprovalVerdictPolicy
 import io.github.mangi.eta.core.EtaTrace
 import io.github.mangi.eta.agent.browser.AgentBrowserSession
 import io.github.mangi.eta.agent.device.DeviceControlUnavailableException
@@ -334,30 +335,31 @@ internal class AgentLocalTools(
                         val outcome = io.github.mangi.eta.agent.display.dashboard.AgentConfirmGuard
                             .awaitVerdict(registered.token, isCancelled = isRunCancelled)
                         val reply = outcome?.reply
-                        if (outcome != null && reply.isNullOrBlank()) {
-                            // 有裁决但回灌为空：按阻塞超时 / 被取消处理。
-                            return@runCatching textResult(
-                                io.github.mangi.eta.agent.display.dashboard.AgentConfirmGuard.blockedResult(registered),
-                            )
-                        }
-                        if (outcome != null && outcome.rejected) {
-                            // 拒绝 / 手动接管：失败语义，明确告知不执行、不要重试。
-                            return@runCatching textResult(
-                                io.github.mangi.eta.agent.display.dashboard.AgentConfirmGuard
-                                    .verdictResult(reply.orEmpty(), registered, rejected = true),
-                            )
-                        }
-                        if (outcome != null) {
-                            // 批准：grant 窗口已写入（choose → grantFor），本次调用放行执行。
-                            // 不 return 裁决文本，继续向下走到真正的工具分发——原工具执行一次，
-                            // 结果直接回灌给模型；模型不需要（也不应）再次发起同一调用。
-                            // 后续主屏闸门的 inspect 会命中 grant 窗口而不再挂卡。
-                            approvalGranted = true
-                        } else {
-                            // 没有有效裁决（超时/取消）：以 NEED_CONFIRM 收尾。
-                            return@runCatching textResult(
-                                io.github.mangi.eta.agent.display.dashboard.AgentConfirmGuard.blockedResult(registered),
-                            )
+                        // 裁决 → 处置的映射只在 ApprovalVerdictPolicy 里定义一份：
+                        // 早先这里手写一套 if，另一个闸门又手写一套，口径一旦漂移就是 fail-open
+                        // （用户点「跳过」却执行了被拦工具，2026-11-26 审核 P0-2）。
+                        // REJECTED 分支结束在 return 里，结构上就不可能落到 approvalGranted = true。
+                        when (ApprovalVerdictPolicy.dispositionOf(outcome)) {
+                            ApprovalVerdictPolicy.Disposition.REJECTED ->
+                                // 拒绝 / 手动接管：失败语义，明确告知不执行、不要重试。
+                                return@runCatching textResult(
+                                    io.github.mangi.eta.agent.display.dashboard.AgentConfirmGuard
+                                        .verdictResult(reply.orEmpty(), registered, rejected = true),
+                                )
+
+                            ApprovalVerdictPolicy.Disposition.NO_VERDICT ->
+                                // 没有有效裁决（超时 / 取消 / 回灌为空）：以 NEED_CONFIRM 收尾。
+                                // 超时是否应改成 fail-closed 是另一条策略（H7），本次不动。
+                                return@runCatching textResult(
+                                    io.github.mangi.eta.agent.display.dashboard.AgentConfirmGuard.blockedResult(registered),
+                                )
+
+                            ApprovalVerdictPolicy.Disposition.EXECUTE ->
+                                // 批准：grant 窗口已写入（choose → grantFor），本次调用放行执行。
+                                // 不 return 裁决文本，继续向下走到真正的工具分发——原工具执行一次，
+                                // 结果直接回灌给模型；模型不需要（也不应）再次发起同一调用。
+                                // 后续主屏闸门的 inspect 会命中 grant 窗口而不再挂卡。
+                                approvalGranted = true
                         }
                     }
                 }
@@ -386,16 +388,19 @@ internal class AgentLocalTools(
                     // - 无有效裁决（超时 / 取消）：以 NEED_CONFIRM 收尾。
                     val outcome = guard.awaitVerdict(draft.token, isCancelled = isRunCancelled)
                     val reply = outcome?.reply
-                    if (outcome != null && reply.isNullOrBlank()) {
-                        return@runCatching textResult(guard.blockedResult(draft))
+                    // 与上面的审查档闸门共用同一张裁决表：REJECTED 必须在此收尾，
+                    // 不能因为"没走到 approvalGranted"就默认落到下面的 flow-through。
+                    when (ApprovalVerdictPolicy.dispositionOf(outcome)) {
+                        ApprovalVerdictPolicy.Disposition.REJECTED ->
+                            return@runCatching textResult(guard.verdictResult(reply.orEmpty(), draft, rejected = true))
+
+                        ApprovalVerdictPolicy.Disposition.NO_VERDICT ->
+                            return@runCatching textResult(guard.blockedResult(draft))
+
+                        ApprovalVerdictPolicy.Disposition.EXECUTE ->
+                            // 批准：flow-through 继续执行原工具。
+                            Unit
                     }
-                    if (outcome != null && outcome.rejected) {
-                        return@runCatching textResult(guard.verdictResult(reply.orEmpty(), draft, rejected = true))
-                    }
-                    if (outcome == null) {
-                        return@runCatching textResult(guard.blockedResult(draft))
-                    }
-                    // 批准：flow-through 继续执行原工具。
                 }
             }
             if (virtualRouting.usesPrimary && virtualSettings != null) {
@@ -1978,8 +1983,9 @@ internal class AgentLocalTools(
 
     /** 审批卡上显示的「这次要动什么」：命令类显示命令，其余显示路径。 */
     private fun reviewTarget(toolName: String, args: JSONObject): String = when (toolName) {
-        "terminal", "terminal_job", "terminal_daemon" -> args.optString("command").take(40)
-        else -> args.optString("path").take(40)
+        // 免批签名要用完整命令/路径：截断会让「前 N 字符相同」的不同操作共用一次批准。
+        "terminal", "terminal_job", "terminal_daemon" -> args.optString("command")
+        else -> args.optString("path")
     }
 
     private fun errorResult(code: String, message: String): String =

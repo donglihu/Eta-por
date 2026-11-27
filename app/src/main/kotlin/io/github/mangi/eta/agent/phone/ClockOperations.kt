@@ -93,7 +93,10 @@ internal class ClockOperations(
                     val mask = c.getInt(days)
                     add(
                         JSONObject()
-                            .put("alarm_id", c.getLong(ids))
+                            // id 统一按文本输出：工具入参契约是文本（`id("alarm_id")`），
+                            // 生产者给数字会让模型照抄后报「必须是文本」（2026-11-26 审核）。
+                            // 日历侧一直用 id.toString()，这里对齐。
+                            .put("alarm_id", c.getLong(ids).toString())
                             .put("hour", c.getInt(hours))
                             .put("minute", c.getInt(minutes))
                             .put("repeat_mask", mask)
@@ -130,9 +133,9 @@ internal class ClockOperations(
                 put("deleteAfterUse", 0)
                 applySchedule(this, mask, enabled = true, hour = hour, minute = minute)
             }
-        val created =
-            mutate { resolver.insert(DIR_URI, values) }
-                ?: PhoneOperation.error("CLOCK_UNAVAILABLE", "时钟未返回新闹钟记录")
+        // mutate 自身在 block 返回 null 时已经抛 CLOCK_UNAVAILABLE，这里不再重复兜底
+        // （原先的 `?: PhoneOperation.error(...)` 是永远走不到的死代码，2026-11-26 审核）。
+        val created = mutate { resolver.insert(DIR_URI, values) }
         val id =
             created.lastPathSegment?.toLongOrNull()
                 ?: PhoneOperation.error("CLOCK_UNAVAILABLE", "时钟未返回新闹钟 ID")
@@ -144,7 +147,7 @@ internal class ClockOperations(
                 after.optInt("repeat_mask") == mask &&
                 after.optBoolean("enabled")
         return PhoneOperation.changed("set_alarm", verified)
-            .put("alarm_id", id)
+            .put("alarm_id", id.toString())
             .put("alarm", after ?: JSONObject.NULL)
             .put("rescheduled", lastRescheduled)
     }
@@ -152,9 +155,13 @@ internal class ClockOperations(
     /** 改时 / 开关 / 删除：item URI 直写后回读确认。 */
     private fun change(tool: String, args: JSONObject): JSONObject {
         val id = PhoneOperation.id(args, "alarm_id")
-        val before =
-            alarms().firstOrNull { it.getLong("alarm_id") == id }
-                ?: PhoneOperation.error("ALARM_NOT_FOUND", "未找到指定闹钟")
+        // 「查不到」与「查不了」必须分开报：早先查询异常被兜成 null，直接报「未找到指定闹钟」，
+        // 用户会以为闹钟不存在，实际是 Provider 暂时读不出来（2026-11-26 审核）。
+        val before = when (val lookup = lookupAlarm(id)) {
+            is LookupResult.Found -> lookup.alarm
+            LookupResult.Gone -> PhoneOperation.error("ALARM_NOT_FOUND", "未找到指定闹钟")
+            LookupResult.Unknown -> PhoneOperation.error("CLOCK_UNAVAILABLE", "读取闹钟失败，本次未改动")
+        }
         val itemUri = ContentUris.withAppendedId(DIR_URI, id)
         var expectedHour = before.optInt("hour")
         var expectedMinute = before.optInt("minute")
@@ -184,24 +191,65 @@ internal class ClockOperations(
             }
             "delete_alarm" -> mutate { resolver.delete(itemUri, null, null) }
         }
-        val after = awaitAlarm { it.getLong("alarm_id") == id }
-        val verified =
-            when (tool) {
-                "delete_alarm" -> after == null
-                "update_alarm_time" ->
-                    after != null &&
-                        after.optInt("hour") == expectedHour &&
-                        after.optInt("minute") == expectedMinute
-                else -> after != null && after.optBoolean("enabled") == expectedEnabled
-            }
+        val after = lookupAlarm(id)
+        val found = (after as? LookupResult.Found)?.alarm
+        val verified = AlarmVerification.verified(
+            tool = tool,
+            lookup = when (after) {
+                is LookupResult.Found -> AlarmVerification.Lookup.Found(
+                    hour = found!!.optInt("hour"),
+                    minute = found.optInt("minute"),
+                    enabled = found.optBoolean("enabled"),
+                )
+                LookupResult.Gone -> AlarmVerification.Lookup.Gone
+                LookupResult.Unknown -> AlarmVerification.Lookup.Unknown
+            },
+            expectedHour = expectedHour,
+            expectedMinute = expectedMinute,
+            expectedEnabled = expectedEnabled,
+        )
         return PhoneOperation.changed(tool, verified)
-            .put("alarm_id", id)
+            .put("alarm_id", id.toString())
             .put("before", before)
-            .put("alarm", after ?: JSONObject.NULL)
+            .put("alarm", found ?: JSONObject.NULL)
             .put("rescheduled", lastRescheduled)
     }
 
-    private fun <T> mutate(block: () -> T?): T? {
+    /** 单条闹钟回读结果：区分「确实没有」与「读不出来」。 */
+    private sealed interface LookupResult {
+        data class Found(val alarm: JSONObject) : LookupResult
+        /** 查询成功，但列表里没有这条。 */
+        data object Gone : LookupResult
+        /** 查询本身失败：不能当作任何结论。 */
+        data object Unknown : LookupResult
+    }
+
+    /**
+     * 按 id 回读单条闹钟。
+     *
+     * 与 [awaitAlarm] 的区别：那个是「等到出现为止」，查不到就返回 null；
+     * 这里必须区分「等待期内没出现」和「Provider 查询本身抛异常」，
+     * 因为删除的确认逻辑依赖这个区别。
+     */
+    private fun lookupAlarm(id: Long): LookupResult {
+        var lastFailure: Throwable? = null
+        repeat(POLL_ATTEMPTS) { attempt ->
+            val result = runCatching { alarms().firstOrNull { it.getLong("alarm_id") == id } }
+            val found = result.getOrNull()
+            if (found != null) return LookupResult.Found(found)
+            if (result.isFailure) lastFailure = result.exceptionOrNull()
+            if (attempt < POLL_ATTEMPTS - 1) Thread.sleep(POLL_INTERVAL_MS)
+        }
+        return if (lastFailure != null) LookupResult.Unknown else LookupResult.Gone
+    }
+
+    /**
+     * 执行一次时钟写入：block 返回 null 或抛异常都转成 [PhoneOperationFailure]。
+     *
+     * 返回类型是非空 [T]：调用点原来还挂着 `?: PhoneOperation.error(...)` 兜底，
+     * 但那条分支永远走不到（block 为 null 时这里已经抛了），属于死代码（2026-11-26 审核）。
+     */
+    private fun <T : Any> mutate(block: () -> T?): T {
         onMutation()
         val result =
             runCatching(block)

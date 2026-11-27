@@ -518,6 +518,9 @@ internal class AgentRuntimeRunExecutor(
                 roleplayContext = roleplayContext,
                 rewriteReply = request.operation == AgentRuntimeWire.OP_REWRITE_REPLY,
                 compactOnly = request.operation == AgentRuntimeWire.OP_COMPACT,
+                // 按需加载只在这里打开：主 run 的目录最全（约 150 个 schema），收益最大；
+                // 子代理、体验复盘、手动压缩都不参与（理由见 complete 的 KDoc）。
+                toolGroupLoading = request.operation == AgentRuntimeWire.OP_CHAT,
                 onContextSnapshot = { snapshot ->
                     // 压缩会把历史里的记忆写入摘要掉，下一轮需要重新注入最新记忆。
                     ConversationMemoryPins.forget(conversationId)

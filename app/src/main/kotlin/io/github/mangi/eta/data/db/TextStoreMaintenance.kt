@@ -1,7 +1,11 @@
 package io.github.mangi.eta.data.db
 
 import android.content.Context
+import io.github.mangi.eta.core.AndroidAgentLogger
+import io.github.mangi.eta.core.safeLogType
+import io.github.mangi.eta.core.toSafeLogToken
 import java.io.File
+import kotlinx.coroutines.CancellationException
 
 /** agent_text_chunks 里一个 (表, 所有者, 字段) 的体量。 */
 internal data class TextChunkUsage(
@@ -26,6 +30,8 @@ internal object TextStoreMaintenance {
         val oversizedFields: Int,
         val trimmedFields: Int,
         val savedChars: Long,
+        /** 瘦身失败的字段数：失败必须可见，不能只当「没东西可瘦」静默跳过（P1-4）。 */
+        val failedFields: Int = 0,
         val topFields: List<TextChunkUsage>,
     )
 
@@ -39,6 +45,7 @@ internal object TextStoreMaintenance {
             oversizedFields = rows.count { it.charCount > limit },
             trimmedFields = 0,
             savedChars = 0,
+            failedFields = 0,
             topFields = rows.take(3),
         )
     }
@@ -49,12 +56,45 @@ internal object TextStoreMaintenance {
         val limit = ChunkedTextDao.MAX_FIELD_CHARS.toLong()
         var trimmed = 0
         var saved = 0L
+        var failed = 0
         rows.filter { it.charCount > limit }.forEach { row ->
-            val outcome = runCatching { trimOne(dao, row) }.getOrNull() ?: return@forEach
+            // 单字段失败不影响其它字段，但必须留痕并计数：trimOne 走 trimToTail →
+            // restoreTextTail，引用头损坏 / 分块缺失都会抛，旧写法 getOrNull() 把它压成「跳过」。
+            val outcome = try {
+                trimOne(dao, row)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (failure: Throwable) {
+                failed += 1
+                emitLog(
+                    "Text store trim failed: table=${row.ownerTable.toSafeLogToken()} " +
+                        "field=${row.field.toSafeLogToken()} owner=${row.ownerId.toSafeLogToken()} " +
+                        "reason=${ChunkedTextFailureReason.of(failure)} type=${failure.safeLogType()}",
+                )
+                return@forEach
+            } ?: return@forEach
             trimmed += outcome.first
             saved += outcome.second
         }
-        return inspect(database).copy(trimmedFields = trimmed, savedChars = saved)
+        return inspect(database).copy(trimmedFields = trimmed, savedChars = saved, failedFields = failed)
+    }
+
+    /**
+     * 瘦身过程的日志出口。
+     *
+     * 与 [EtaDatabase.quarantineLogSink] 同一模式：纯 JVM 单测里 android.util.Log 是 stub，
+     * 注入 sink 才能让「失败必须留痕」这条契约在 skip=0 的测试里被真正验证。
+     */
+    @androidx.annotation.VisibleForTesting
+    internal var trimLogSink: ((String) -> Unit)? = null
+
+    private fun emitLog(message: String) {
+        val sink = trimLogSink
+        if (sink != null) {
+            runCatching { sink(message) }
+            return
+        }
+        runCatching { AndroidAgentLogger.error(message) }
     }
 
     /**
@@ -118,7 +158,18 @@ internal object TextStoreMaintenance {
     suspend fun runOnceIfNeeded(context: Context) {
         val flag = File(context.filesDir, FLAG)
         if (flag.exists()) return
-        val report = runCatching { trimOversized(EtaDatabase.get(context)) }.getOrNull() ?: return
+        val report = try {
+            trimOversized(EtaDatabase.get(context))
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (failure: Throwable) {
+            // 启动期一次性的瘦身：失败要留痕，否则用户只会看到「分块表一直越线」而查不到原因。
+            emitLog(
+                "Text store startup trim failed: reason=${ChunkedTextFailureReason.of(failure)} " +
+                    "type=${failure.safeLogType()}",
+            )
+            return
+        }
         runCatching {
             flag.writeText(
                 "fields=${report.scannedFields} oversized=${report.oversizedFields} " +

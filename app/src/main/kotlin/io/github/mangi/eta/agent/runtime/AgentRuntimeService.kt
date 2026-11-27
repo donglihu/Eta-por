@@ -548,7 +548,10 @@ internal class AgentRuntimeService : Service(), LifecycleOwner, SavedStateRegist
             return
         }
         // 顺序固定：先内存三档闸门，再弹性会话上限。上限在这两个节点才重算。
-        val sessionLimit = AgentMemoryGate.sessionLimit().coerceAtMost(MAX_CONCURRENT_RUNS)
+        // sessionLimit() 的上限（AgentMemoryGate.MAX_SESSION_LIMIT = 6）与
+        // MAX_CONCURRENT_RUNS 同源，coerceAtMost 实际是 no-op——留着只会让人误以为是
+        // 双保险（2026-11-26 审核）。真正生效的是内存档位，这里直接用它算出的值。
+        val sessionLimit = AgentMemoryGate.sessionLimit()
         if (runningSessionCount() >= sessionLimit) {
             if (enqueueRun(request, replyTo)) return
             io.github.mangi.eta.core.EtaTrace.log(
@@ -582,7 +585,7 @@ internal class AgentRuntimeService : Service(), LifecycleOwner, SavedStateRegist
                 val current = sessionFor(request.runId)
                 if (current != null && event is AgentEvent.ToolStarted &&
                     (event.name in VirtualScreenRoutingPolicy.uiTools || event.name == "virtual_screen") &&
-                    runBlocking { SettingsDataStore.settings() }.virtualScreenEnabled
+                    SettingsDataStore.cachedVirtualScreenEnabled()
                 ) {
                     current.virtualUiRouted.set(true)
                 }
@@ -744,7 +747,7 @@ internal class AgentRuntimeService : Service(), LifecycleOwner, SavedStateRegist
         val revealsOperation = AgentOverlayVisibilityPolicy.shouldRevealFor(event)
         val dismissesEntrySurface = AgentOverlayVisibilityPolicy.shouldDismissEntrySurfaceFor(event)
         val virtualScreenEnabled = (revealsOperation || dismissesEntrySurface || event is AgentEvent.ToolStarted) &&
-            runBlocking { SettingsDataStore.settings() }.virtualScreenEnabled
+            SettingsDataStore.cachedVirtualScreenEnabled()
         val virtualUi = usesVirtualUi(session, virtualScreenEnabled)
         val revealsForegroundOperation = !virtualUi && revealsOperation
         val requiresEntrySurfaceDismissal = !virtualUi && dismissesEntrySurface

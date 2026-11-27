@@ -5,7 +5,17 @@ import org.json.JSONArray
 import org.json.JSONObject
 
 /** 在工具执行前校验模型参数；这里只检查调用合同，不承担权限审批或安全策略。 */
-internal class AgentToolCallValidator(tools: JSONArray) {
+internal class AgentToolCallValidator(
+    tools: JSONArray,
+    /**
+     * 额外 schema：按需加载时被摘下的延迟工具。
+     *
+     * 目录里没有它们（`tool_call` 转发过来的真名必须能校验参数），但也不能因此放宽——
+     * 只有 [AgentToolDirectory.heldSchemas] 里真实存在、且所属组已打开的才会走到这里，
+     * 判定在 [AgentToolGroupCatalog.resolve]。
+     */
+    extraSchemas: Map<String, JSONObject> = emptyMap(),
+) {
     private data class ToolSchema(
         val parameters: JSONObject,
         val root: JSONObject,
@@ -17,6 +27,9 @@ internal class AgentToolCallValidator(tools: JSONArray) {
             val name = function.optString("name").trim()
             val parameters = function.optJSONObject("parameters") ?: continue
             if (name.isNotBlank()) put(name, ToolSchema(parameters, parameters))
+        }
+        extraSchemas.forEach { (name, parameters) ->
+            if (name.isNotBlank() && name !in this) put(name, ToolSchema(parameters, parameters))
         }
     }
 
@@ -207,11 +220,19 @@ internal class AgentToolCallValidator(tools: JSONArray) {
     ): String? {
         schema.optInteger("minItems")?.let { if (value.length() < it) return "$path 项目数不能少于 $it" }
         schema.optInteger("maxItems")?.let { if (value.length() > it) return "$path 项目数不能超过 $it" }
+        // 元素数上限：模型可以构造任意长的数组，后续每项还要走一遍 schema 校验。
+        // 没有这道闸门时，一个 10 万元素的数组足以把工具调用校验拖成秒级阻塞。
+        if (value.length() > MAX_ARRAY_ITEMS) {
+            return "$path 项目数超过校验上限 $MAX_ARRAY_ITEMS"
+        }
         if (schema.optBoolean("uniqueItems", false)) {
-            for (left in 0 until value.length()) {
-                for (right in left + 1 until value.length()) {
-                    if (jsonEquals(value.opt(left), value.opt(right))) return "$path 不允许重复项目"
-                }
+            // 用规范化 JSON 串做哈希判重：早先是 O(n²) 两两 jsonEquals 比较。
+            // 键必须走 [canonicalJson]，与 jsonEquals 保持同一套对象键序语义，
+            // 否则 {"a":1,"b":2} 与 {"b":2,"a":1} 会被判成两个不同元素。
+            val seen = HashSet<String>(value.length() * 2)
+            for (index in 0 until value.length()) {
+                val key = canonicalJson(value.opt(index)).toString()
+                if (!seen.add(key)) return "$path 不允许重复项目"
             }
         }
 
@@ -345,5 +366,13 @@ internal class AgentToolCallValidator(tools: JSONArray) {
 
     private companion object {
         const val MAX_SCHEMA_DEPTH = 256
+
+        /**
+         * 单个数组参数的元素上限。
+         *
+         * 模型可以构造任意长的数组，每一项后面还要走一遍 schema 校验；不设上限时
+         * 一个几万元素的数组就能把校验拖成秒级阻塞（2026-11-26 审核）。
+         */
+        const val MAX_ARRAY_ITEMS = 10_000
     }
 }

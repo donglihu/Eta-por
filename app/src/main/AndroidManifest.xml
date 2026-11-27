@@ -48,6 +48,15 @@
 
     <uses-permission android:name="${applicationId}.permission.CONTROL_ACCESSIBILITY_PROTECTION" />
 
+    <!-- 再补一道 signature 级权限：注释一直声称「provider 带 signature 级权限，普通应用调不到」，
+         但早先清单里并没有声明，实际只靠 token 一个静态随机串把门（2026-11-26 审核）。
+         root helper 以 uid 0 调用，signature 权限对 uid 0 不构成阻断。
+         <permission> 只能作为 <manifest> 的直接子元素；放在 <application> 内会被 aapt2 拒绝
+         （unexpected element <permission> found in <manifest><application>）。 -->
+    <permission
+        android:name="${applicationId}.permission.HOST_SURFACE"
+        android:protectionLevel="signature" />
+
     <queries>
         <!-- MT2 管理器：targetSdk 37 有包可见性限制，不声明就 getPackageInfo 直接抛异常，
              表现出来是「没有安装 MT2 管理器」。 -->
@@ -279,7 +288,8 @@
             android:name=".agent.display.VirtualScreenSurfaceProvider"
             android:authorities="${applicationId}.hostsurface"
             android:exported="true"
-            android:grantUriPermissions="false" />
+            android:grantUriPermissions="false"
+            android:permission="${applicationId}.permission.HOST_SURFACE" />
     </application>
 
 </manifest>

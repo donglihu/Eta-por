@@ -114,19 +114,25 @@ internal interface ChunkedTextDao {
 
     /**
      * 只读尾部分块：单次进堆的字符数以 [maxChars] 为界。
+     *
      * 越线判断只信引用头，不用 SQL 求和（两者计法不同，混用会造成假的不匹配）。
+     *
+     * 引用头解析失败必须抛错，不能返回空串：本方法的返回值会被 [trimToTail] 写回原列，
+     * 一旦用「空」冒充「读不到」，一个损坏的引用头就会把历史固化成空
+     * （严格版 [restoreText] 一直是抛错的，两条读取路径口径必须一致，2026-11-26 审核）。
      */
     suspend fun restoreTextTail(table: String, owner: String, field: String, stored: String, maxChars: Int): String {
         if (!stored.startsWith(REFERENCE_PREFIX)) return stored
-        val ref = parseReference(stored) ?: return ""
-        val count = ref.first
+        val ref = parseReference(stored)
+            ?: error("Invalid history payload reference")
         if (ref.second <= maxChars) return restoreText(table, owner, field, stored)
         val wanted = maxChars / CHUNK_CHARS + 2
-        var start = maxOf(0, count - wanted)
+        var start = maxOf(0, ref.first - wanted)
         val kept = ArrayList<AgentTextChunkEntity>(wanted)
-        while (start < count) {
-            val page = textChunks(table, owner, field, minOf(32, count - start), start)
-            if (page.isEmpty()) break
+        while (start < ref.first) {
+            val page = textChunks(table, owner, field, minOf(32, ref.first - start), start)
+            // 分块缺失也要抛：早先 break 掉返回半截内容，同样会被写回原列。
+            check(page.isNotEmpty()) { "History payload chunk missing" }
             kept.addAll(page)
             start += page.size
             if (kept.sumOf { it.content.length } >= maxChars) break

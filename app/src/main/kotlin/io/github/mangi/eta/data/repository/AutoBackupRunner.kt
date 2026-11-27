@@ -466,6 +466,8 @@ internal object AutoBackupRunner {
         }
         val handle = storage.create(tempName)
             ?: return fail(now, "备份文件创建失败：" + storage.label)
+        // 改名成功即视为已落盘：之后任何异常都不再删文件，否则会把正式备份删掉。
+        var committed = false
         return try {
             val output = handle.openOutput()
             if (output == null) {
@@ -476,8 +478,13 @@ internal object AutoBackupRunner {
                 if (full) EtaFullBackupArchive.export(context, stream, includeLinuxEnvironment = includeLinux).conversationCount
                 else EtaBackupRepository.export(context, stream).conversationCount
             }
-            // 全量包是流式写的 zip：导出中途被杀会留下「没有中央目录」的残包，
-            // 旧实现直接改名成正式文件，界面显示成功、实际导入必失败。落正式名之前先验一次结构。
+            // 落正式名之前先 fsync：不落盘就 rename，断电时会出现「名字对、内容截断」的包。
+            if (!handle.syncBeforeRename()) {
+                AndroidAgentLogger.warn("Backup fsync skipped: " + storage.label)
+            }
+            // 落正式名之前先验一次结构。全量包是流式写的 zip，导出中途被杀会留下
+            // 「没有中央目录」的残包；逻辑备份是流式 JSON，截断后同样解析不出。
+            // 早先只对 full 校验，非 full 完全没校验（2026-11-26 审核）。
             if (full) {
                 val check = handle.verifyFullBackup(context)
                 if (!check.ok) {
@@ -485,11 +492,16 @@ internal object AutoBackupRunner {
                     handle.delete()
                     return fail(now, "全量包不完整：" + check.reason + "；已丢弃，未写入备份目录")
                 }
+            } else if (handle.size <= 0L) {
+                // 逻辑备份没有中央目录可验，最低限度确认「不是空文件」。
+                handle.delete()
+                return fail(now, "备份文件为空；已丢弃，未写入备份目录")
             }
             if (!handle.renameTo(targetName)) {
                 handle.delete()
                 return fail(now, "备份文件落盘失败 " + storage.label + "/" + targetName)
             }
+            committed = true
             val kept = prune(keep, storage, full)
             runCatching {
                 SettingsDataStore.setAutoBackupState(
@@ -502,13 +514,59 @@ internal object AutoBackupRunner {
             }
             AutoBackupResult.Done(targetName, conversationCount, kept)
         } catch (error: Throwable) {
+            // 清理必须发生在 rethrow 之前：取消（任务撤销 / 进程被杀）走的是下面那条 rethrow 分支，
+            // 早先直接抛出，`.part` 就留在备份目录里（实测残留 1.53 GB），只能靠下一次真正跑到
+            // runNow 的预清理兜——而 runLocked 有「未开启 / 未到周期 / 数据没变化」三个前置返回，
+            // 这个「下一次」是有条件的。所以取消路径也在这里删。
+            // 用 runCatching 包住：清理失败不能顶掉原始异常（否则日志里看到的是删除错误）。
+            // committed 之后不再删：那时 handle 指向的文件已经被改名成正式备份，删掉等于丢包。
+            val cleanup = discardTempOnFailure(handle, committed)
+            if (cleanup.error != null) {
+                AndroidAgentLogger.warn(
+                    "Auto backup temp delete failed: type=${cleanup.error.safeLogType()}, name-length=${handle.name.length}",
+                )
+            } else if (cleanup.attempted && !cleanup.deleted) {
+                // 删不掉不致命：runNow 开头的预清理是第二道防线，下一轮真正跑到那里会再清一次。
+                AndroidAgentLogger.warn("Auto backup temp left behind: name-length=" + handle.name.length)
+            }
             if (error is CancellationException) throw error
-            handle.delete()
             AndroidAgentLogger.warn("Auto backup failed: type=${error.safeLogType()}")
             fail(
                 now,
                 error.message?.takeIf { it.isNotBlank() } ?: error.javaClass.simpleName,
             )
+        }
+    }
+
+    /**
+     * 失败 / 取消时丢弃临时文件的结论。
+     *
+     * 之所以用返回值而不是在函数里直接打日志：`AndroidAgentLogger` 走 `android.util.Log`，
+     * 纯 JVM 单测里调用会抛 "not mocked"。这里只做判定，日志交给调用方（[runNow] 本来就在 Android 进程内）。
+     */
+    internal data class TempCleanup(
+        /** 是否真的尝试过删除；false 表示已 committed，跳过。 */
+        val attempted: Boolean,
+        /** 删除是否成功。 */
+        val deleted: Boolean,
+        /** 删除时抛出的异常；成功或跳过为 null。 */
+        val error: Throwable? = null,
+    )
+
+    /**
+     * 失败 / 取消时丢弃临时文件。
+     *
+     * 抽成独立函数是为了让「取消也要删 `.part`」这条行为能被纯 JVM 用例直接覆盖：
+     * 整条 [runNow] 依赖 Context、DataStore 与真实导出，纯 JVM 起不来。
+     * [committed] 为 true 表示 rename 已经成功，handle 指向的已是正式备份，此时不动它。
+     */
+    internal fun discardTempOnFailure(handle: BackupHandle, committed: Boolean): TempCleanup {
+        if (committed) return TempCleanup(attempted = false, deleted = false)
+        return try {
+            TempCleanup(attempted = true, deleted = handle.delete())
+        } catch (error: Exception) {
+            // 只捕获删除动作本身；清理失败不能顶掉调用方正在处理的原始异常。
+            TempCleanup(attempted = true, deleted = false, error = error)
         }
     }
 

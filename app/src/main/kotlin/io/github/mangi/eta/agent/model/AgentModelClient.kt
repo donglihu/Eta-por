@@ -124,6 +124,23 @@ internal object AgentModelClient {
         toolResultSpill: ((toolName: String, toolCallId: String, content: String) -> String?)? = null,
         /** `update_plan` 是否可用：只有主会话的计划面板算数，子代理与复盘不得覆盖它。 */
         planToolsEnabled: Boolean = true,
+        /**
+         * 是否允许按组延迟加载工具。
+         *
+         * **默认 false（API 层保守）**：只有「主 run」这一个调用点显式打开
+         * （[io.github.mangi.eta.agent.runtime.AgentRuntimeRunExecutor]，再受
+         * `Prefs.toolGroupLoadingMode()` 与 provider 灰度控制），其余入口一律不分。
+         * 理由有两条，都是踩过或必然踩的：
+         *
+         * 1. 子代理与体验复盘的目录还要按 `profile.filterTools` / `restrictedToolNames` 二次裁剪，
+         *    而 hold 发生在裁剪之前——把 `file` / `terminal` 摘进延迟组后，
+         *    「screen 允许、其余禁用」这类白名单会作用在一个只剩两个入口的目录上，
+         *    表现为子代理突然什么都不能干；它们本身工具少，也没有学习成本可省。
+         * 2. 这个开关改变的是「模型看到多少个工具」这一全局契约，调用点必须自己声明意图，
+         *    不能让所有 `complete(...)` 的默认行为一起变——那会让单测与预览页对着一个
+         *    它们并不理解的目录做断言。
+         */
+        toolGroupLoading: Boolean = false,
         onEvent: (AgentEvent) -> Unit = {}
     ): ModelResponse.Text {
         config.validate()
@@ -133,6 +150,16 @@ internal object AgentModelClient {
         val activeExpert = ExpertStore.active()
         val toolPolicy = AgentToolPolicyStore.load()
         val initialCapabilities = capabilitiesProvider()
+        // 按需加载的档位与 run 级状态：目录 hold、校验器与 loop 解包都读同一份，
+        // 不允许三处各判一遍（否则会出现「目录摘了但不会解包」这种半开状态）。
+        val groupLoadingEnabled = toolGroupLoading &&
+            AgentToolGroupLoadingPolicy.enabled(config.providerType)
+        // 逐工具开关与其它正式配置同一纪律：每次 run 读一次，轮内改动不参与前缀计算。
+        // 只有 GROUP 档用它（判断两个入口是否允许声明）；OFF 档保持改动前的行为，
+        // 那条「请求体逐字节不变」的回滚约定优先于顺带修 bug。
+        val disabledToolsForRun = if (groupLoadingEnabled) Prefs.disabledTools() else emptySet()
+        val groupSession = if (groupLoadingEnabled) AgentToolGroupSession() else null
+        val deferredSchemas = LinkedHashMap<String, JSONObject>()
         val messages = AgentPromptBuilder.buildInitialMessages(
             config,
             prompt,
@@ -149,6 +176,7 @@ internal object AgentModelClient {
             planMode = initialCapabilities.planMode,
             jailbreak = jailbreak,
             expert = activeExpert,
+            toolGroupLoading = groupLoadingEnabled,
         )
         if (rewriteReply) {
             messages.put(messages.length() - 1, AgentConversationCodec.userTextMessage(
@@ -167,7 +195,7 @@ internal object AgentModelClient {
         val transcript = JSONArray()
         // 旧 history 中的无效消息可能在组装时被跳过，系统边界不能由 history 条数倒推。
         val systemCount = AgentPromptBuilder.buildSystemMessages(
-            config, skillContext, memoryContext, initialCapabilities.rootAvailable, roleplayContext, executionContext, initialCapabilities.virtualScreenEnabled, initialCapabilities.virtualScreenFallbackEnabled, customization, initialCapabilities.planMode, jailbreak, activeExpert,
+            config, skillContext, memoryContext, initialCapabilities.rootAvailable, roleplayContext, executionContext, initialCapabilities.virtualScreenEnabled, initialCapabilities.virtualScreenFallbackEnabled, customization, initialCapabilities.planMode, jailbreak, activeExpert, groupLoadingEnabled,
         ).length()
         // MCP 工具只在 run 开始时压一次：每轮重复解析这 190KB JSON 纯属浪费。
         val remoteToolNames = (0 until additionalTools.length()).mapNotNull { index ->
@@ -205,7 +233,13 @@ internal object AgentModelClient {
             val filtered = toolFilter?.invoke(built) ?: built
             // 专家工具集：白名单为空表示继承全量，黑名单优先；声明与执行用同一个函数，
             // 避免「目录里没了但真调用还能跑」的两套口径。
-            return activeExpert?.let { expert -> expertFilterTools(expert, filtered) } ?: filtered
+            val selected = activeExpert?.let { expert -> expertFilterTools(expert, filtered) } ?: filtered
+            if (!groupLoadingEnabled) return selected
+            // 按组 hold 放在**所有裁剪之后**：只摘「这次真能调到」的工具，
+            // 否则 tool_call 转发过来会在参数校验阶段报「不在目录里」，
+            // 与真实原因（被关掉/不可用/被专家裁掉）对不上。
+            deferredSchemas.clear()
+            return AgentToolDirectory.holdDeferredGroups(selected, deferredSchemas, disabledToolsForRun)
         }
         val tools = toolsFor(initialCapabilities)
         // 只在请求侧丢最老轮次：数据库与界面一条不删；系统提示、记忆与当前输入永不裁。
@@ -239,7 +273,7 @@ internal object AgentModelClient {
                 capabilities.virtualScreenEnabled != promptVirtualScreenEnabled ||
                 capabilities.virtualScreenFallbackEnabled != promptVirtualScreenFallbackEnabled) {
                 val systemMessages = AgentPromptBuilder.buildSystemMessages(
-                    config, skillContext, memoryContext, capabilities.rootAvailable, roleplayContext, executionContext, capabilities.virtualScreenEnabled, capabilities.virtualScreenFallbackEnabled, customization, capabilities.planMode, jailbreak, activeExpert,
+                    config, skillContext, memoryContext, capabilities.rootAvailable, roleplayContext, executionContext, capabilities.virtualScreenEnabled, capabilities.virtualScreenFallbackEnabled, customization, capabilities.planMode, jailbreak, activeExpert, groupLoadingEnabled,
                 )
                 for (index in 0 until systemMessages.length()) {
                     messages.put(index, systemMessages.getJSONObject(index))
@@ -351,6 +385,9 @@ internal object AgentModelClient {
             onUserTurnAppended = ::armPlanForNewUserTurn,
             spillToolResult = toolResultSpill,
             remoteToolNames = remoteToolNames,
+            groupSession = groupSession,
+            deferredSchemas = deferredSchemas,
+            disabledToolNames = disabledToolsForRun,
             toolsForRound = ::toolsForRound,
         )
         val result = try {

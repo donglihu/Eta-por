@@ -19,7 +19,14 @@ class AgentToolRequirementsTest {
             CharacterMemoryTools.appendSchemas(it)
             AgentSubagentToolCatalog.appendSchemas(it)
         }
-        val executionOnly = setOf("input_text", "replace_text", "clear_text", "paste_text")
+        // executionOnly：只做旧 transcript 兼容，不再向模型暴露。
+        // 按需加载的两个入口（tools_use_group / tool_call）默认档（OFF）不声明，
+        // 只有 GROUP 档由 AgentToolDirectory.holdDeferred 追加，因此同样不进全量目录比对。
+        val executionOnly = setOf(
+            "input_text", "replace_text", "clear_text", "paste_text",
+            io.github.mangi.eta.agent.model.AgentToolGroupCatalog.USE_GROUP,
+            io.github.mangi.eta.agent.model.AgentToolGroupCatalog.CALL,
+        )
         assertEquals(AgentToolRequirements.toolNames - executionOnly, tools.names())
         executionOnly.forEach { name -> assertFalse("$name 仅保留执行兼容，不再向模型暴露", name in tools.names()) }
         assertEquals(tools.length(), tools.names().size)
@@ -154,11 +161,18 @@ class AgentToolRequirementsTest {
         }
     }
 
+    /**
+     * 全量目录。
+     *
+     * `planMode = true` 是刻意的：`update_plan` 只在计划模式的会话里声明
+     * （见 [AgentToolCatalog]，非计划会话声明它会让模型照着描述乱交清单），
+     * 而这个用例断言的是「登记表 ↔ 目录」集合相等，必须取「所有开关都打开」的那一份目录。
+     */
     private fun catalog(root: Boolean) = AgentToolCatalog.build(
         terminalTools = true, browserTools = true, deviceDirectTools = true,
         deviceSensitiveReadTools = true, deviceSensitiveActionTools = true,
         skillGitHubDiscovery = true, skillGitHubInstall = true, memoryTools = true,
-        capabilities = AgentToolCapabilities(rootAvailable = root),
+        capabilities = AgentToolCapabilities(rootAvailable = root, planMode = true),
     )
 
     private fun JSONArray.names(): Set<String> = (0 until length()).mapTo(linkedSetOf()) {

@@ -292,6 +292,67 @@ class NativeAppOperationsTest {
         assertEquals("早课", item.getString("label"))
     }
 
+    @Test
+    fun alarmIdIsReturnedAsTextSoModelCanFeedItBack() {
+        // 工具入参契约是文本（id("alarm_id")）；生产者给数字时，模型照抄回填会报
+        // 「alarm_id 必须是文本」——契约与返回体必须一致（2026-11-26 审核）。
+        val provider = FakeProvider()
+        provider.addClockRow(7, 8, 30, 0, enabled = true)
+        val listed = PhoneOperations.execute(context, "list_alarms",
+            JSONObject(), userId = 0, access = provider)
+        assertEquals("7", listed.getJSONArray("items").getJSONObject(0).getString("alarm_id"))
+
+        val created = PhoneOperations.execute(context, "set_alarm",
+            JSONObject().put("hour", 9).put("minute", 15), userId = 0, access = provider)
+        assertTrue(created.toString(), created.get("alarm_id") is String)
+
+        val changed = PhoneOperations.execute(context, "set_alarm_enabled",
+            JSONObject().put("alarm_id", "7").put("enabled", false), userId = 0, access = provider)
+        assertTrue(changed.toString(), changed.get("alarm_id") is String)
+    }
+
+    @Test
+    fun alarmIdAcceptsNumericFormForBackwardCompatibility() {
+        // 模型把 7 当数字回填时也必须能走通，不许因为类型不同就判非法。
+        val provider = FakeProvider()
+        provider.addClockRow(7, 8, 30, 0, enabled = true)
+        val result = PhoneOperations.execute(context, "update_alarm_time",
+            JSONObject().put("alarm_id", 7).put("hour", 10).put("minute", 5),
+            userId = 0, access = provider)
+        assertTrue(result.toString(), result.getBoolean("verified"))
+        assertEquals("content://com.android.deskclock/alarm/7", provider.updatedUri.toString())
+    }
+
+    @Test
+    fun alarmDeleteDoesNotClaimSuccessWhenQueryFails() {
+        // 早先用 `after == null` 判删除成功，而查询异常也被兜成 null，
+        // 于是「读不出来」被报成「已删除」（2026-11-26 审核）。
+        val provider = FakeProvider()
+        provider.addClockRow(7, 8, 30, 0, enabled = true)
+        provider.alarmQueryFails = true
+        val result = runCatching {
+            PhoneOperations.execute(context, "update_alarm_time",
+                JSONObject().put("alarm_id", "7").put("hour", 9).put("minute", 0),
+                userId = 0, access = provider)
+        }
+        val payload = result.getOrNull()
+        // 查询失败既不能报成功，也不能报「闹钟不存在」。
+        if (payload != null) {
+            assertFalse("查询失败不能报 verified", payload.optBoolean("verified", false))
+            assertEquals("CLOCK_UNAVAILABLE", payload.optString("code"))
+        }
+    }
+
+    @Test
+    fun alarmMissingIdStillReportsNotFound() {
+        // 「确实没有这条」仍要保留 ALARM_NOT_FOUND，不能被改成 CLOCK_UNAVAILABLE。
+        val provider = FakeProvider()
+        provider.addClockRow(7, 8, 30, 0, enabled = true)
+        val result = PhoneOperations.execute(context, "delete_alarm",
+            JSONObject().put("alarm_id", "999"), userId = 0, access = provider)
+        assertEquals("ALARM_NOT_FOUND", result.getString("code"))
+    }
+
     private fun event() =
         JSONObject()
             .put("title", "会议")
@@ -319,6 +380,8 @@ class NativeAppOperationsTest {
         var alarmHour = 8
         var alarmMinute = 30
         var repeatMask = 0
+        /** 模拟 Provider 查询本身失败（不是「没有这条」）：删除/改时的回读必须区分两者。 */
+        var alarmQueryFails = false
 
         override fun query(
             uri: Uri,
@@ -328,6 +391,10 @@ class NativeAppOperationsTest {
             sort: String?,
         ): Cursor? {
             if (uri.authority.orEmpty().endsWith("com.nearme.note") && !notesReady) return null
+            // 时钟查询失败：模拟 Provider 抛异常（不是返回空列表）。
+            if (alarmQueryFails && uri.pathSegments.firstOrNull() == "alarm") {
+                throw IllegalStateException("provider unavailable")
+            }
             val rows: List<Map<String, Any?>> =
                 when (uri.pathSegments.firstOrNull()) {
                     "calendars" ->
