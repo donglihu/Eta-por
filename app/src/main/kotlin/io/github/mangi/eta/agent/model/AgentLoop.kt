@@ -489,7 +489,7 @@ internal class AgentLoop(
             // 按需加载档下，模型最常见的错是「知道工具名就直接调」。这里给出组名与两条命令，
             // 而不是笼统的「未提供」——后者会让它换工具硬凑。
             val (code, message) = if (groupSession != null) {
-                AgentToolGroupCatalog.notAvailableMessage(toolCall.name)
+                AgentToolGroupCatalog.notAvailableMessage(toolCall.name, groupSession.view)
             } else {
                 "TOOL_NOT_AVAILABLE" to "工具未在本轮能力目录中提供，请使用当前可用工具"
             }
@@ -511,7 +511,7 @@ internal class AgentLoop(
             if (roundCall.name == AgentToolGroupCatalog.USE_GROUP) {
                 return openGroupOutcome(round, roundCall, session)
             }
-            AgentToolGroupCatalog.resolve(roundCall, session.openedGroups(), disabledToolNames)
+            AgentToolGroupCatalog.resolve(roundCall, session.openedGroups(), disabledToolNames, session.view)
         } ?: AgentToolGroupCatalog.EffectiveCall.Direct(roundCall)
         val effective = when (resolved) {
             is AgentToolGroupCatalog.EffectiveCall.Direct -> roundCall
@@ -645,14 +645,14 @@ internal class AgentLoop(
                 toolCall = call,
                 code = "INVALID_TOOL_ARGUMENTS",
                 message = "缺少 group 参数；可选组：" +
-                    AgentToolGroups.deferredGroups.joinToString("、") { it.id },
+                    session.view.deferredGroups.joinToString("、") { it.id },
             )
         }
         val rejection = session.open(groupId)
         if (rejection != null) {
             return completedOutcome(round, call, AgentModelClient.ToolResult(rejection))
         }
-        val members = AgentToolGroups.members(groupId).orEmpty()
+        val members = session.view.members(groupId).orEmpty()
         EtaTrace.log("perf.tools.group_open", "group=$groupId tools=${members.size} round=$round")
         return completedOutcome(
             round = round,
