@@ -2422,6 +2422,26 @@
     <string name="memory_backup_summary_failed">备份失败：%1$s（目标 %2$s）</string>
     <string name="model_test_action">测速</string>
     <string name="model_test_ok">测速通过</string>
+    <string name="model_test_success_line">连接正常 · %1$dms</string>
+
+    <!-- aicode 移植：模型列表徽章与思考强度弹层 -->
+    <string name="model_picker_badge_image">Image</string>
+    <string name="model_picker_badge_tools">Tools</string>
+    <string name="chat_reasoning_sheet_title">思考强度</string>
+    <string name="chat_reasoning_toggle">思考</string>
+    <string name="chat_reasoning_off_short">不思考</string>
+    <string name="chat_reasoning_default_marker">默认</string>
+    <string name="chat_reasoning_hint_mandatory">该模型思考恒开，关闭会退回最低档</string>
+    <string name="chat_reasoning_hint_unknown">思考能力未知，档位可能不生效</string>
+    <string name="chat_reasoning_hint_clamped">当前档位超出模型支持范围，将自动降为 %1$s</string>
+    <string name="chat_reasoning_level_off">关闭</string>
+    <string name="chat_reasoning_level_default">默认</string>
+    <string name="chat_reasoning_level_minimal">极简</string>
+    <string name="chat_reasoning_level_low">低</string>
+    <string name="chat_reasoning_level_medium">中</string>
+    <string name="chat_reasoning_level_high">高</string>
+    <string name="chat_reasoning_level_xhigh">极高</string>
+    <string name="chat_reasoning_level_max">最高</string>
     <!-- 专家中心：顶部概览卡 + 分类筛选 + 专家卡片 -->
     <string name="expert_center_title">专家</string>
     <string name="expert_center_subtitle">让某个专业角色接管这一轮对话</string>

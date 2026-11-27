@@ -279,6 +279,13 @@ internal object RemoteModelFetcher {
                 "max_input_tokens",
                 "maxInputTokens",
             ),
+            outputTokens = positiveInt(
+                "output_limit",
+                "outputLimit",
+                "max_output_tokens",
+                "maxOutputTokens",
+                "max_completion_tokens",
+            ),
             inputModalities = inputModalities(architecture),
             outputModalities = stringList("output_modalities", "outputModalities")
                 ?: architecture?.stringList("output_modalities", "outputModalities")

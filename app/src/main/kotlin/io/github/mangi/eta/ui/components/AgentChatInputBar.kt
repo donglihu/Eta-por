@@ -33,6 +33,8 @@ import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBars
@@ -48,6 +50,8 @@ import androidx.compose.foundation.text.input.rememberTextFieldState
 import androidx.compose.foundation.text.input.setTextAndPlaceCursorAtEnd
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.ArrowUpward
+import androidx.compose.material.icons.rounded.Bolt
+import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.Pause
 import androidx.compose.material.icons.rounded.PlayArrow
@@ -81,6 +85,7 @@ import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.res.vectorResource
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
@@ -88,6 +93,8 @@ import io.github.mangi.eta.agent.subagent.SubagentRunRegistry
 import kotlinx.coroutines.delay
 import androidx.compose.ui.unit.sp
 import io.github.mangi.eta.R
+import io.github.mangi.eta.data.model.ModelReasoningCapabilities
+import io.github.mangi.eta.ui.components.EtaSwitch
 import io.github.mangi.eta.data.model.ReasoningEffort
 import androidx.compose.ui.platform.LocalContext
 import io.github.mangi.eta.ui.app.ChatDraftStore
@@ -121,6 +128,7 @@ import top.yukonga.miuix.kmp.squircle.squircleBorder
 import top.yukonga.miuix.kmp.squircle.squircleSurface
 import top.yukonga.miuix.kmp.theme.LocalDismissState
 import top.yukonga.miuix.kmp.theme.MiuixTheme
+import top.yukonga.miuix.kmp.overlay.OverlayBottomSheet
 import top.yukonga.miuix.kmp.window.WindowListPopup
 
 private val SendButtonVisualSize = ChatInputActionIconSize
@@ -148,6 +156,7 @@ internal fun AgentChatInputBar(
     isStreaming: Boolean,
     reasoningEffort: ReasoningEffort,
     availableReasoningEfforts: List<ReasoningEffort>,
+    reasoningCapabilities: ModelReasoningCapabilities?,
     /** Plan 模式开关：显示在思考图标右侧，开着时本轮只读、只产出计划。 */
     planMode: Boolean = false,
     onPlanModeChange: (Boolean) -> Unit = {},
@@ -771,9 +780,8 @@ internal fun AgentChatInputBar(
                                 ThinkingEffortChip(
                                     effort = reasoningEffort,
                                     options = availableReasoningEfforts,
+                                    capabilities = reasoningCapabilities,
                                     enabled = !isStreaming,
-                                    popupAnchorTopPx = inputContainerTopPx,
-                                    popupMaxHeight = thinkingPopupMaxHeight,
                                     onEffortChange = onReasoningEffortChange,
                                 )
                             }
@@ -933,75 +941,240 @@ internal fun AgentChatInputBar(
 
 }
 
-/** 思考强度选择保持为单一图标，当前状态仅通过图标颜色表达。 */
+/**
+ * 思考强度入口，布局对齐 aicode ReasoningEffortSelector：闪电图标 + 当前档位短名，
+ * 整块可点，点开底部弹层（思考总开关 + 生效提示 + 档位列表 + 默认标记）。
+ */
 @Composable
 private fun ThinkingEffortChip(
     effort: ReasoningEffort,
     options: List<ReasoningEffort>,
+    capabilities: ModelReasoningCapabilities?,
     enabled: Boolean,
-    popupAnchorTopPx: Int,
-    popupMaxHeight: Dp,
     onEffortChange: (ReasoningEffort) -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    var showPopup by remember { mutableStateOf(false) }
-    val active = effort != ReasoningEffort.OFF
+    var showSheet by remember { mutableStateOf(false) }
     val menuEnabled = enabled && options.isNotEmpty()
     LaunchedEffect(menuEnabled) {
-        if (!menuEnabled) showPopup = false
+        if (!menuEnabled) showSheet = false
     }
-    val popupPositionProvider = remember(popupAnchorTopPx) {
-        InputPopupPositionProvider(popupAnchorTopPx)
+    // 弹层标签与请求同源：能力已知时用 normalize 收敛（超范围降档、恒开回落），未知时按所选值展示并提示。
+    val mandatory = capabilities?.mandatory == true
+    val effective = capabilities?.normalize(effort) ?: effort
+    val label = when {
+        effort == ReasoningEffort.OFF && !mandatory -> stringResource(R.string.chat_reasoning_off_short)
+        else -> reasoningEffortLabel(effective)
     }
     val contentColor by animateColorAsState(
-        targetValue = if (active) {
-            MiuixTheme.colorScheme.primary
-        } else {
-            MiuixTheme.colorScheme.onSurfaceVariantSummary
+        targetValue = when {
+            !menuEnabled -> MiuixTheme.colorScheme.disabledOnSurface
+            effort != ReasoningEffort.OFF -> MiuixTheme.colorScheme.primary
+            else -> MiuixTheme.colorScheme.onSurfaceVariantSummary
         },
         animationSpec = tween(durationMillis = 160),
         label = "thinking_content",
     )
-    Box(modifier = modifier) {
-        IconButton(
-            onClick = { showPopup = true },
-            enabled = menuEnabled,
-            minWidth = ChatInputActionSize,
-            minHeight = ChatInputActionSize,
+    Row(
+        modifier = modifier
+            .clip(RoundedCornerShape(12.dp))
+            .clickable(enabled = menuEnabled) { showSheet = true }
+            .padding(horizontal = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Icon(
+            imageVector = Icons.Rounded.Bolt,
+            contentDescription = stringResource(R.string.chat_reasoning_effort, effort.displayName),
+            modifier = Modifier.size(ThinkingIconSize),
+            tint = contentColor,
+        )
+        Spacer(modifier = Modifier.width(2.dp))
+        Text(
+            text = label,
+            style = MiuixTheme.textStyles.footnote1,
+            color = contentColor,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.widthIn(max = 56.dp),
+        )
+    }
+    if (showSheet && menuEnabled) {
+        OverlayBottomSheet(
+            show = true,
+            title = stringResource(R.string.chat_reasoning_sheet_title),
+            onDismissRequest = { showSheet = false },
         ) {
-            Icon(
-                imageVector = ImageVector.vectorResource(R.drawable.ic_atom),
-                contentDescription = stringResource(R.string.chat_reasoning_effort, effort.displayName),
-                modifier = Modifier.size(ThinkingIconSize),
-                tint = contentColor,
+            ThinkingEffortSheetContent(
+                effort = effort,
+                options = options,
+                capabilities = capabilities,
+                onEffortChange = onEffortChange,
+                onDismiss = { showSheet = false },
             )
         }
-        WindowListPopup(
-            // 锚点尚未测量（0）时也要能弹出：位置提供者会把越界的 Y 夹回窗口内。
-            show = showPopup && menuEnabled,
-            popupPositionProvider = popupPositionProvider,
-            alignment = PopupPositionProvider.Align.TopStart,
-            onDismissRequest = { showPopup = false },
-            maxHeight = popupMaxHeight,
+    }
+}
+
+/** 思考强度弹层，对齐 aicode：标题行 + 思考总开关 + 生效提示 + 档位列表（默认档打标、选中打勾）。 */
+@Composable
+private fun ThinkingEffortSheetContent(
+    effort: ReasoningEffort,
+    options: List<ReasoningEffort>,
+    capabilities: ModelReasoningCapabilities?,
+    onEffortChange: (ReasoningEffort) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val mandatory = capabilities?.mandatory == true
+    // 能力未知（无 capabilities 或只有 DEFAULT）也给出开关：交给用户试，弹层会提示「可能不生效」。
+    val showToggle = !mandatory
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .navigationBarsPadding()
+            .padding(horizontal = 20.dp)
+            .padding(bottom = 20.dp),
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.fillMaxWidth(),
         ) {
-            val dismiss = LocalDismissState.current
-            ListPopupColumn {
-                options.forEachIndexed { index, option ->
-                    DropdownImpl(
-                        text = option.displayName,
-                        optionSize = options.size,
-                        isSelected = option == effort,
-                        index = index,
-                        onSelectedIndexChange = {
-                            onEffortChange(option)
-                            dismiss?.invoke()
-                        },
+            Text(
+                text = stringResource(R.string.chat_reasoning_toggle),
+                style = MiuixTheme.textStyles.body2,
+                color = MiuixTheme.colorScheme.onSurface,
+                modifier = Modifier.weight(1f),
+            )
+            if (showToggle) {
+                EtaSwitch(
+                    checked = effort != ReasoningEffort.OFF,
+                    onCheckedChange = { on ->
+                        onEffortChange(
+                            if (on) {
+                                // 打开思考回到哪一档：优先模型默认档，其次「中」，再取最高可用档；都没有就跟随默认。
+                                capabilities?.defaultEffort?.takeIf { it != ReasoningEffort.OFF && it in options }
+                                    ?: options.firstOrNull { it == ReasoningEffort.MEDIUM }
+                                    ?: options.lastOrNull { it != ReasoningEffort.OFF && it != ReasoningEffort.DEFAULT }
+                                    ?: ReasoningEffort.DEFAULT
+                            } else {
+                                ReasoningEffort.OFF
+                            },
+                        )
+                        onDismiss()
+                    },
+                )
+            }
+        }
+        ThinkingEffortHints(effort, capabilities)
+        options.forEach { option ->
+            val selected = option == effort
+            val isDefault = capabilities?.defaultEffort == option
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(10.dp))
+                    .clickable {
+                        onEffortChange(option)
+                        onDismiss()
+                    }
+                    .padding(horizontal = 10.dp, vertical = 12.dp),
+            ) {
+                Icon(
+                    imageVector = Icons.Rounded.Bolt,
+                    contentDescription = null,
+                    modifier = Modifier.size(18.dp),
+                    tint = if (selected) {
+                        MiuixTheme.colorScheme.primary
+                    } else {
+                        MiuixTheme.colorScheme.onSurfaceVariantSummary
+                    },
+                )
+                Spacer(modifier = Modifier.width(10.dp))
+                Text(
+                    text = reasoningEffortLabel(option),
+                    style = MiuixTheme.textStyles.body2,
+                    color = if (selected) {
+                        MiuixTheme.colorScheme.primary
+                    } else {
+                        MiuixTheme.colorScheme.onSurface
+                    },
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f),
+                )
+                if (isDefault) {
+                    Text(
+                        text = stringResource(R.string.chat_reasoning_default_marker),
+                        style = MiuixTheme.textStyles.footnote2.copy(fontSize = 10.sp),
+                        color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                        maxLines = 1,
+                        modifier = Modifier
+                            .squircleSurface(
+                                color = MiuixTheme.colorScheme.surfaceVariant,
+                                cornerRadius = 50.dp,
+                            )
+                            .padding(horizontal = 6.dp, vertical = 2.dp),
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                }
+                if (selected) {
+                    Icon(
+                        imageVector = Icons.Rounded.Check,
+                        contentDescription = null,
+                        modifier = Modifier.size(16.dp),
+                        tint = MiuixTheme.colorScheme.primary,
                     )
                 }
             }
         }
     }
 }
+
+/** 弹层提示行，对齐 aicode ReasoningHintLines：思考恒开、能力未知、档位被自动降级三种情形。 */
+@Composable
+private fun ThinkingEffortHints(
+    effort: ReasoningEffort,
+    capabilities: ModelReasoningCapabilities?,
+) {
+    val mandatoryHint = stringResource(R.string.chat_reasoning_hint_mandatory)
+    val unknownHint = stringResource(R.string.chat_reasoning_hint_unknown)
+    val normalized = capabilities?.normalize(effort)
+    val clampedHint = if (normalized != null && effort != ReasoningEffort.OFF && normalized != effort) {
+        stringResource(R.string.chat_reasoning_hint_clamped, reasoningEffortLabel(normalized))
+    } else {
+        null
+    }
+    val hints = buildList {
+        if (capabilities?.mandatory == true) add(mandatoryHint)
+        if (capabilities == null || capabilities.supportedEfforts.isEmpty()) add(unknownHint)
+        clampedHint?.let(::add)
+    }
+    hints.forEach { hint ->
+        Text(
+            text = hint,
+            style = MiuixTheme.textStyles.footnote2,
+            color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+            maxLines = 2,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.padding(top = 6.dp),
+        )
+    }
+}
+
+/** 档位短名（对齐 aicode 档位标签）：关闭/默认/极简/低/中/高/极高/最高。 */
+@Composable
+private fun reasoningEffortLabel(effort: ReasoningEffort): String = stringResource(
+    when (effort) {
+        ReasoningEffort.OFF -> R.string.chat_reasoning_level_off
+        ReasoningEffort.DEFAULT -> R.string.chat_reasoning_level_default
+        ReasoningEffort.MINIMAL -> R.string.chat_reasoning_level_minimal
+        ReasoningEffort.LOW -> R.string.chat_reasoning_level_low
+        ReasoningEffort.MEDIUM -> R.string.chat_reasoning_level_medium
+        ReasoningEffort.HIGH -> R.string.chat_reasoning_level_high
+        ReasoningEffort.XHIGH -> R.string.chat_reasoning_level_xhigh
+        ReasoningEffort.MAX -> R.string.chat_reasoning_level_max
+    }
+)
 
 /** Plan 开关：一枚小胶囊，选中才填浅底；宽度压在 30dp 内，右侧按钮的位置不会被它挤走。 */
 @Composable

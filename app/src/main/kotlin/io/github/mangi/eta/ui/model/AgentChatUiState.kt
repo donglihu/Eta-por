@@ -5,6 +5,7 @@ import io.github.mangi.eta.agent.model.AgentFileReference
 import io.github.mangi.eta.agent.model.AgentModelClient
 import io.github.mangi.eta.agent.roleplay.RoleplayBinding
 import io.github.mangi.eta.agent.roleplay.RoleplayMessageState
+import io.github.mangi.eta.data.model.ModelReasoningCapabilities
 import io.github.mangi.eta.data.model.ReasoningEffort
 import io.github.mangi.eta.ui.components.RoleplayChatUi
 
@@ -83,6 +84,8 @@ internal data class AgentChatUiState(
     val thinkingEnabled: Boolean,
     val reasoningEffort: ReasoningEffort = ReasoningEffort.fromLegacy(thinkingEnabled),
     val availableReasoningEfforts: List<ReasoningEffort> = emptyList(),
+    /** 当前模型思考能力（档位/恒开/默认档），供思考强度弹层提示与默认标记；无模型能力时为 null。 */
+    val reasoningCapabilities: ModelReasoningCapabilities? = null,
     /** Plan 模式：先交清单再执行；清单提交前副作用工具会被运行侧拒绝（PLAN_REQUIRED_FIRST）。 */
     val planMode: Boolean = false,
     /** 计划清单：`update_plan` 产出，展示在会话框上方，可展开收起。 */

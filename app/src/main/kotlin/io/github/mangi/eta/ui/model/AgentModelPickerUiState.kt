@@ -50,6 +50,12 @@ internal data class AgentModelOptionUi(
     val modelId: String,
     val displayName: String,
     val contextWindow: Int?,
+    /** 单次回复的输出上限（token）；无数据为 null，模型列表不画输出徽章。 */
+    val outputTokens: Int? = null,
+    /** 支持图像输入（vision）→ 列表行「Image」高亮徽章。 */
+    val supportsVision: Boolean = false,
+    /** 支持工具调用 → 列表行「Tools」徽章。 */
+    val supportsTools: Boolean = false,
 )
 
 @Immutable
@@ -153,6 +159,9 @@ internal object AgentModelPickerProjector {
             modelId = model.modelId,
             displayName = model.displayName.ifBlank { model.modelId },
             contextWindow = model.effectiveContextWindow,
+            outputTokens = model.outputTokens,
+            supportsVision = model.supportsVision,
+            supportsTools = model.supportsTools,
         )
 }
 

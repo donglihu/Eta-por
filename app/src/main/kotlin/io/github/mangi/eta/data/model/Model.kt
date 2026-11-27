@@ -13,6 +13,8 @@ data class Model(
     val sortOrder: Int = 0,
     val contextWindow: Int? = null,
     val contextWindowOverride: Int? = null,
+    /** 单次回复的输出上限（token），来自远端目录的 max_output_tokens 类字段；无数据为 null。 */
+    val outputTokens: Int? = null,
     val inputModalities: List<String> = listOf(TEXT_MODALITY),
     val outputModalities: List<String> = listOf(TEXT_MODALITY),
     val attachment: Boolean? = null,

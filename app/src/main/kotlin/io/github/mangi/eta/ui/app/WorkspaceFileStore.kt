@@ -21,6 +21,9 @@ internal data class WorkspaceEntry(val path: String, val name: String, val direc
 /** 浏览器内联预览的文件大小上限：超过就不读全量，交给外部应用打开。 */
 internal const val WORKSPACE_PREVIEW_MAX_BYTES: Long = 2L * 1024 * 1024
 
+/** 二进制嗅探采样字节数（与 git / aicode 一致：开头 8000 字节内出现 NUL 判二进制）。 */
+internal const val WORKSPACE_BINARY_SNIFF_BYTES: Int = 8000
+
 internal class WorkspaceFileStore(
     context: Context,
     private val backendFor: (File) -> FileToolBackend = ::workspaceBackend,
@@ -41,6 +44,9 @@ internal class WorkspaceFileStore(
      */
     private val backend: FileToolBackend by lazy { backendFor(root) }
 
+    /** 写操作内核（自 aicode 移植）：删除走 .trash、写文件原子落位，路径校验与读侧同一套防线。 */
+    private val ops = WorkspaceFileOps(root)
+
     /**
      * 列目录。走 [java.io.File] API，不经 [io.github.mangi.eta.agent.terminal.FileToolBackend]。
      *
@@ -60,12 +66,15 @@ internal class WorkspaceFileStore(
             .filter { it.isFile || it.isDirectory }
             .map { child ->
                 WorkspaceEntry(
-                    path = child.relativeTo(root).path,
+                    path = child.absolutePath.removePrefix(root.absolutePath).trimStart('/'),
                     name = child.name,
                     directory = child.isDirectory,
                     size = if (child.isDirectory) 0L else child.length(),
                 )
             }
+            // FUSE 存储（外部/模拟存储）上 readdir 可能重复返回同一条目（aicode 实测教训，AOSP ReaddirHelper 同做此处理）：
+            // 同名重复会产生重复节点 path，撞坏 LazyColumn 的 key。
+            .distinctBy { it.name }
             .sortedWith(compareByDescending<WorkspaceEntry> { it.directory }.thenBy { it.name.lowercase() })
             .toList()
     }
@@ -109,6 +118,65 @@ internal class WorkspaceFileStore(
         }
         destination.length()
     }
+
+    // region 写操作（自 aicode 侧边栏文件区移植；UI 层调用入口）
+
+    /** 新建/覆盖写文本文件；文件树「新建文件」用 overwrite=false 防覆盖。 */
+    suspend fun writeText(path: String, content: String, overwrite: Boolean = true) = withContext(Dispatchers.IO) {
+        ops.writeText(path, content, overwrite)
+    }
+
+    /** 新建文件夹（含父目录）。 */
+    suspend fun mkdirs(path: String) = withContext(Dispatchers.IO) {
+        ops.mkdirs(path)
+    }
+
+    /** 同目录重命名，返回新相对路径。 */
+    suspend fun rename(path: String, newName: String): String = withContext(Dispatchers.IO) {
+        ops.rename(path, newName)
+    }
+
+    /** 删除 = 移入 root/.trash/，返回落位绝对路径（物理清理留给巡检/人工确认）。 */
+    suspend fun deleteToTrash(path: String): File = withContext(Dispatchers.IO) {
+        ops.deleteToTrash(path)
+    }
+
+    /** 复制到新路径；粘贴用。 */
+    suspend fun copy(path: String, newPath: String, overwrite: Boolean = false) = withContext(Dispatchers.IO) {
+        ops.copy(path, newPath, overwrite)
+    }
+
+    /** 内容指纹 `sha256:<hex>`；编辑器保存前冲突比对用。文件不存在或非普通文件返回 null。 */
+    suspend fun fingerprint(path: String): String? = withContext(Dispatchers.IO) {
+        ops.fingerprint(path)
+    }
+
+    /** 名称合法性（不含路径分隔符、非 . / ..）。 */
+    fun isValidEntryName(name: String): Boolean = ops.isValidEntryName(name)
+
+    /** 普通文件大小（字节）；不存在或不是文件时返回 -1。编辑器「过大拒绝打开」预检用。 */
+    suspend fun fileSize(path: String): Long = withContext(Dispatchers.IO) {
+        val file = ops.resolve(path)
+        if (file.isFile) file.length() else -1L
+    }
+
+    /** 读文件头部原始字节（二进制嗅探用，与 git 一致只看开头一段）；按 [maxBytes] 截断。 */
+    suspend fun readHeadBytes(path: String, maxBytes: Int = WORKSPACE_BINARY_SNIFF_BYTES): ByteArray = withContext(Dispatchers.IO) {
+        val file = ops.resolve(path)
+        if (!file.isFile) throw java.io.IOException("WORKSPACE_NOT_FILE")
+        file.inputStream().use { input ->
+            val buffer = ByteArray(maxBytes)
+            var offset = 0
+            while (offset < maxBytes) {
+                val count = input.read(buffer, offset, maxBytes - offset)
+                if (count < 0) break
+                offset += count
+            }
+            if (offset == maxBytes) buffer else buffer.copyOf(offset)
+        }
+    }
+
+    // endregion
 
     suspend fun importFile(uri: Uri): Boolean = withContext(Dispatchers.IO) {
         AgentFileReferenceGateway.importDocumentUri(appContext, uri) is AgentFileReferenceGateway.Resolution.Success

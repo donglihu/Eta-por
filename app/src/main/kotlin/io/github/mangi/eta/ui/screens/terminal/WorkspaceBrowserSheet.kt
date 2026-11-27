@@ -39,6 +39,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.InsertDriveFile
 import androidx.compose.material.icons.automirrored.rounded.OpenInNew
+import androidx.compose.material.icons.rounded.Add
 import androidx.compose.material.icons.rounded.Apps
 import androidx.compose.material.icons.rounded.Description
 import androidx.compose.material.icons.rounded.Refresh
@@ -73,7 +74,14 @@ import io.github.mangi.eta.ui.onboarding.tourAnchor
 import io.github.mangi.eta.ui.onboarding.tourAnchorFirst
 import io.github.mangi.eta.R
 import io.github.mangi.eta.ui.app.WorkspaceEntry
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.compose.foundation.text.BasicTextField
 import io.github.mangi.eta.ui.app.WorkspaceFileStore
+import io.github.mangi.eta.ui.components.EtaOverlayDialog
+import io.github.mangi.eta.ui.components.EtaTextButton
+import io.github.mangi.eta.ui.components.EtaWindowDialog
+import io.github.mangi.eta.ui.components.MiuixDialogActions
+import io.github.mangi.eta.ui.screens.files.WorkspaceTreeState
 import io.github.mangi.eta.ui.markdown.MarkdownFileDialog
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -110,6 +118,10 @@ internal fun WorkspaceBrowserSheet(
     onOpenMarkdown: ((String, String) -> Unit)? = null,
     /** 长按文件或文件夹 → 交给宿主加入当前会话引用；入参是绝对路径。 */
     onAttachReference: ((String) -> Unit)? = null,
+    /** 文件树状态机（自 aicode 移植）；浏览、展开与全部写操作都走它。由宿主持有，面板开合不丢状态。 */
+    treeState: WorkspaceTreeState,
+    /** 点文本文件 → 交给宿主打开内置编辑器（宿主负责路由与 CodeEditorState）。 */
+    onOpenFile: (String) -> Unit,
 ) {
     // 入场从右滑到定位、退场滑回右侧：之前是 visible 一翻转就整块出现，观感是「突变」。
 
@@ -121,36 +133,29 @@ internal fun WorkspaceBrowserSheet(
     // 无障碍长按动作名与可见提示分开：前者要短，后者要解释清楚。
     val attachActionLabel = stringResource(R.string.workspace_attach_reference_action)
 
-    val expanded = remember { mutableListOf<String>().toMutableStateList() }
-    var rootEntries by remember { mutableStateOf<List<WorkspaceEntry>?>(null) }
-    var rows by remember { mutableStateOf<List<TreeRow>>(emptyList()) }
-    var revision by remember { mutableIntStateOf(0) }
-    // 面板自己的刷新计数：顶栏不提供刷新，按钮在面板头部。
-    var refreshTick by remember { mutableIntStateOf(0) }
     var loading by remember { mutableStateOf(false) }
     var message by remember { mutableStateOf<String?>(null) }
     // 打开方式选择器是否展开
     var markdownPath by remember { mutableStateOf<String?>(null) }
     var markdownText by remember { mutableStateOf("") }
 
-    LaunchedEffect(revision, refreshTick) {
-        rootEntries = try {
-            store.list("")
-        } catch (cancelled: CancellationException) {
-            throw cancelled
-        } catch (_: Exception) {
-            emptyList()
-        }
-    }
+    // ---- 文件树状态机（自 aicode 移植）：浏览/展开/写操作唯一事实源 ----
+    val browse by treeState.browseState.collectAsStateWithLifecycle()
+    val busyPaths by treeState.busyPaths.collectAsStateWithLifecycle()
+    val expandingPath by treeState.expandingPath.collectAsStateWithLifecycle()
+    val pasteConflict by treeState.pasteConflict.collectAsStateWithLifecycle()
+    val clipboard by treeState.clipboard.collectAsStateWithLifecycle()
 
-    // 展开变化时重读全树。store 复用同一个 backend，不会每次展开都新起 shell 进程。
-    LaunchedEffect(rootEntries, expanded.toList(), revision, refreshTick) {
-        val base = rootEntries
-        val expandedSnapshot = expanded.toList()
-        rows = if (base == null) emptyList() else withContext(Dispatchers.IO) {
-            flattenTree(store, base, expandedSnapshot)
-        }
-    }
+    /** 长按弹出的操作菜单目标；null 隐藏。 */
+    var menuNode by remember { mutableStateOf<WorkspaceTreeState.TreeNode?>(null) }
+    /** 头部「+」：在根目录新建（true=选 FILE/FOLDER）。 */
+    var createMenuAtRoot by remember { mutableStateOf(false) }
+    /** 新建（FILE/FOLDER）与重命名对话框的挂起状态。 */
+    var pendingCreate by remember { mutableStateOf<Pair<CreateKind, String>?>(null) }
+    var pendingRename by remember { mutableStateOf<String?>(null) }
+    var pendingDelete by remember { mutableStateOf<String?>(null) }
+
+    // 文件树展开集持久化（按工作区 root 一把 key，见宿主 WorkspaceTreeState 构造）。
 
     AnimatedVisibility(
         visible = visible,
@@ -199,6 +204,15 @@ internal fun WorkspaceBrowserSheet(
                     overflow = TextOverflow.Ellipsis,
                     modifier = Modifier.weight(1f),
                 )
+                // 新建文件/文件夹（在根目录；子目录的新建走长按菜单）。
+                IconButton(onClick = { createMenuAtRoot = true }) {
+                    Icon(
+                        imageVector = Icons.Rounded.Add,
+                        contentDescription = "新建文件或文件夹",
+                        modifier = Modifier.size(20.dp),
+                        tint = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                    )
+                }
                 // 刷新：转一整圈作为反馈。
                 var spinning by remember { mutableStateOf(false) }
                 val spin by animateFloatAsState(
@@ -209,7 +223,7 @@ internal fun WorkspaceBrowserSheet(
                 )
                 IconButton(onClick = {
                     spinning = true
-                    revision++
+                    treeState.refresh()
                 }) {
                     Icon(
                         imageVector = Icons.Rounded.Refresh,
@@ -220,84 +234,79 @@ internal fun WorkspaceBrowserSheet(
                 }
             }
 
-            val current = rootEntries
-            when {
-                current == null -> Box(
+            when (val state = browse) {
+                is WorkspaceTreeState.BrowseState.Loading -> Box(
                     modifier = Modifier.fillMaxSize(),
                     contentAlignment = Alignment.Center,
                 ) { InfiniteProgressIndicator(size = 24.dp) }
 
-                rows.isEmpty() -> Box(
+                is WorkspaceTreeState.BrowseState.Error -> Box(
                     modifier = Modifier.fillMaxSize(),
                     contentAlignment = Alignment.Center,
                 ) {
                     Text(
-                        text = stringResource(R.string.workspace_browser_empty),
+                        text = "工作区读取失败：${state.detail ?: "未知错误"}",
                         style = MiuixTheme.textStyles.footnote1,
                         color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
                     )
                 }
 
-                else -> LazyColumn(modifier = Modifier.fillMaxSize()) {
-                    items(rows, key = { it.path }) { row ->
-                        WorkspaceTreeRow(
-                            row = row,
-                            expanded = row.path in expanded,
-                            attachActionLabel = attachActionLabel,
-                            // 长按 → 加入会话引用。同步解析绝对路径（一次 stat，带 root 越界校验），
-                            // 解析这一步不能挂在 UI 协程上：长按后立刻关面板会连协程一起取消，
-                            // 引用静默丢失。异步入队交给 AgentAppState 自己的 scope。
-                            onLongClick = onAttachReference?.let { attach ->
-                                {
-                                    val absolute = runCatching { store.absolutePath(row.path) }.getOrNull()
-                                    if (absolute != null) {
-                                        attach(absolute)
-                                    } else {
-                                        Toast.makeText(
-                                            context,
-                                            context.getString(R.string.workspace_attach_reference_failed),
-                                            Toast.LENGTH_SHORT,
-                                        ).show()
-                                    }
-                                }
-                            },
-                            onClick = {
-                                if (row.entry.directory) {
-                                    if (row.path in expanded) expanded.remove(row.path)
-                                    else expanded.add(row.path)
-                                } else if (isImageFile(row.entry.name)) {
-                                    // 图片不交给 MT2：直接在本页全屏看，缩放/翻页都能用。
-                                    previewImage = store.absolutePath(row.path)
-                                } else if (isMarkdown(row.entry.name)) {
-                                    loading = true
-                                    scope.launch {
-                                        val text = try {
-                                            store.readText(row.path)
-                                        } catch (cancelled: CancellationException) {
-                                            throw cancelled
-                                        } catch (_: Exception) {
-                                            null
+                is WorkspaceTreeState.BrowseState.Success -> {
+                    if (state.nodes.isEmpty()) {
+                        Box(
+                            modifier = Modifier.fillMaxSize(),
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            Text(
+                                text = stringResource(R.string.workspace_browser_empty),
+                                style = MiuixTheme.textStyles.footnote1,
+                                color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                            )
+                        }
+                    } else {
+                        LazyColumn(modifier = Modifier.fillMaxSize()) {
+                            items(state.nodes, key = { it.path }) { node ->
+                                val row = TreeRow(node.path, node.entry, node.depth)
+                                WorkspaceTreeRow(
+                                    row = row,
+                                    expanded = node.isExpanded,
+                                    busy = node.path in busyPaths || expandingPath == node.path,
+                                    attachActionLabel = attachActionLabel,
+                                    // 长按 → 文件操作菜单（引用/重命名/删除/复制/剪切/粘贴）。
+                                    onLongClick = { menuNode = node },
+                                    onClick = {
+                                        when {
+                                            node.entry.directory -> treeState.toggleExpand(node.path)
+                                            isImageFile(node.entry.name) ->
+                                                // 图片不交给 MT2：直接在本页全屏看，缩放/翻页都能用。
+                                                previewImage = store.absolutePath(node.path)
+                                            isMarkdown(node.entry.name) -> {
+                                                loading = true
+                                                scope.launch {
+                                                    val text = try {
+                                                        store.readText(node.path)
+                                                    } catch (cancelled: CancellationException) {
+                                                        throw cancelled
+                                                    } catch (_: Exception) {
+                                                        null
+                                                    }
+                                                    loading = false
+                                                    if (text == null) {
+                                                        message = context.getString(R.string.workspace_browser_read_failed)
+                                                    } else if (onOpenMarkdown != null) {
+                                                        onOpenMarkdown(node.path, text)
+                                                    } else {
+                                                        markdownPath = node.path
+                                                        markdownText = text
+                                                    }
+                                                }
+                                            }
+                                            else -> onOpenFile(node.path)
                                         }
-                                        loading = false
-                                        if (text == null) {
-                                            message = context.getString(R.string.workspace_browser_read_failed)
-                                        } else if (onOpenMarkdown != null) {
-                                            onOpenMarkdown(row.path, text)
-                                        } else {
-                                            markdownPath = row.path
-                                            markdownText = text
-                                        }
-                                    }
-                                } else {
-                                    // 非 Markdown：直接丢给 MT2 管理器，不弹应用列表。
-                                    // Codex 的「用 VSCode 打开」是同一个思路——固定默认编辑器，不让人每次挑。
-                                    scope.launch {
-                                        val error = openInMtManager(context, store, row.entry.path)
-                                        if (error != null) message = error
-                                    }
-                                }
-                            },
-                        )
+                                    },
+                                )
+                            }
+                        }
                     }
                 }
             }
@@ -355,40 +364,193 @@ internal fun WorkspaceBrowserSheet(
         )
     }
 
+    // ---------- 文件操作对话框（自 aicode FileBrowserTab 移植，文案 v1 硬编码中文） ----------
+
+    if (createMenuAtRoot) {
+        EtaOverlayDialog(
+            show = true,
+            title = "在根目录新建",
+            onDismissRequest = { createMenuAtRoot = false },
+        ) {
+            EtaTextButton(
+                text = "新建文件",
+                onClick = {
+                    createMenuAtRoot = false
+                    pendingCreate = CreateKind.FILE to WorkspaceTreeState.ROOT
+                },
+                modifier = Modifier.fillMaxWidth(),
+            )
+            EtaTextButton(
+                text = "新建文件夹",
+                onClick = {
+                    createMenuAtRoot = false
+                    pendingCreate = CreateKind.FOLDER to WorkspaceTreeState.ROOT
+                },
+                modifier = Modifier.fillMaxWidth(),
+            )
+        }
+    }
+
+    menuNode?.let { node ->
+        EtaOverlayDialog(
+            show = true,
+            title = node.entry.name,
+            onDismissRequest = { menuNode = null },
+        ) {
+            // 加入会话引用（原长按行为保留）
+            EtaTextButton(
+                text = attachActionLabel,
+                onClick = {
+                    menuNode = null
+                    val attach = onAttachReference ?: return@EtaTextButton
+                    val absolute = runCatching { store.absolutePath(node.path) }.getOrNull()
+                    if (absolute != null) {
+                        attach(absolute)
+                    } else {
+                        Toast.makeText(context, context.getString(R.string.workspace_attach_reference_failed), Toast.LENGTH_SHORT).show()
+                    }
+                },
+                modifier = Modifier.fillMaxWidth(),
+            )
+            if (node.entry.directory) {
+                EtaTextButton(text = "新建文件", onClick = { menuNode = null; pendingCreate = CreateKind.FILE to node.path }, modifier = Modifier.fillMaxWidth())
+                EtaTextButton(text = "新建文件夹", onClick = { menuNode = null; pendingCreate = CreateKind.FOLDER to node.path }, modifier = Modifier.fillMaxWidth())
+                EtaTextButton(
+                    text = if (clipboard != null) "粘贴到此处" else "粘贴（剪贴板为空）",
+                    enabled = clipboard != null,
+                    onClick = {
+                        menuNode = null
+                        treeState.paste(node.path) { success -> if (!success && treeState.pasteConflict.value == null) message = "粘贴失败" }
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            }
+            if (!node.entry.directory) {
+                EtaTextButton(
+                    text = "复制",
+                    onClick = { menuNode = null; treeState.copyEntry(node.path, node.entry.name) },
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                EtaTextButton(
+                    text = "剪切",
+                    onClick = { menuNode = null; treeState.cutEntry(node.path, node.entry.name) },
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            }
+            EtaTextButton(text = "重命名", onClick = { menuNode = null; pendingRename = node.path }, modifier = Modifier.fillMaxWidth())
+            EtaTextButton(
+                text = "删除（移入回收站）",
+                onClick = { menuNode = null; pendingDelete = node.path },
+                modifier = Modifier.fillMaxWidth(),
+            )
+        }
+    }
+
+    pendingCreate?.let { (kind, parent) ->
+        var name by remember(pendingCreate) { mutableStateOf("") }
+        EtaWindowDialog(
+            show = true,
+            title = if (kind == CreateKind.FILE) "新建文件" else "新建文件夹",
+            summary = if (parent == WorkspaceTreeState.ROOT) "位置：工作区根目录" else "位置：$parent",
+            onDismissRequest = { pendingCreate = null },
+        ) {
+            BasicTextField(
+                value = name,
+                onValueChange = { name = it },
+                singleLine = true,
+                textStyle = androidx.compose.ui.text.TextStyle(
+                    color = MiuixTheme.colorScheme.onSurface,
+                    fontSize = MiuixTheme.textStyles.body1.fontSize,
+                ),
+                modifier = Modifier.fillMaxWidth(),
+            )
+            MiuixDialogActions(
+                confirmText = "创建",
+                confirmEnabled = treeState.isValidEntryName(name),
+                onCancel = { pendingCreate = null },
+                onConfirm = {
+                    val done = { success: Boolean ->
+                        if (!success) message = "创建失败（名称非法或已存在）"
+                    }
+                    if (kind == CreateKind.FILE) treeState.createFile(parent, name, done) else treeState.createFolder(parent, name, done)
+                    pendingCreate = null
+                },
+            )
+        }
+    }
+
+    pendingRename?.let { path ->
+        var name by remember(pendingRename) { mutableStateOf(path.substringAfterLast('/')) }
+        EtaWindowDialog(
+            show = true,
+            title = "重命名",
+            summary = path,
+            onDismissRequest = { pendingRename = null },
+        ) {
+            BasicTextField(
+                value = name,
+                onValueChange = { name = it },
+                singleLine = true,
+                textStyle = androidx.compose.ui.text.TextStyle(
+                    color = MiuixTheme.colorScheme.onSurface,
+                    fontSize = MiuixTheme.textStyles.body1.fontSize,
+                ),
+                modifier = Modifier.fillMaxWidth(),
+            )
+            MiuixDialogActions(
+                confirmText = "重命名",
+                confirmEnabled = treeState.isValidEntryName(name) && name.trim() != path.substringAfterLast('/'),
+                onCancel = { pendingRename = null },
+                onConfirm = {
+                    treeState.rename(path, name) { success -> if (!success) message = "重命名失败（目标已存在）" }
+                    pendingRename = null
+                },
+            )
+        }
+    }
+
+    pendingDelete?.let { path ->
+        EtaWindowDialog(
+            show = true,
+            title = "删除确认",
+            summary = "$path 将移入工作区回收站（.trash），可在巡检时物理清理。",
+            onDismissRequest = { pendingDelete = null },
+        ) {
+            MiuixDialogActions(
+                confirmText = "删除",
+                destructive = true,
+                onCancel = { pendingDelete = null },
+                onConfirm = {
+                    treeState.delete(path) { success -> if (!success) message = "删除失败" }
+                    pendingDelete = null
+                },
+            )
+        }
+    }
+
+    pasteConflict?.let { (source, target) ->
+        EtaWindowDialog(
+            show = true,
+            title = "粘贴冲突",
+            summary = "目标 $target 已存在（来自 $source）。覆盖它吗？",
+            onDismissRequest = { treeState.dismissPasteConflict() },
+        ) {
+            MiuixDialogActions(
+                confirmText = "覆盖",
+                destructive = true,
+                onCancel = { treeState.dismissPasteConflict() },
+                onConfirm = { treeState.pasteOverwrite() },
+            )
+        }
+    }
+
 }
 
 /** 树的一行。 */
 private data class TreeRow(val path: String, val entry: WorkspaceEntry, val depth: Int)
 
-/**
- * 把已展开的目录递归读出来，扁平化成可见行。
- *
- * store 复用同一个 backend（一次 shell 会话），所以展开多层不会再逐层起进程。
- */
-private suspend fun flattenTree(
-    store: WorkspaceFileStore,
-    entries: List<WorkspaceEntry>,
-    expanded: List<String>,
-): List<TreeRow> {
-    val out = mutableListOf<TreeRow>()
-    suspend fun walk(list: List<WorkspaceEntry>, depth: Int) {
-        list.forEach { entry ->
-            out += TreeRow(entry.path, entry, depth)
-            if (entry.directory && entry.path in expanded) {
-                val children = try {
-                    store.list(entry.path)
-                } catch (cancelled: CancellationException) {
-                    throw cancelled
-                } catch (_: Exception) {
-                    emptyList()
-                }
-                walk(children, depth + 1)
-            }
-        }
-    }
-    walk(entries, 0)
-    return out
-}
+/** 新建类型。 */
+private enum class CreateKind { FILE, FOLDER }
 
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
@@ -398,6 +560,8 @@ private fun WorkspaceTreeRow(
     onClick: () -> Unit,
     onLongClick: (() -> Unit)? = null,
     attachActionLabel: String? = null,
+    /** 该行正在执行展开/写操作：尾标换成小转圈。 */
+    busy: Boolean = false,
 ) {
     val context = LocalContext.current
     Row(
@@ -467,6 +631,7 @@ private fun WorkspaceTreeRow(
             }
         }
         when {
+            busy -> InfiniteProgressIndicator(size = 16.dp)
             // 同一个箭头转 180°，比换两个图标更像「展开」这个动作本身。
             row.entry.directory -> {
                 // 未展开朝左、展开朝下：起点 -90° 而不是 180°，

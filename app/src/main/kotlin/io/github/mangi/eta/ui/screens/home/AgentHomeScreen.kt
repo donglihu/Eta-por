@@ -75,6 +75,7 @@ internal fun AgentHomeScreen(
             isStreaming = state.isStreaming,
             reasoningEffort = state.reasoningEffort,
             availableReasoningEfforts = state.availableReasoningEfforts,
+            reasoningCapabilities = state.reasoningCapabilities,
             planMode = state.planMode,
             planSteps = state.planSteps,
             onPlanModeChange = { enabled -> onAction(AgentHomeAction.PlanModeChanged(enabled)) },

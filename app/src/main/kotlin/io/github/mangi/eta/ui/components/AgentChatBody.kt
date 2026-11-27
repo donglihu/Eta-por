@@ -86,6 +86,7 @@ import androidx.compose.ui.unit.dp
 import io.github.mangi.eta.R
 import io.github.mangi.eta.agent.browser.AgentBrowserSession
 import io.github.mangi.eta.agent.display.dashboard.AgentConfirmGuard
+import io.github.mangi.eta.data.model.ModelReasoningCapabilities
 import io.github.mangi.eta.data.model.ReasoningEffort
 import io.github.mangi.eta.ui.app.AgentConversationRevisionReducer
 import io.github.mangi.eta.ui.app.LocalBlurEnabled
@@ -165,6 +166,7 @@ internal fun AgentChatBody(
     isStreaming: Boolean,
     reasoningEffort: ReasoningEffort,
     availableReasoningEfforts: List<ReasoningEffort>,
+    reasoningCapabilities: ModelReasoningCapabilities?,
     /** Plan 模式开关与计划清单（会话框上方面板）。 */
     planMode: Boolean = false,
     /** 计划清单：不给默认值——漏传会直接编译失败，而不是静默让面板永远不显示。 */
@@ -362,6 +364,7 @@ internal fun AgentChatBody(
             isStreaming = isStreaming,
             reasoningEffort = reasoningEffort,
             availableReasoningEfforts = availableReasoningEfforts,
+            reasoningCapabilities = reasoningCapabilities,
             planMode = planMode,
             planSteps = planSteps,
             onPlanModeChange = onPlanModeChange,
@@ -477,6 +480,7 @@ private fun AgentChatScaffold(
     isStreaming: Boolean,
     reasoningEffort: ReasoningEffort,
     availableReasoningEfforts: List<ReasoningEffort>,
+    reasoningCapabilities: ModelReasoningCapabilities?,
     planMode: Boolean = false,
     /** 计划清单：不给默认值——漏传会直接编译失败，而不是静默让面板永远不显示。 */
     planSteps: List<io.github.mangi.eta.ui.model.PlanStepUi>,
@@ -593,6 +597,7 @@ private fun AgentChatScaffold(
                 isStreaming = isStreaming,
                 reasoningEffort = reasoningEffort,
                 availableReasoningEfforts = availableReasoningEfforts,
+                reasoningCapabilities = reasoningCapabilities,
                 planMode = planMode,
                 planSteps = planSteps,
                 onPlanModeChange = onPlanModeChange,
@@ -1404,6 +1409,7 @@ private fun AgentChatBottomBar(
     isStreaming: Boolean,
     reasoningEffort: ReasoningEffort,
     availableReasoningEfforts: List<ReasoningEffort>,
+    reasoningCapabilities: ModelReasoningCapabilities?,
     planMode: Boolean = false,
     /** 计划清单：不给默认值——漏传会直接编译失败，而不是静默让面板永远不显示。 */
     planSteps: List<io.github.mangi.eta.ui.model.PlanStepUi>,
@@ -1580,6 +1586,7 @@ private fun AgentChatBottomBar(
                 isStreaming = isStreaming,
                 reasoningEffort = reasoningEffort,
                 availableReasoningEfforts = availableReasoningEfforts,
+                reasoningCapabilities = reasoningCapabilities,
                 planMode = planMode,
                 onPlanModeChange = onPlanModeChange,
                 pendingImages = pendingImages,

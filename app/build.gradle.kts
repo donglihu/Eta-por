@@ -173,6 +173,11 @@ androidComponents {
 dependencies {
     coreLibraryDesugaring(libs.desugar.jdk.libs.nio)
     implementation(libs.jsoup)
+    // sora-editor：文件浏览器内置代码编辑器（自 aicode 移植）；language-textmate 提供语法高亮。
+    // minSdk 33 已高于 API 33 脱糖分界，但保留 coreLibraryDesugaring 以覆盖 java.nio.file 路径。
+    implementation(platform(libs.sora.editor.bom))
+    implementation(libs.sora.editor)
+    implementation(libs.sora.textmate)
     implementation(libs.commons.compress)
     implementation(libs.xz)
     compileOnly(libs.libxposed.api)

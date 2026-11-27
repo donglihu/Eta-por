@@ -136,6 +136,13 @@ internal class AgentAppState(
     initialConversations: AgentConversationStore.Snapshot = AgentConversationStore.load(context),
 ) {
     private val appContext = context.applicationContext
+
+    /**
+     * UI 派生状态（文件浏览器树状态机、内置编辑器等）统一复用的协程域。
+     * 暴露只读视图而不是直接共享可变内部：任何 UI 侧异步都必须走这里，
+     * 禁止 Composable 里 rememberCoroutineScope（纪律同 aicode 移植方案）。
+     */
+    val uiScope: CoroutineScope get() = scope
     private val conversationRuns = ConversationRunRegistry()
     private val runMessageProjector = AgentRunMessageProjector()
     private val runEventCoalescer = AgentRunEventCoalescer()
@@ -419,6 +426,7 @@ internal class AgentAppState(
                 thinkingEnabled = effort.enablesReasoning,
                 reasoningEffort = effort,
                 availableReasoningEfforts = reasoningEffortOptions(effort),
+                reasoningCapabilities = currentReasoningCapabilities,
             )
         } else {
             homeState.withCurrentReasoningCapabilities()
@@ -552,6 +560,7 @@ internal class AgentAppState(
             thinkingEnabled = normalized.enablesReasoning,
             reasoningEffort = normalized,
             availableReasoningEfforts = reasoningEffortOptions(normalized),
+            reasoningCapabilities = capabilities,
         )
     }
 
@@ -1070,6 +1079,7 @@ internal class AgentAppState(
                 thinkingEnabled = normalized.enablesReasoning,
                 reasoningEffort = normalized,
                 availableReasoningEfforts = reasoningEffortOptions(normalized),
+                reasoningCapabilities = currentReasoningCapabilities,
             )
         )
         if (selectedConversationId != null) persistConversations()
@@ -3900,6 +3910,7 @@ internal class AgentAppState(
             thinkingEnabled = draft.reasoningEffort.enablesReasoning,
             reasoningEffort = draft.reasoningEffort,
             availableReasoningEfforts = reasoningEffortOptions(draft.reasoningEffort),
+            reasoningCapabilities = currentReasoningCapabilities,
             pendingImages = draft.pendingImages,
             pendingFileReferences = draft.pendingFileReferences,
             modelId = draft.modelId,

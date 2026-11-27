@@ -6,6 +6,8 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -24,9 +26,11 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.rounded.Bolt
+import androidx.compose.material.icons.rounded.ArrowDownward
+import androidx.compose.material.icons.rounded.ArrowUpward
 import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material.icons.rounded.Dns
+import androidx.compose.material.icons.rounded.ErrorOutline
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -42,6 +46,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalWindowInfo
@@ -54,12 +59,14 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.DpSize
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import io.github.mangi.eta.R
 import io.github.mangi.eta.agent.model.ModelTestResult
 import io.github.mangi.eta.agent.model.ModelTestState
 import io.github.mangi.eta.ui.model.AgentModelOptionUi
 import io.github.mangi.eta.ui.model.AgentModelPickerUiState
 import io.github.mangi.eta.ui.model.filterGroups
+import io.github.mangi.eta.ui.model.formatCompactTokenCount
 import io.github.mangi.eta.ui.model.modelCount
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.drop
@@ -382,7 +389,12 @@ private fun ModelProviderLabel(name: String, horizontalPadding: Dp = 20.dp) {
     )
 }
 
+/**
+ * 模型行，布局对齐 aicode：品牌 logo + 名称 + 能力徽章（Image/Tools/上下文/输出）+ 名称下方测速结果行，
+ * 行尾是「测速」按钮（测速中转圈）。徽章与结果行只在有数据时出现，避免空行撑高列表。
+ */
 @Composable
+@OptIn(ExperimentalLayoutApi::class)
 private fun ModelPickerRow(
     model: AgentModelOptionUi,
     selected: Boolean,
@@ -399,21 +411,36 @@ private fun ModelPickerRow(
             .padding(horizontal = horizontalPadding)
             .squircleSurface(color = Color.Transparent, cornerRadius = 12.dp)
             .clickable(onClick = onClick)
-            .padding(horizontal = 12.dp, vertical = 11.dp),
+            .padding(horizontal = 12.dp, vertical = 9.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Text(
-            text = model.displayName,
-            style = MiuixTheme.textStyles.body2,
-            color = contentColor,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-            modifier = Modifier.weight(1f),
+        ModelBrandMark(
+            modelId = model.modelId,
+            sourceType = model.providerSourceType,
+            size = 20.dp,
         )
-        ModelTestIndicator(
+        Spacer(modifier = Modifier.width(10.dp))
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = model.displayName,
+                style = MiuixTheme.textStyles.body2,
+                color = contentColor,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            ModelBadgesRow(model)
+            testState?.result?.let { result ->
+                ModelTestResultLine(
+                    result = result,
+                    onShowDetail = onShowTestDetail,
+                    modifier = Modifier.padding(top = 2.dp),
+                )
+            }
+        }
+        ModelTestButton(
             state = testState,
             onTest = { onTestModel(model) },
-            onShowDetail = onShowTestDetail,
+            modifier = Modifier.padding(start = 8.dp),
         )
         if (selected) {
             Spacer(modifier = Modifier.width(8.dp))
@@ -427,89 +454,165 @@ private fun ModelPickerRow(
     }
 }
 
-/**
- * 模型行尾的测速指示器，对齐 miniAI：
- * - 未测：闪电图标，点一下开测；
- * - 测速中：同位置转圈；
- * - 成功：绿色 ✓ + 绿色耗时（如 `120ms`）；
- * - 失败：红色感叹号，点击弹出失败原因。
- */
+/** 能力徽章：Image（高亮）｜Tools｜↑ 上下文上限｜↓ 输出上限；四类都没数据时整行不占位。 */
 @Composable
-private fun ModelTestIndicator(
-    state: ModelTestState?,
-    onTest: () -> Unit,
-    onShowDetail: (() -> Unit)?,
-) {
-    val success = state?.result?.takeIf { it.success }
-    val failed = state != null && state.failed
-    when {
-        state?.running == true -> {
-            Box(
-                modifier = Modifier.size(ModelTestIconSize),
-                contentAlignment = Alignment.Center,
-            ) {
-                InfiniteProgressIndicator(size = 14.dp)
-            }
+@OptIn(ExperimentalLayoutApi::class)
+private fun ModelBadgesRow(model: AgentModelOptionUi) {
+    val hasBadges = model.supportsVision || model.supportsTools ||
+        (model.contextWindow ?: 0) > 0 || (model.outputTokens ?: 0) > 0
+    if (!hasBadges) return
+    FlowRow(
+        horizontalArrangement = Arrangement.spacedBy(4.dp),
+        verticalArrangement = Arrangement.spacedBy(3.dp),
+        modifier = Modifier.padding(top = 3.dp),
+    ) {
+        if (model.supportsVision) {
+            ModelBadge(text = stringResource(R.string.model_picker_badge_image), highlight = true)
         }
-        success != null -> {
-            Row(
-                modifier = Modifier
-                    .clip(RoundedCornerShape(8.dp))
-                    .clickable(onClick = onTest)
-                    .padding(horizontal = 4.dp, vertical = 2.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Icon(
-                    imageVector = Icons.Rounded.Check,
-                    contentDescription = stringResource(R.string.model_test_ok),
-                    modifier = Modifier.size(14.dp),
-                    tint = ModelTestSuccessColor,
-                )
-                Spacer(modifier = Modifier.width(3.dp))
-                Text(
-                    text = formatTestLatency(success),
-                    style = MiuixTheme.textStyles.footnote2,
-                    color = ModelTestSuccessColor,
-                    maxLines = 1,
-                )
-            }
+        if (model.supportsTools) {
+            ModelBadge(text = stringResource(R.string.model_picker_badge_tools))
         }
-        failed -> {
-            Box(
-                modifier = Modifier
-                    .size(ModelTestIconSize)
-                    .clip(RoundedCornerShape(8.dp))
-                    .clickable(enabled = onShowDetail != null) { onShowDetail?.invoke() },
-                contentAlignment = Alignment.Center,
-            ) {
-                Text(
-                    text = "!",
-                    style = MiuixTheme.textStyles.body2,
-                    color = MiuixTheme.colorScheme.error,
-                )
-            }
+        model.contextWindow?.takeIf { it > 0 }?.let { context ->
+            ModelBadge(
+                text = formatCompactTokenCount(context),
+                icon = Icons.Rounded.ArrowUpward,
+            )
         }
-        else -> {
-            IconButton(
-                onClick = onTest,
-                minWidth = ModelTestIconSize,
-                minHeight = ModelTestIconSize,
-            ) {
-                Icon(
-                    imageVector = Icons.Rounded.Bolt,
-                    contentDescription = stringResource(R.string.model_test_action),
-                    modifier = Modifier.size(16.dp),
-                    tint = MiuixTheme.colorScheme.primary,
-                )
-            }
+        model.outputTokens?.takeIf { it > 0 }?.let { output ->
+            ModelBadge(
+                text = formatCompactTokenCount(output),
+                icon = Icons.Rounded.ArrowDownward,
+            )
         }
     }
 }
 
-/** `850ms` / `1.20s`：超过一秒换单位，读数不至于变成五位数。 */
-private fun formatTestLatency(result: ModelTestResult): String {
-    val ms = if (result.latencyMs > 0) result.latencyMs else result.timings.totalMs
-    return if (ms >= 1000) String.format(java.util.Locale.US, "%.2fs", ms / 1000.0) else "${ms}ms"
+/** 圆角 50 的 pill 徽章，与 aicode ModelTag 同形：高亮蓝底给 Image，其余中性灰底。 */
+@Composable
+private fun ModelBadge(
+    text: String,
+    highlight: Boolean = false,
+    icon: ImageVector? = null,
+) {
+    val background = if (highlight) {
+        MiuixTheme.colorScheme.primaryContainer
+    } else {
+        MiuixTheme.colorScheme.surfaceVariant
+    }
+    val content = if (highlight) {
+        MiuixTheme.colorScheme.onPrimaryContainer
+    } else {
+        MiuixTheme.colorScheme.onSurfaceVariantSummary
+    }
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier
+            .squircleSurface(color = background, cornerRadius = 50.dp)
+            .padding(horizontal = 6.dp, vertical = 2.dp),
+    ) {
+        icon?.let {
+            Icon(
+                imageVector = it,
+                contentDescription = null,
+                modifier = Modifier.size(11.dp),
+                tint = content,
+            )
+            Spacer(modifier = Modifier.width(3.dp))
+        }
+        Text(
+            text = text,
+            style = MiuixTheme.textStyles.footnote2.copy(fontSize = 10.sp),
+            color = content,
+            maxLines = 1,
+        )
+    }
+}
+
+/** 行尾「测速」入口：测速中转圈，空闲时文字按钮，结果行显示在名称下方（对齐 aicode ModelSelectionRow）。 */
+@Composable
+private fun ModelTestButton(
+    state: ModelTestState?,
+    onTest: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Box(
+        modifier = modifier.width(44.dp),
+        contentAlignment = Alignment.Center,
+    ) {
+        if (state?.running == true) {
+            InfiniteProgressIndicator(size = 14.dp)
+        } else {
+            Text(
+                text = stringResource(R.string.model_test_action),
+                style = MiuixTheme.textStyles.footnote1,
+                color = MiuixTheme.colorScheme.primary,
+                maxLines = 1,
+                modifier = Modifier
+                    .clip(RoundedCornerShape(8.dp))
+                    .clickable(onClick = onTest)
+                    .padding(horizontal = 6.dp, vertical = 4.dp),
+            )
+        }
+    }
+}
+
+/**
+ * 测速结果行，对齐 aicode ModelTestResultLine：
+ * 成功：绿色对勾 + 「连接正常 · {ms}ms」；失败：红色叹号 + HTTP 状态码片段，点击弹失败详情。
+ */
+@Composable
+private fun ModelTestResultLine(
+    result: ModelTestResult,
+    onShowDetail: (() -> Unit)?,
+    modifier: Modifier = Modifier,
+) {
+    val success = result.success
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = modifier
+            .clip(RoundedCornerShape(6.dp))
+            .clickable(enabled = onShowDetail != null) { onShowDetail?.invoke() }
+            .padding(horizontal = 2.dp, vertical = 1.dp),
+    ) {
+        Icon(
+            imageVector = if (success) Icons.Rounded.Check else Icons.Rounded.ErrorOutline,
+            contentDescription = null,
+            modifier = Modifier.size(13.dp),
+            tint = if (success) ModelTestSuccessColor else MiuixTheme.colorScheme.error,
+        )
+        Spacer(modifier = Modifier.width(4.dp))
+        Text(
+            text = if (success) {
+                stringResource(R.string.model_test_success_line, result.latencyMs)
+            } else {
+                modelTestFailureSnippet(result.message)
+            },
+            style = MiuixTheme.textStyles.footnote2,
+            color = if (success) ModelTestSuccessColor else MiuixTheme.colorScheme.error,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
+        if (!success && onShowDetail != null) {
+            Spacer(modifier = Modifier.width(3.dp))
+            Text(
+                text = "›",
+                style = MiuixTheme.textStyles.footnote2,
+                color = MiuixTheme.colorScheme.onSurfaceVariantSummary.copy(alpha = 0.5f),
+            )
+        }
+    }
+}
+
+/** 失败摘要：优先抓 HTTP 状态码 / code 片段，抓不到取首行前 20 字。 */
+private fun modelTestFailureSnippet(message: String): String {
+    val codeMatch = Regex("""(?i)(HTTP\s*\d{3}|code[:\s]+[a-zA-Z0-9_]+)""").find(message)
+    if (codeMatch != null) return codeMatch.value
+    val firstLine = message.lines().firstOrNull().orEmpty().trim()
+    return when {
+        firstLine.isBlank() -> "Error"
+        firstLine.length > 20 -> firstLine.take(20) + "…"
+        else -> firstLine
+    }
 }
 
 @Composable
@@ -546,9 +649,6 @@ internal fun ModelBrandMark(
 }
 
 private val ModelPopupWidth = 268.dp
-
-/** 测速指示器占位；比图标略大，给点击留出手指余量。 */
-private val ModelTestIconSize = 26.dp
 
 /** 测速成功的绿色：与主题 success 语义一致，失败沿用 colorScheme.error。 */
 private val ModelTestSuccessColor = Color(0xFF2BA24C)

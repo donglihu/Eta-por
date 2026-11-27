@@ -14,6 +14,10 @@ sealed interface AppRoute : NavKey {
     @Serializable
     data object Terminal : AppRoute
 
+    /** 内置代码编辑器（自 aicode 移植）：[path] 为工作区相对路径，[line] 为打开后要跳到的行（1 起）。 */
+    @Serializable
+    data class FileEditor(val path: String, val line: Int = 0) : AppRoute
+
     @Serializable
     data object Tools : AppRoute
 

@@ -284,6 +284,25 @@ fun AgentAppRoot(
     // 工作区里点的 Markdown：路径 to 内容。宿主放在页面层，避免在工作区 sheet 里再套一层弹层。
     var workspaceMarkdown by remember { mutableStateOf<Pair<String, String>?>(null) }
     val workspaceStore = remember { io.github.mangi.eta.ui.app.WorkspaceFileStore(context) }
+    // 文件树状态机（自 aicode 移植）：展开集持久化进 SharedPreferences；scope 统一走 agentState.uiScope。
+    val workspaceTreeState = remember {
+        val prefs = context.getSharedPreferences("workspace_tree_expansion", android.content.Context.MODE_PRIVATE)
+        io.github.mangi.eta.ui.screens.files.WorkspaceTreeState(
+            store = io.github.mangi.eta.ui.screens.files.WorkspaceFileTreeAccess(workspaceStore),
+            scope = agentState.uiScope,
+            logger = AndroidAgentLogger,
+            expansionLoader = { key -> prefs.getStringSet(key, null)?.toSet() ?: setOf("") },
+            expansionSaver = { key, value -> prefs.edit().putStringSet(key, HashSet(value)).apply() },
+        )
+    }
+    val codeEditorState = remember {
+        io.github.mangi.eta.ui.screens.files.CodeEditorState(
+            context = context,
+            store = workspaceStore,
+            scope = agentState.uiScope,
+            logger = AndroidAgentLogger,
+        )
+    }
     var conversationDeleteTarget by remember { mutableStateOf<ConversationSummaryUi?>(null) }
     var conversationBatchDeleteTarget by remember { mutableStateOf<List<ConversationSummaryUi>?>(null) }
     var conversationExportTarget by remember { mutableStateOf<ConversationSummaryUi?>(null) }
@@ -442,8 +461,10 @@ fun AgentAppRoot(
                     topInset = WindowInsets.statusBars.asPaddingValues().calculateTopPadding() + 56.dp,
                     onDismiss = { workspaceSheetOpen = false },
                     onOpenMarkdown = { path, text -> workspaceMarkdown = path to text },
-                    // 文件区长按 → 当前会话引用；面板把输入栏推到屏外，成功提示由 attach 内部 Toast 给。
+                    // 文件区长按 → 文件操作菜单；菜单内保留「加入当前会话引用」。
                     onAttachReference = { absolutePath -> agentState.attachWorkspaceReference(absolutePath) },
+                    treeState = workspaceTreeState,
+                    onOpenFile = { path -> pushRoute(AppRoute.FileEditor(path)) },
                 )
             },
             conversationTrimmed = agentState.historyTrimNotice,
@@ -734,6 +755,14 @@ fun AgentAppRoot(
                         onOpenEnvironment = { pushRoute(AppRoute.LinuxEnvironment) },
                     )
                 }
+            }
+            entry<AppRoute.FileEditor>(swipeDismiss = swipeDismiss) { route ->
+                io.github.mangi.eta.ui.screens.files.CodeEditorScreen(
+                    path = route.path,
+                    initialLine = route.line,
+                    editorState = codeEditorState,
+                    onBack = ::popRoute,
+                )
             }
             entry<AppRoute.Tools>(swipeDismiss = swipeDismiss) {
                 AgentToolsScreen(

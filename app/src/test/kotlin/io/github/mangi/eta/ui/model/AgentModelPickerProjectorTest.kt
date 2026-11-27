@@ -221,6 +221,35 @@ class AgentModelPickerProjectorTest {
         assertNull(providers.enabledModel(null))
     }
 
+    @Test
+    fun project_projectsBadgeFieldsForModelList() {
+        val visionToolModel = model(
+            id = "multimodal",
+            displayName = "Multimodal",
+            contextWindowOverride = 256_000,
+        ).copy(
+            outputTokens = 65_536,
+            inputModalities = listOf(Model.TEXT_MODALITY, Model.IMAGE_MODALITY),
+            toolCall = true,
+        )
+        val plainModel = model(id = "plain", displayName = "Plain")
+        val result = AgentModelPickerProjector.project(
+            providers = listOf(provider(id = "p", models = listOf(visionToolModel, plainModel))),
+            selectedProviderId = "p",
+            selectedModelId = visionToolModel.id,
+        )
+
+        val projected = result.selectedModel
+        assertEquals(256_000, projected?.contextWindow)
+        assertEquals(65_536, projected?.outputTokens)
+        assertEquals(true, projected?.supportsVision)
+        assertEquals(true, projected?.supportsTools)
+        val plain = result.providerGroups.single().models.first { it.id == plainModel.id }
+        assertEquals(null, plain.outputTokens)
+        assertEquals(false, plain.supportsVision)
+        assertEquals(false, plain.supportsTools)
+    }
+
     private fun provider(
         id: String,
         name: String = id,

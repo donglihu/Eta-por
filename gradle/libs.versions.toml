@@ -26,12 +26,17 @@ junit = "4.13.2"
 json = "20260814"
 robolectric = "4.17"
 commonsCompress = "1.28.0"
+soraEditorBom = "0.24.6"
 xz = "1.12"
+
 
 [libraries]
 kotlin-gradle-plugin = { group = "org.jetbrains.kotlin", name = "kotlin-gradle-plugin", version.ref = "kotlin" }
 commons-compress = { group = "org.apache.commons", name = "commons-compress", version.ref = "commonsCompress" }
 xz = { group = "org.tukaani", name = "xz", version.ref = "xz" }
+sora-textmate = { group = "io.github.rosemoe", name = "language-textmate" }
+sora-editor = { group = "io.github.rosemoe", name = "editor" }
+sora-editor-bom = { group = "io.github.rosemoe", name = "editor-bom", version.ref = "soraEditorBom" }
 libxposed-api = { group = "io.github.libxposed", name = "api", version.ref = "libxposedApi" }
 libxposed-service = { group = "io.github.libxposed", name = "service", version.ref = "libxposedService" }
 dexkit = { group = "org.luckypray", name = "dexkit", version.ref = "dexkit" }
