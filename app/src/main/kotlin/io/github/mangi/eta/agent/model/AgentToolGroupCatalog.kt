@@ -134,6 +134,7 @@ internal object AgentToolGroupCatalog {
         call: AgentModelClient.ToolCall,
         openedGroups: Set<String>,
         disabledTools: Set<String> = emptySet(),
+        view: AgentToolGroupView = AgentToolGroupView.static(),
     ): EffectiveCall {
         if (call.name != CALL) return EffectiveCall.Direct(call)
         val args = runCatching { JSONObject(call.argumentsJson.ifBlank { "{}" }) }.getOrNull()
@@ -148,7 +149,7 @@ internal object AgentToolGroupCatalog {
                 "$CALL 缺少 tool 字段；示例：{\"tool\":\"terminal\",\"arguments\":\"{\\\"command\\\":\\\"ls\\\"}\"}",
             )
         }
-        val group = AgentToolGroups.groupOf(tool)
+        val group = view.groupOf(tool)
         val deferred = group != null && group != AgentToolGroups.BASIC
         return when {
             group == null -> EffectiveCall.Rejected("UNKNOWN_TOOL", "未知工具：$tool")
@@ -193,8 +194,11 @@ internal object AgentToolGroupCatalog {
      * 延迟组工具**直接按真名调用**是最常见的失败模式（模型知道工具名，但没先开组）。
      * 通用文案「工具未在本轮能力目录中提供」会让它换工具硬凑；这里直接告诉它先开哪一组。
      */
-    fun notAvailableMessage(toolName: String): Pair<String, String> {
-        val group = AgentToolGroups.groupOf(toolName)
+    fun notAvailableMessage(
+        toolName: String,
+        view: AgentToolGroupView = AgentToolGroupView.static(),
+    ): Pair<String, String> {
+        val group = view.groupOf(toolName)
         return if (group != null && group != AgentToolGroups.BASIC) {
             "TOOL_GROUP_NOT_OPEN" to
                 "$toolName 属于延迟加载的组 $group，schema 未随本轮请求下发。" +
@@ -228,6 +232,8 @@ internal object AgentToolGroupCatalog {
  * 所以开组判定必须原子：上限检查与插入合成一个循环 CAS，不能先 `size` 再 `add`。
  */
 internal class AgentToolGroupSession(
+    /** 本 run 冻结的分组视图（含 MCP 动态组）；构造后只读，不跨 run 共享。 */
+    val view: AgentToolGroupView = AgentToolGroupView.static(),
     private val maxOpens: Int = MAX_OPENS_PER_RUN,
 ) {
     private val opened = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
@@ -241,16 +247,22 @@ internal class AgentToolGroupSession(
      * @return null 表示成功（或已经打开过，幂等且不占配额）；否则返回拒绝回执正文。
      */
     fun open(groupId: String): String? {
-        val group = AgentToolGroups.group(groupId)
+        val group = view.group(groupId)
             ?: return AgentToolGroupCatalog.rejection(
                 "UNKNOWN_TOOL_GROUP",
                 "未知工具组：$groupId；可选组：" +
-                    AgentToolGroups.deferredGroups.joinToString("、") { it.id },
+                    view.deferredGroups.joinToString("、") { it.id },
             )
         if (group.resident) {
             return AgentToolGroupCatalog.rejection(
                 "UNKNOWN_TOOL_GROUP",
                 "组 $groupId 是常驻组，成员已在目录里，直接调用即可",
+            )
+        }
+        if (groupId.startsWith(AgentToolGroups.MCP_GROUP_PREFIX) && group.toolNames.isEmpty()) {
+            return AgentToolGroupCatalog.rejection(
+                "TOOL_GROUP_EMPTY",
+                "组 $groupId 当前没有可用工具：该 MCP 服务器未连接或没有注册工具",
             )
         }
         if (!opened.add(groupId)) return null

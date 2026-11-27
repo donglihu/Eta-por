@@ -141,6 +141,14 @@ internal object AgentModelClient {
          *    它们并不理解的目录做断言。
          */
         toolGroupLoading: Boolean = false,
+        /**
+         * MCP 单 run 工具上限的截断说明，由 Runtime 从 run 冻结快照取。
+         *
+         * 快照超限时这部分工具**根本没进目录**，模型无从得知；静默丢弃会让它以为
+         * 「这个 server 就这么多工具」，从而反复重试或断言能力不存在。这里把它并进组索引，
+         * 一次性讲清「哪个 server、少了几个」，比每轮在工具结果里补一句更省前缀。
+         */
+        mcpTruncationNotice: String? = null,
         onEvent: (AgentEvent) -> Unit = {}
     ): ModelResponse.Text {
         config.validate()
@@ -158,55 +166,50 @@ internal object AgentModelClient {
         // 只有 GROUP 档用它（判断两个入口是否允许声明）；OFF 档保持改动前的行为，
         // 那条「请求体逐字节不变」的回滚约定优先于顺带修 bug。
         val disabledToolsForRun = if (groupLoadingEnabled) Prefs.disabledTools() else emptySet()
-        val groupSession = if (groupLoadingEnabled) AgentToolGroupSession() else null
-        val deferredSchemas = LinkedHashMap<String, JSONObject>()
-        val messages = AgentPromptBuilder.buildInitialMessages(
-            config,
-            prompt,
-            images,
-            history,
-            skillContext,
-            memoryContext,
-            rootAvailable = initialCapabilities.rootAvailable,
-            roleplayContext = roleplayContext,
-            executionContext = executionContext,
-            virtualScreenEnabled = initialCapabilities.virtualScreenEnabled,
-            virtualScreenFallbackEnabled = initialCapabilities.virtualScreenFallbackEnabled,
-            customization = customization,
-            planMode = initialCapabilities.planMode,
-            jailbreak = jailbreak,
-            expert = activeExpert,
-            toolGroupLoading = groupLoadingEnabled,
-        )
-        if (rewriteReply) {
-            messages.put(messages.length() - 1, AgentConversationCodec.userTextMessage(
-                "请只改写下面这条角色回复，保持已有事实与实际工具结果，以当前角色设定改善表达。" +
-                    "这不是重新执行任务；不得调用任何工具、重读设备、更新记忆或编造缺失证据。只输出替代正文。\n" +
-                    "<reply_to_rewrite>\n$prompt\n</reply_to_rewrite>",
-            ))
-        } else if (!compactOnly) {
-            messages.getJSONObject(messages.length() - 1).put("_eta_message_id", initialUserMessageId)
-            AssistantScreenContextProjection.attach(messages.getJSONObject(messages.length() - 1), assistantScreenContext)
-        }
-        if (!compactOnly && config.providerType == ProviderTypes.GEMINI) {
-            GeminiEphemeralState.markRunStart(messages.getJSONObject(messages.length() - 1))
-        }
-        if (compactOnly) messages.remove(messages.length() - 1)
-        val transcript = JSONArray()
-        // 旧 history 中的无效消息可能在组装时被跳过，系统边界不能由 history 条数倒推。
-        val systemCount = AgentPromptBuilder.buildSystemMessages(
-            config, skillContext, memoryContext, initialCapabilities.rootAvailable, roleplayContext, executionContext, initialCapabilities.virtualScreenEnabled, initialCapabilities.virtualScreenFallbackEnabled, customization, initialCapabilities.planMode, jailbreak, activeExpert, groupLoadingEnabled,
-        ).length()
-        // MCP 工具只在 run 开始时压一次：每轮重复解析这 190KB JSON 纯属浪费。
+        // MCP 动态组：run 开始时从 additionalTools（唯一来源）反推每 server 的成员。
+        // 组 id 与 McpRunSnapshot.modelToolName 的 serverPart 对齐：mcp_<serverPart8>_<tool>_<hash>。
         val remoteToolNames = (0 until additionalTools.length()).mapNotNull { index ->
             additionalTools.optJSONObject(index)?.optJSONObject("function")?.optString("name")
                 ?.takeIf { it.isNotBlank() }
         }.toSet()
+        val mcpServerGroups = remoteToolNames.filter { it.startsWith("mcp_") }
+            .groupBy { modelName ->
+                val serverPart = modelName.removePrefix("mcp_").substringBefore('_')
+                "${AgentToolGroups.MCP_GROUP_PREFIX}$serverPart"
+            }
+        // 视图按 run 冻结：并发 run 互不覆盖，也不会把上一个 run 的 server 列表带给下一个 run。
+        val groupView = if (groupLoadingEnabled) {
+            AgentToolGroupView.of(
+                serverGroups = mcpServerGroups.mapValues { (_, names) -> names.toSet() },
+                summaries = mcpServerGroups.mapValues { (_, names) ->
+                    "MCP 服务器动态组（${names.size} 个工具）：用 ${AgentToolGroupCatalog.CALL} " +
+                        "转发调用，工具名以 mcp_ 开头"
+                },
+                truncationNotice = mcpTruncationNotice,
+            )
+        } else {
+            AgentToolGroupView.static()
+        }
+        val groupSession = if (groupLoadingEnabled) AgentToolGroupSession(groupView) else null
+        // 组索引正文只算一次：system 首轮构造与能力变化时的重建都用同一份字节，
+        // 否则「同一 run 内两次 buildSystemMessages」会因为 MCP 组顺序不同而改写前缀。
+        val groupIndex = if (groupLoadingEnabled) groupView.indexMessage() else null
+        val deferredSchemas = LinkedHashMap<String, JSONObject>()
+        // GROUP 档下 MCP schema 整体不进目录：第三方 schema 体积不可控（单个 server 可达 190KB），
+        // 开 `mcp:<serverId>` 组只解锁 tool_call 转发，tools 数组字节不变。
+        // OFF 档保持全量（旧行为）；预览页同走本函数，两档口径天然一致。
         val compactedAdditionalTools = if (additionalTools.length() == 0) {
             additionalTools
+        } else if (groupLoadingEnabled) {
+            JSONArray().also { filtered ->
+                (0 until additionalTools.length()).forEach { index ->
+                    val tool = additionalTools.optJSONObject(index) ?: return@forEach
+                    val name = tool.optJSONObject("function")?.optString("name").orEmpty()
+                    if (!name.startsWith("mcp_")) filtered.put(tool)
+                }
+            }.also { AgentToolSchemaCompactor.compactMcp(it) }
         } else {
             JSONArray(additionalTools.toString()).also { AgentToolSchemaCompactor.compactMcp(it) }
-
         }
         fun toolsFor(capabilities: AgentToolCapabilities): JSONArray {
             val built = AgentToolDirectory.build(
@@ -241,7 +244,50 @@ internal object AgentModelClient {
             deferredSchemas.clear()
             return AgentToolDirectory.holdDeferredGroups(selected, deferredSchemas, disabledToolsForRun)
         }
-        val tools = toolsFor(initialCapabilities)
+        // 目录先算一次：技能索引要按「本 run 真正下发的工具名」判定，
+        // 所以 messages 必须等目录算完再建（系统提示是前缀开头，不能建两次）。
+        val initialTools = toolsFor(initialCapabilities)
+        val initialToolNames = toolNames(initialTools)
+        val messages = AgentPromptBuilder.buildInitialMessages(
+            config,
+            prompt,
+            images,
+            history,
+            skillContext,
+            memoryContext,
+            rootAvailable = initialCapabilities.rootAvailable,
+            roleplayContext = roleplayContext,
+            executionContext = executionContext,
+            virtualScreenEnabled = initialCapabilities.virtualScreenEnabled,
+            virtualScreenFallbackEnabled = initialCapabilities.virtualScreenFallbackEnabled,
+            customization = customization,
+            planMode = initialCapabilities.planMode,
+            jailbreak = jailbreak,
+            expert = activeExpert,
+            toolGroupLoading = groupLoadingEnabled,
+            groupIndex = groupIndex,
+            availableToolNames = initialToolNames,
+        )
+        if (rewriteReply) {
+            messages.put(messages.length() - 1, AgentConversationCodec.userTextMessage(
+                "请只改写下面这条角色回复，保持已有事实与实际工具结果，以当前角色设定改善表达。" +
+                    "这不是重新执行任务；不得调用任何工具、重读设备、更新记忆或编造缺失证据。只输出替代正文。\n" +
+                    "<reply_to_rewrite>\n$prompt\n</reply_to_rewrite>",
+            ))
+        } else if (!compactOnly) {
+            messages.getJSONObject(messages.length() - 1).put("_eta_message_id", initialUserMessageId)
+            AssistantScreenContextProjection.attach(messages.getJSONObject(messages.length() - 1), assistantScreenContext)
+        }
+        if (!compactOnly && config.providerType == ProviderTypes.GEMINI) {
+            GeminiEphemeralState.markRunStart(messages.getJSONObject(messages.length() - 1))
+        }
+        if (compactOnly) messages.remove(messages.length() - 1)
+        val transcript = JSONArray()
+        // 旧 history 中的无效消息可能在组装时被跳过，系统边界不能由 history 条数倒推。
+        val systemCount = AgentPromptBuilder.buildSystemMessages(
+            config, skillContext, memoryContext, initialCapabilities.rootAvailable, roleplayContext, executionContext, initialCapabilities.virtualScreenEnabled, initialCapabilities.virtualScreenFallbackEnabled, customization, initialCapabilities.planMode, jailbreak, activeExpert, groupLoadingEnabled, groupIndex, initialToolNames,
+        ).length()
+        val tools = initialTools
         // 只在请求侧丢最老轮次：数据库与界面一条不删；系统提示、记忆与当前输入永不裁。
         val trimOutcome = if (rewriteReply || compactOnly) AgentHistoryTrimmer.Outcome() else
             AgentHistoryTrimmer.trimInPlace(
@@ -272,8 +318,11 @@ internal object AgentModelClient {
             if (capabilities.rootAvailable != promptRootAvailable ||
                 capabilities.virtualScreenEnabled != promptVirtualScreenEnabled ||
                 capabilities.virtualScreenFallbackEnabled != promptVirtualScreenFallbackEnabled) {
+                val nextTools = toolsFor(capabilities)
+                // 重建时技能索引判据要跟「这一轮下发的目录」走：Root 授权变化可能让
+                // skills_read 一起进出目录，拿首轮的名字集合会把索引和目录重新拆开。
                 val systemMessages = AgentPromptBuilder.buildSystemMessages(
-                    config, skillContext, memoryContext, capabilities.rootAvailable, roleplayContext, executionContext, capabilities.virtualScreenEnabled, capabilities.virtualScreenFallbackEnabled, customization, capabilities.planMode, jailbreak, activeExpert, groupLoadingEnabled,
+                    config, skillContext, memoryContext, capabilities.rootAvailable, roleplayContext, executionContext, capabilities.virtualScreenEnabled, capabilities.virtualScreenFallbackEnabled, customization, capabilities.planMode, jailbreak, activeExpert, groupLoadingEnabled, groupIndex, toolNames(nextTools),
                 )
                 for (index in 0 until systemMessages.length()) {
                     messages.put(index, systemMessages.getJSONObject(index))
@@ -281,7 +330,7 @@ internal object AgentModelClient {
                 promptRootAvailable = capabilities.rootAvailable
                 promptVirtualScreenEnabled = capabilities.virtualScreenEnabled
                 promptVirtualScreenFallbackEnabled = capabilities.virtualScreenFallbackEnabled
-                publishedTools = toolsFor(capabilities)
+                publishedTools = nextTools
                 return publishedTools
             }
             val published = toolNames(publishedTools)

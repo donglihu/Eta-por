@@ -377,7 +377,9 @@ internal object VirtualScreenFloatWindow {
     private fun show(next: VirtualDisplayInfo, settings: Settings) {
         if (!canOverlay()) { requestOverlayPermission(); return }
         hide()
-        // 浮窗展开可见 = 人眼在看：25fps / q80。hide() 里已先释放，这里重新申请。
+        // 浮窗展开可见 = 人眼在看：25fps / q80。
+        // 唤醒锁不归这里管：由 VirtualScreenSession 统一按「还有没有屏」持有/释放
+        // （见 VirtualScreenSession.releaseWakeLockIfIdle），浮窗只申请出帧档位。
         VirtualScreenSession.setWatchProfile("float", VirtualScreenSession.WatchProfile.FLOAT)
         info = next
         lastFrameId = 0

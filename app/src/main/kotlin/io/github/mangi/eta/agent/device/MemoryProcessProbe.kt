@@ -1,6 +1,7 @@
 package io.github.mangi.eta.agent.device
 
 import io.github.mangi.eta.core.AndroidAgentLogger
+import io.github.mangi.eta.core.MemoryPressure
 
 /**
  * 内存面板的数据源：进程 RSS 排行、「Eta 自己起的后台任务」，以及构建进程与一键清理。
@@ -143,13 +144,15 @@ internal object MemoryProcessProbe {
 
     private val PACKAGE_NAME = Regex("[A-Za-z0-9_][A-Za-z0-9_.]*")
 
-    /** /proc/meminfo 的 MemAvailable（KB）。口径与面板概览一致，用来算清理前后差值。 */
-    fun memAvailableKb(): Long = runCatching {
-        java.io.File("/proc/meminfo").useLines { lines ->
-            lines.firstOrNull { it.startsWith("MemAvailable:") }
-                ?.filter(Char::isDigit)?.toLongOrNull() ?: 0L
-        }
-    }.getOrDefault(0L)
+    /**
+     * /proc/meminfo 的 MemAvailable（KB）。口径与面板概览一致，用来算清理前后差值。
+     *
+     * 读数统一走 [MemoryPressure]：这里再写一份解析，就会出现「面板显示够、清理却按另一套算」。
+     * 读不到时仍返回 0（保持既有差值语义），不把 -1 带进减法。
+     */
+    fun memAvailableKb(): Long = MemoryPressure.availableSystemBytes().let { bytes ->
+        if (bytes < 0L) 0L else bytes / 1024L
+    }
 
     enum class CleanFailure { NO_ROOT, DENIED, TIMEOUT, SCRIPT }
 

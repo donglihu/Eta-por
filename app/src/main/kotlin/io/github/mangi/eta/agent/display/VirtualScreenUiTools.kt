@@ -110,7 +110,13 @@ internal class VirtualScreenUiTools(
         check(!isCancelled()) { "DISPLAY_CANCELLED" }
         val settings = runBlocking { SettingsDataStore.settings() }
         require(settings.virtualScreenEnabled) { "VIRTUAL_SCREEN_DISABLED" }
-        require(VirtualScreenSession.prepareForRun(owner, runId)) { "DISPLAY_BUSY" }
+        // prepareForRun 现在区分「别的 run 占着屏」和「内存不够」：
+        // 以前两者都报 DISPLAY_BUSY，内存不足被说成「正被其他任务使用」，用户按提示等也没用。
+        when (VirtualScreenSession.prepareForRun(owner, runId)) {
+            VirtualScreenSession.PrepareOutcome.OK -> Unit
+            VirtualScreenSession.PrepareOutcome.NO_MEMORY -> error("INSUFFICIENT_MEMORY")
+            VirtualScreenSession.PrepareOutcome.RUN_BUSY -> error("DISPLAY_BUSY")
+        }
         if (!VirtualScreenSession.isActive(owner)) {
             val created = VirtualScreenSession.execute(
                 context, owner, JSONObject().put("action", "create")

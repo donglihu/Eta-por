@@ -2,7 +2,6 @@ package io.github.mangi.eta.agent.runtime
 
 import android.content.Context
 import io.github.mangi.eta.core.MemoryPressure
-import java.io.File
 
 /**
  * 多开会话的内存闸门（系统剩余内存绝对值为主，进程堆水位为辅）＋ 弹性会话上限。
@@ -49,16 +48,17 @@ internal object AgentMemoryGate {
     /** 内存读数拿不到时的默认上限，取中间值，既不放飞也不卡死。 */
     const val DEFAULT_SESSION_LIMIT = 3
 
-    /** 可用内存（MB）：取 /proc/meminfo 的 MemAvailable（与系统判定一致），读不到返回 -1。 */
-    fun availableMb(): Long = runCatching {
-        val lines = File("/proc/meminfo").readLines()
-        fun read(key: String): Long? = lines
-            .firstOrNull { line -> line.startsWith(key) }
-            ?.filter { char -> char.isDigit() }
-            ?.toLongOrNull()
-        val kb = read("MemAvailable:") ?: read("MemFree:")
-        if (kb == null) -1L else kb / 1024L
-    }.getOrDefault(-1L)
+    /**
+     * 可用内存（MB）：统一取 [MemoryPressure.availableSystemBytes]（`/proc/meminfo` 的 MemAvailable），
+     * 读不到返回 -1。
+     *
+     * 早前这里自己解析 meminfo（还带 MemFree 兜底），灵屏、图片传输各写一份，口径一漂就出现
+     * 「一边认为还够、另一边已经贴顶」。MemAvailable 从 3.14 内核起才有，本项目最低支持
+     * Android 14（内核 5.x），兜底路径不再需要。
+     */
+    fun availableMb(): Long = MemoryPressure.availableSystemBytes().let { bytes ->
+        if (bytes < 0L) -1L else bytes / 1024L / 1024L
+    }
 
     /**
      * 档位 = maxOf(系统侧基础档, 堆水位抬档后的档)。
