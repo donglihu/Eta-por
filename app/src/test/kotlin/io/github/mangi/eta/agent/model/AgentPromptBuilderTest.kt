@@ -186,7 +186,7 @@ class AgentPromptBuilderTest {
         assertTrue(systemContents.any { it.contains("browser_use") })
         assertFalse(systemContents.any { it.contains("只需 command") })
         assertTrue(messages.getJSONObject(2).getString("content").contains("可调用 subagent 派发子智能体"))
-        val skillMessage = systemContents.single { it.contains("id=screen-audit") }
+        val skillMessage = systemContents.single { it.contains("- screen-audit |") }
         assertEquals(skillMessage, messages.getJSONObject(3).getString("content"))
         assertTrue(skillMessage.contains("/data/data/io.github.mangi.eta/files/skills/{id}/SKILL.md"))
         assertFalse(skillMessage.contains("path="))
@@ -196,6 +196,43 @@ class AgentPromptBuilderTest {
         assertTrue(skillMessage.contains("正文按需调用 skills_read 加载对应 SKILL.md"))
         assertEquals("读取网页", messages.getJSONObject(4).getString("content"))
     }
+
+    @Test
+    fun skillIndexFollowsTheDeclaredToolNamesInsteadOfTheToolProfile() {
+        val skill = SkillIndexEntry(
+            id = "screen-audit",
+            name = "屏幕审计",
+            description = "检查屏幕",
+            rootPath = "/skills/screen-audit",
+            skillFilePath = "/skills/screen-audit/SKILL.md",
+            hasScripts = false,
+            hasReferences = false,
+            hasAssets = false,
+            hasEvals = false,
+        )
+        val skillContext = SkillContext(installedSkills = listOf(skill))
+        fun contents(toolNames: Set<String>?, groupLoading: Boolean = false) =
+            AgentPromptBuilder.buildSystemMessages(
+                config = modelConfig(systemPrompt = "", terminalTools = false, browserTools = false),
+                skillContext = skillContext,
+                memoryContext = AgentMemoryContext.DISABLED,
+                rootAvailable = false,
+                toolGroupLoading = groupLoading,
+                availableToolNames = toolNames,
+            ).systemContents()
+
+        // 目录里真有 skills_read：索引注入。
+        assertTrue(contents(setOf("skills_list", "skills_read")).any { it.contains("- screen-audit |") })
+        // 目录里没有：索引必须消失，否则模型照着索引去调一个不存在的工具。
+        assertFalse(contents(setOf("skills_list")).any { it.contains("- screen-audit |") })
+        // 没有目录信息（null）：退回旧判据（FULL 档注入），老调用方行为不变。
+        assertTrue(contents(null).any { it.contains("- screen-audit |") })
+        // 组索引与技能索引各判各的：开了组加载但没有 skills_read，组索引在、技能索引不在。
+        val grouped = contents(setOf("skills_list"), groupLoading = true)
+        assertTrue(grouped.any { it.contains("tools_use_group") })
+        assertFalse(grouped.any { it.contains("- screen-audit |") })
+    }
+
 
     @Test
     fun subagentGuidanceFollowsTheSwitchWithoutChangingOtherSystemMessages() {
