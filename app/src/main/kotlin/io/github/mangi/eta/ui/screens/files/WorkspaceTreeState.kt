@@ -54,7 +54,7 @@ internal class WorkspaceFileTreeAccess(private val store: WorkspaceFileStore) : 
  * - 写操作统一包装：IO 派发 + 忙标记 + 成功后按父目录定点失效。
  *
  * 按 ETA 场景的裁剪与替换：
- * - 单 root（/data/local/tmp/eta），无远程/profile/backend 维度，工作区根即唯一根；
+ * - 单 root（[io.github.mangi.eta.agent.terminal.TerminalRuntime.ROOT_WORKSPACE_PATH]），无远程/profile/backend 维度，工作区根即唯一根；
  * - 目录监听用 [FileObserver]（aicode 是自建 inotify 桥），事件可达性已探针实测；
  * - 删除走 [WorkspaceFileStore.deleteToTrash]（ETA 纪律），剪切粘贴的源删除同样入 trash；
  * - aicode 的根级 .gitignore 过滤暂未移植（ETA 浏览器原本也没有），为后续独立项。
