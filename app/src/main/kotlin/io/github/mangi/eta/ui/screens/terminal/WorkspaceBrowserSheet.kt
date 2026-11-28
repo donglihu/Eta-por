@@ -47,6 +47,7 @@ import androidx.compose.material.icons.outlined.Folder
 import androidx.compose.material.icons.outlined.FolderOpen
 import androidx.compose.material.icons.rounded.Folder
 import androidx.compose.material.icons.rounded.KeyboardArrowDown
+import androidx.compose.material.icons.rounded.MoreVert
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -273,7 +274,21 @@ internal fun WorkspaceBrowserSheet(
                                     busy = node.path in busyPaths || expandingPath == node.path,
                                     attachActionLabel = attachActionLabel,
                                     // 长按 → 文件操作菜单（引用/重命名/删除/复制/剪切/粘贴）。
-                                    onLongClick = { menuNode = node },
+                                    onLongClick = onAttachReference?.let { attach ->
+                                        {
+                                            val absolute = runCatching { store.absolutePath(node.path) }.getOrNull()
+                                            if (absolute != null) {
+                                                attach(absolute)
+                                            } else {
+                                                Toast.makeText(
+                                                    context,
+                                                    context.getString(R.string.workspace_attach_reference_failed),
+                                                    Toast.LENGTH_SHORT,
+                                                ).show()
+                                            }
+                                        }
+                                    },
+                                    onMenuClick = { menuNode = node },
                                     onClick = {
                                         when {
                                             node.entry.directory -> treeState.toggleExpand(node.path)
@@ -299,6 +314,12 @@ internal fun WorkspaceBrowserSheet(
                                                         markdownPath = node.path
                                                         markdownText = text
                                                     }
+                                                }
+                                            }
+                                            node.entry.name.substringAfterLast('.', "").equals("apk", ignoreCase = true) -> {
+                                                scope.launch {
+                                                    val error = openInMtManager(context, store, node.path)
+                                                    if (error != null) message = error
                                                 }
                                             }
                                             else -> onOpenFile(node.path)
@@ -562,6 +583,7 @@ private fun WorkspaceTreeRow(
     attachActionLabel: String? = null,
     /** 该行正在执行展开/写操作：尾标换成小转圈。 */
     busy: Boolean = false,
+    onMenuClick: (() -> Unit)? = null,
 ) {
     val context = LocalContext.current
     Row(
@@ -650,10 +672,15 @@ private fun WorkspaceTreeRow(
                     tint = MiuixTheme.colorScheme.onSurfaceVariantSummary,
                 )
             }
-            !isMarkdown(row.entry.name) -> Icon(
-                imageVector = Icons.AutoMirrored.Rounded.OpenInNew,
-                contentDescription = stringResource(R.string.workspace_browser_open_with),
-                modifier = Modifier.size(18.dp),
+        }
+        IconButton(
+            onClick = { onMenuClick?.invoke() },
+            modifier = Modifier.size(30.dp),
+        ) {
+            Icon(
+                imageVector = Icons.Rounded.MoreVert,
+                contentDescription = "文件操作",
+                modifier = Modifier.size(20.dp),
                 tint = MiuixTheme.colorScheme.onSurfaceVariantSummary,
             )
         }

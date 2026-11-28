@@ -29,6 +29,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.ArrowDownward
 import androidx.compose.material.icons.rounded.ArrowUpward
 import androidx.compose.material.icons.rounded.Check
+import androidx.compose.material.icons.rounded.ChevronRight
 import androidx.compose.material.icons.rounded.Dns
 import androidx.compose.material.icons.rounded.ErrorOutline
 import androidx.compose.runtime.Composable
@@ -464,7 +465,9 @@ private fun ModelBadgesRow(model: AgentModelOptionUi) {
     FlowRow(
         horizontalArrangement = Arrangement.spacedBy(4.dp),
         verticalArrangement = Arrangement.spacedBy(3.dp),
-        modifier = Modifier.padding(top = 3.dp),
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(top = 3.dp),
     ) {
         if (model.supportsVision) {
             ModelBadge(text = stringResource(R.string.model_picker_badge_image), highlight = true)
@@ -523,12 +526,11 @@ private fun ModelBadge(
             text = text,
             style = MiuixTheme.textStyles.footnote2.copy(fontSize = 10.sp),
             color = content,
-            maxLines = 1,
         )
     }
 }
 
-/** 行尾「测速」入口：测速中转圈，空闲时文字按钮，结果行显示在名称下方（对齐 aicode ModelSelectionRow）。 */
+/** 行尾「测试」入口，几何对齐 aicode：56×32dp，测速中转圈，空闲时文字按钮；结果行显示在名称下方。 */
 @Composable
 private fun ModelTestButton(
     state: ModelTestState?,
@@ -536,11 +538,11 @@ private fun ModelTestButton(
     modifier: Modifier = Modifier,
 ) {
     Box(
-        modifier = modifier.width(44.dp),
+        modifier = modifier.width(56.dp).height(32.dp),
         contentAlignment = Alignment.Center,
     ) {
         if (state?.running == true) {
-            InfiniteProgressIndicator(size = 14.dp)
+            InfiniteProgressIndicator(size = 16.dp)
         } else {
             Text(
                 text = stringResource(R.string.model_test_action),
@@ -550,15 +552,16 @@ private fun ModelTestButton(
                 modifier = Modifier
                     .clip(RoundedCornerShape(8.dp))
                     .clickable(onClick = onTest)
-                    .padding(horizontal = 6.dp, vertical = 4.dp),
+                    .padding(horizontal = 4.dp, vertical = 4.dp),
             )
         }
     }
 }
 
 /**
- * 测速结果行，对齐 aicode ModelTestResultLine：
- * 成功：绿色对勾 + 「连接正常 · {ms}ms」；失败：红色叹号 + HTTP 状态码片段，点击弹失败详情。
+ * 测速结果行，完全对齐 aicode ModelTestResultLine：
+ * 成功：绿色对勾 + 「连接正常 · {ms}ms」；失败：红色圆叹号 + HTTP/code 片段（超 20 字取 20 字加 "..."）。
+ * 行尾恒显右箭头，整行可点开测速详情。
  */
 @Composable
 private fun ModelTestResultLine(
@@ -570,14 +573,14 @@ private fun ModelTestResultLine(
     Row(
         verticalAlignment = Alignment.CenterVertically,
         modifier = modifier
-            .clip(RoundedCornerShape(6.dp))
+            .clip(RoundedCornerShape(4.dp))
             .clickable(enabled = onShowDetail != null) { onShowDetail?.invoke() }
-            .padding(horizontal = 2.dp, vertical = 1.dp),
+            .padding(horizontal = 4.dp, vertical = 2.dp),
     ) {
         Icon(
             imageVector = if (success) Icons.Rounded.Check else Icons.Rounded.ErrorOutline,
             contentDescription = null,
-            modifier = Modifier.size(13.dp),
+            modifier = Modifier.size(14.dp),
             tint = if (success) ModelTestSuccessColor else MiuixTheme.colorScheme.error,
         )
         Spacer(modifier = Modifier.width(4.dp))
@@ -587,30 +590,29 @@ private fun ModelTestResultLine(
             } else {
                 modelTestFailureSnippet(result.message)
             },
-            style = MiuixTheme.textStyles.footnote2,
+            style = MiuixTheme.textStyles.footnote1,
             color = if (success) ModelTestSuccessColor else MiuixTheme.colorScheme.error,
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
         )
-        if (!success && onShowDetail != null) {
-            Spacer(modifier = Modifier.width(3.dp))
-            Text(
-                text = "›",
-                style = MiuixTheme.textStyles.footnote2,
-                color = MiuixTheme.colorScheme.onSurfaceVariantSummary.copy(alpha = 0.5f),
-            )
-        }
+        Spacer(modifier = Modifier.width(4.dp))
+        Icon(
+            imageVector = Icons.Rounded.ChevronRight,
+            contentDescription = null,
+            modifier = Modifier.size(12.dp),
+            tint = MiuixTheme.colorScheme.onSurfaceVariantSummary.copy(alpha = 0.5f),
+        )
     }
 }
 
-/** 失败摘要：优先抓 HTTP 状态码 / code 片段，抓不到取首行前 20 字。 */
+/** 失败摘要，与 aicode 同规则：正则抓 HTTP 状态码 / code 片段，抓不到取首行前 20 字加 "..."。 */
 private fun modelTestFailureSnippet(message: String): String {
     val codeMatch = Regex("""(?i)(HTTP\s*\d{3}|code[:\s]+[a-zA-Z0-9_]+)""").find(message)
     if (codeMatch != null) return codeMatch.value
-    val firstLine = message.lines().firstOrNull().orEmpty().trim()
+    val firstLine = message.lines().firstOrNull()
     return when {
-        firstLine.isBlank() -> "Error"
-        firstLine.length > 20 -> firstLine.take(20) + "…"
+        firstLine == null -> "Error"
+        firstLine.length > 20 -> firstLine.take(20) + "..."
         else -> firstLine
     }
 }
@@ -650,8 +652,8 @@ internal fun ModelBrandMark(
 
 private val ModelPopupWidth = 268.dp
 
-/** 测速成功的绿色：与主题 success 语义一致，失败沿用 colorScheme.error。 */
-private val ModelTestSuccessColor = Color(0xFF2BA24C)
+/** 测速成功的绿色：与主题 success 语义一致，失败沿用 colorScheme.error；详情弹层共用。 */
+internal val ModelTestSuccessColor = Color(0xFF2BA24C)
 
 /** 不超过这个数量时弹窗一眼就能看完，不需要搜索。 */
 private const val ModelPopupLimit = 8

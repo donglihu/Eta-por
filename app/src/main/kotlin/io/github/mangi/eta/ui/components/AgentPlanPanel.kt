@@ -1,6 +1,7 @@
 package io.github.mangi.eta.ui.components
 
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.expandVertically
 import androidx.compose.animation.fadeIn
@@ -8,6 +9,8 @@ import androidx.compose.animation.fadeOut
 import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -243,11 +246,34 @@ internal fun AgentPlanPanel(
             verticalAlignment = Alignment.CenterVertically,
         ) {
             // 图标与标题一起当作展开／收起开关，和图示一致；右侧箭头同理。
+            //
+            // 按压反馈不用默认 ripple：整行一按一块浅色圆角矩形，观感生硬（用户反馈「太丑」）。
+            // 改成自绘的软高亮：按压时底色淡入到 6% 前景色，松手 120ms 淡出，
+            // 无涟漪扩散，视觉上只是整行轻轻「沉」了一下。
+            val toggleInteraction = remember { MutableInteractionSource() }
+            val togglePressed by toggleInteraction.collectIsPressedAsState()
+            val highlightAlpha by animateFloatAsState(
+                targetValue = if (togglePressed) 1f else 0f,
+                animationSpec = tween(durationMillis = 120),
+                label = "planToggleHighlight",
+            )
             Row(
                 modifier = Modifier
                     .weight(1f)
-                    .clip(RoundedCornerShape(8.dp))
-                    .clickable { expanded = !expanded },
+                    .clip(RoundedCornerShape(10.dp))
+                    .background(
+                        MiuixTheme.colorScheme.onSurface.copy(
+                            alpha = 0.06f * highlightAlpha,
+                        ),
+                    )
+                    .clickable(
+                        interactionSource = toggleInteraction,
+                        indication = null,
+                    ) { expanded = !expanded }
+                    // padding 放在 clickable 之后：扩出来的部分同样响应点击。
+                    // 上下各 6dp 后整行约 36dp 高，点标题、点徽章、点行间空白都能命中，
+                    // 不再只认文字那一行（用户反馈「点击生效区域只在字体一行」）。
+                    .padding(horizontal = 4.dp, vertical = 6.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 // 标题图标用「空心选中复选框」：方框描边、勾是描边，不填底色。

@@ -27,6 +27,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.ime
@@ -38,10 +39,14 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.ArrowDownward
+import androidx.compose.material.icons.rounded.Check
+import androidx.compose.material.icons.rounded.ContentCopy
 import androidx.compose.material.icons.rounded.DocumentScanner
 import androidx.compose.material.icons.rounded.Language
 import androidx.compose.material.icons.rounded.RocketLaunch
@@ -74,15 +79,20 @@ import androidx.compose.ui.graphics.RectangleShape
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.shadow.Shadow
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import android.widget.Toast
 import io.github.mangi.eta.R
 import io.github.mangi.eta.agent.browser.AgentBrowserSession
 import io.github.mangi.eta.agent.display.dashboard.AgentConfirmGuard
@@ -136,7 +146,9 @@ import top.yukonga.miuix.kmp.basic.Icon
 import top.yukonga.miuix.kmp.basic.IconButton
 import top.yukonga.miuix.kmp.basic.IconButtonDefaults
 import top.yukonga.miuix.kmp.basic.Scaffold
+import top.yukonga.miuix.kmp.basic.Surface
 import top.yukonga.miuix.kmp.basic.Text
+import top.yukonga.miuix.kmp.overlay.OverlayBottomSheet
 import top.yukonga.miuix.kmp.blur.BlendColorEntry
 import top.yukonga.miuix.kmp.blur.BlurDefaults
 import top.yukonga.miuix.kmp.blur.LayerBackdrop
@@ -457,7 +469,7 @@ internal fun AgentChatBody(
             modifier = modifier,
         )
         // 测速失败详情挂在页面层：底部输入栏在卡片输入态会收起，挂在它里面会跟着消失。
-        ModelTestDetailDialog(
+        ModelTestDetailSheet(
             detail = modelTestDetail,
             onDismiss = onDismissTestDetail,
         )
@@ -1647,48 +1659,200 @@ private fun AgentChatBottomBar(
 
 }
 
+/**
+ * 测速详情弹层，对齐 aicode ModelTestDetailBottomSheet：底部弹层、成功与失败同一布局、
+ * 无关闭/取消按钮（点外部或返回即收起）。顶栏：模型名 + 状态徽章（200 OK / HTTP xxx · 耗时）+ 复制调试日志。
+ */
 @Composable
-private fun ModelTestDetailDialog(detail: ModelTestDetail?, onDismiss: () -> Unit) {
-    if (detail == null) return
-    val result = detail.result
-    val summary = buildString {
-        // 失败时手上一分耗时都没有，写「总计 0ms」等于报假数据。
-        val totalMs = if (result.latencyMs > 0) result.latencyMs else result.timings.totalMs
-        if (totalMs > 0) {
-            append("总计 ").append(totalMs).append("ms")
-            append(" · 连接 ").append(result.timings.connectMs).append("ms")
-            append(" · 发送 ").append(result.timings.sendMs).append("ms")
-            append(" · 处理 ").append(result.timings.processMs).append("ms")
-            append(" · 下载 ").append(result.timings.downloadMs).append("ms")
-            if (result.timings.connectionReused) append(" · 复用连接")
-        }
-        if (result.responseCode != 0 && !result.success) {
-            append("\n\nHTTP ").append(result.responseCode)
-        }
-        if (result.message.isNotBlank()) {
-            if (isNotEmpty()) append("\n\n")
-            append(result.message)
-        }
-        if (result.errorDetail.isNotBlank()) {
-            if (isNotEmpty()) append("\n\n")
-            append(result.errorDetail.take(500))
-        }
-        if (result.replyText.isNotBlank()) {
-            if (isNotEmpty()) append("\n\n")
-            append("回复：").append(result.replyText.take(200))
-        }
-    }
-    EtaWindowDialog(
-        show = true,
-        title = "${detail.modelName} · ${if (result.success) "测速通过" else "测速失败"}",
-        summary = summary,
+private fun ModelTestDetailSheet(detail: ModelTestDetail?, onDismiss: () -> Unit) {
+    var shown by remember { mutableStateOf(detail) }
+    // 面板退场动画期间 detail 已为 null，保留最后一次内容避免闪空。
+    if (detail != null) shown = detail
+    val current = shown ?: return
+    val result = current.result
+    val clipboard = LocalClipboardManager.current
+    val context = LocalContext.current
+    var copied by remember { mutableStateOf(false) }
+    OverlayBottomSheet(
+        show = detail != null,
+        title = stringResource(R.string.model_test_detail_title),
         onDismissRequest = onDismiss,
     ) {
-        MiuixDialogActions(
-            confirmText = "关闭",
-            onCancel = {},
-            onConfirm = onDismiss,
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .navigationBarsPadding()
+                .padding(horizontal = 20.dp)
+                .padding(bottom = 20.dp),
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = current.modelName,
+                        style = MiuixTheme.textStyles.body2,
+                        color = MiuixTheme.colorScheme.onSurface,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Surface(
+                        shape = RoundedCornerShape(4.dp),
+                        color = if (result.success) {
+                            ModelTestSuccessColor.copy(alpha = 0.15f)
+                        } else {
+                            MiuixTheme.colorScheme.error.copy(alpha = 0.15f)
+                        },
+                    ) {
+                        Text(
+                            text = if (result.success) {
+                                "200 OK · ${result.latencyMs}ms"
+                            } else {
+                                val status = if (result.responseCode > 0) {
+                                    "HTTP ${result.responseCode}"
+                                } else {
+                                    stringResource(R.string.model_test_failed_short)
+                                }
+                                "$status · ${result.latencyMs}ms"
+                            },
+                            style = MiuixTheme.textStyles.footnote2.copy(fontWeight = FontWeight.SemiBold),
+                            color = if (result.success) ModelTestSuccessColor else MiuixTheme.colorScheme.error,
+                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
+                        )
+                    }
+                }
+                IconButton(
+                    onClick = {
+                        clipboard.setText(AnnotatedString(modelTestDebugLog(current)))
+                        copied = true
+                        Toast.makeText(context, context.getString(R.string.copy_copied), Toast.LENGTH_SHORT).show()
+                    },
+                    minWidth = 36.dp,
+                    minHeight = 36.dp,
+                ) {
+                    Icon(
+                        imageVector = if (copied) Icons.Rounded.Check else Icons.Rounded.ContentCopy,
+                        contentDescription = stringResource(R.string.model_test_copy_debug),
+                        modifier = Modifier.size(18.dp),
+                        tint = if (copied) MiuixTheme.colorScheme.primary else MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                    )
+                }
+            }
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 12.dp)
+                    .heightIn(max = 480.dp)
+                    .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                if (result.requestUrl.isNotBlank()) {
+                    ModelTestDebugSection(stringResource(R.string.model_test_req_url), result.requestUrl)
+                }
+                if (result.requestHeaders.isNotEmpty()) {
+                    ModelTestDebugSection(
+                        stringResource(R.string.model_test_req_headers),
+                        result.requestHeaders.entries.joinToString("\n") { "${it.key}: ${it.value}" },
+                    )
+                }
+                if (result.requestBody.isNotBlank()) {
+                    ModelTestDebugSection(stringResource(R.string.model_test_req_body), result.requestBody)
+                }
+                if (result.responseHeaders.isNotEmpty()) {
+                    ModelTestDebugSection(
+                        stringResource(R.string.model_test_resp_headers),
+                        result.responseHeaders.entries.joinToString("\n") { "${it.key}: ${it.value}" },
+                    )
+                }
+                if (result.responseBody.isNotBlank()) {
+                    ModelTestDebugSection(stringResource(R.string.model_test_resp_body), result.responseBody)
+                }
+                if (result.errorDetail.isNotBlank() && result.errorDetail != result.responseBody) {
+                    ModelTestDebugSection(
+                        stringResource(R.string.model_test_error_detail),
+                        result.errorDetail,
+                        isError = true,
+                    )
+                }
+            }
+        }
+    }
+}
+
+/** 详情弹层的分节：小标题 + 等宽字体内容块。 */
+@Composable
+private fun ModelTestDebugSection(
+    label: String,
+    content: String,
+    isError: Boolean = false,
+) {
+    Column {
+        Text(
+            text = label,
+            style = MiuixTheme.textStyles.footnote1.copy(fontWeight = FontWeight.Bold),
+            color = if (isError) MiuixTheme.colorScheme.error else MiuixTheme.colorScheme.onSurfaceVariantSummary,
         )
+        Spacer(modifier = Modifier.height(4.dp))
+        Text(
+            text = content,
+            style = MiuixTheme.textStyles.footnote2.copy(
+                fontFamily = FontFamily.Monospace,
+                fontSize = 11.sp,
+            ),
+            color = if (isError) MiuixTheme.colorScheme.error else MiuixTheme.colorScheme.onSurface,
+            modifier = Modifier
+                .fillMaxWidth()
+                .squircleSurface(
+                    color = if (isError) {
+                        MiuixTheme.colorScheme.error.copy(alpha = 0.12f)
+                    } else {
+                        MiuixTheme.colorScheme.surfaceVariant
+                    },
+                    cornerRadius = 8.dp,
+                )
+                .padding(8.dp),
+        )
+    }
+}
+
+/** 复制到剪贴板的完整调试日志，结构与 aicode buildFullDebugLog 一致。 */
+private fun modelTestDebugLog(detail: ModelTestDetail): String {
+    val result = detail.result
+    return buildString {
+        appendLine("=== Model Test Debug Info ===")
+        appendLine("Model: ${detail.modelName}")
+        appendLine("Success: ${result.success}")
+        appendLine("Latency: ${result.latencyMs}ms")
+        if (result.responseCode > 0) appendLine("Status Code: ${result.responseCode}")
+        if (result.message.isNotBlank()) appendLine("Message: ${result.message}")
+        appendLine()
+        appendLine("--- Request ---")
+        appendLine("URL: ${result.requestUrl}")
+        if (result.requestHeaders.isNotEmpty()) {
+            appendLine("Headers:")
+            result.requestHeaders.forEach { (k, v) -> appendLine("  $k: $v") }
+        }
+        if (result.requestBody.isNotBlank()) {
+            appendLine("Body:")
+            appendLine(result.requestBody)
+        }
+        appendLine()
+        appendLine("--- Response ---")
+        if (result.responseHeaders.isNotEmpty()) {
+            appendLine("Headers:")
+            result.responseHeaders.forEach { (k, v) -> appendLine("  $k: $v") }
+        }
+        if (result.responseBody.isNotBlank()) {
+            appendLine("Body:")
+            appendLine(result.responseBody)
+        }
+        if (result.errorDetail.isNotBlank() && result.errorDetail != result.responseBody) {
+            appendLine()
+            appendLine("--- Error Detail ---")
+            appendLine(result.errorDetail)
+        }
     }
 }
 

@@ -34,7 +34,6 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.navigationBarsPadding
-import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBars
@@ -959,13 +958,7 @@ private fun ThinkingEffortChip(
     LaunchedEffect(menuEnabled) {
         if (!menuEnabled) showSheet = false
     }
-    // 弹层标签与请求同源：能力已知时用 normalize 收敛（超范围降档、恒开回落），未知时按所选值展示并提示。
-    val mandatory = capabilities?.mandatory == true
-    val effective = capabilities?.normalize(effort) ?: effort
-    val label = when {
-        effort == ReasoningEffort.OFF && !mandatory -> stringResource(R.string.chat_reasoning_off_short)
-        else -> reasoningEffortLabel(effective)
-    }
+    // 图标颜色即状态：开着蓝色、关闭灰色（老大定稿：不显示档位文字）。
     val contentColor by animateColorAsState(
         targetValue = when {
             !menuEnabled -> MiuixTheme.colorScheme.disabledOnSurface
@@ -975,28 +968,20 @@ private fun ThinkingEffortChip(
         animationSpec = tween(durationMillis = 160),
         label = "thinking_content",
     )
-    Row(
-        modifier = modifier
-            .clip(RoundedCornerShape(12.dp))
-            .clickable(enabled = menuEnabled) { showSheet = true }
-            .padding(horizontal = 4.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        Icon(
-            imageVector = Icons.Rounded.Bolt,
-            contentDescription = stringResource(R.string.chat_reasoning_effort, effort.displayName),
-            modifier = Modifier.size(ThinkingIconSize),
-            tint = contentColor,
-        )
-        Spacer(modifier = Modifier.width(2.dp))
-        Text(
-            text = label,
-            style = MiuixTheme.textStyles.footnote1,
-            color = contentColor,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-            modifier = Modifier.widthIn(max = 56.dp),
-        )
+    Box(modifier = modifier) {
+        IconButton(
+            onClick = { showSheet = true },
+            enabled = menuEnabled,
+            minWidth = ChatInputActionSize,
+            minHeight = ChatInputActionSize,
+        ) {
+            Icon(
+                imageVector = Icons.Rounded.Bolt,
+                contentDescription = stringResource(R.string.chat_reasoning_effort, effort.displayName),
+                modifier = Modifier.size(ThinkingIconSize),
+                tint = contentColor,
+            )
+        }
     }
     if (showSheet && menuEnabled) {
         OverlayBottomSheet(
