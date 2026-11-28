@@ -66,6 +66,7 @@ import io.github.mangi.eta.data.repository.RuntimeConfigRepository
 import io.github.mangi.eta.ui.AppearanceSettingsScreen
 import io.github.mangi.eta.ui.SettingsScreen
 import io.github.mangi.eta.ui.components.ConversationNavigatorSheet
+import io.github.mangi.eta.ui.components.ConversationPaneAnchor
 import io.github.mangi.eta.ui.screens.branches.ConversationBranchScreen
 import io.github.mangi.eta.ui.screens.settings.ConversationTitleSettingsScreen
 import io.github.mangi.eta.ui.components.MiuixDialogActions
@@ -111,6 +112,11 @@ import io.github.mangi.eta.ui.screens.terminal.LinuxEnvironmentScreen
 import io.github.mangi.eta.ui.screens.terminal.LinuxFilesScreen
 import io.github.mangi.eta.ui.screens.terminal.SharedFoldersScreen
 import io.github.mangi.eta.ui.screens.terminal.TerminalEntryScreen
+import io.github.mangi.eta.ui.git.GitCredentialsScreen
+import io.github.mangi.eta.ui.git.GitCredentialState
+import io.github.mangi.eta.ui.git.GitDiffScreen
+import io.github.mangi.eta.ui.git.GitDiffState
+import io.github.mangi.eta.ui.git.GitScreen
 import io.github.mangi.eta.ui.screens.terminal.WorkspaceBrowserSheet
 import io.github.mangi.eta.ui.screens.terminal.WorkspaceScreen
 import io.github.mangi.eta.ui.screens.tools.AgentToolsScreen
@@ -236,6 +242,7 @@ fun AgentAppRoot(
 
     var conversationPaneOpen by remember { mutableStateOf(false) }
     // 工作区文件面板：顶栏以下的内容左移、面板从右滑入，顶栏那一行保持原样。
+    // Git 不再是第四锚点层：顶栏胶囊第四段直接推 AppRoute.Git 全屏页（2026-11-28）。
     var workspaceSheetOpen by remember { mutableStateOf(false) }
     var conversationNavigatorOpen by remember { mutableStateOf(false) }
     // 工具与技能面板的数据：改成「打开时主动读一次」，不依赖 Flow 的首次发射，
@@ -446,10 +453,15 @@ fun AgentAppRoot(
                     },
                     workspaceActive = workspaceSheetOpen,
                     onCloseWorkspace = { workspaceSheetOpen = false },
+                    // Git 已改为全屏页路由：胶囊第四段推 AppRoute.Git；gitActive 恒为 false，
+                    // onCloseGit 仅为胶囊级联收起 API 保留（见 LocalProfileTopBarCapsule KDoc）。
+                    gitActive = false,
+                    onOpenGit = { pushRoute(AppRoute.Git) },
+                    onCloseGit = {},
                 )
             },
             workspaceShifted = workspaceSheetOpen,
-            workspaceVisible = workspaceSheetOpen,
+            pane = if (workspaceSheetOpen) ConversationPaneAnchor.Workspace else ConversationPaneAnchor.Closed,
             onWorkspaceOpen = {
                 conversationPaneOpen = false
                 workspaceSheetOpen = true
@@ -763,6 +775,68 @@ fun AgentAppRoot(
                     editorState = codeEditorState,
                     onBack = ::popRoute,
                 )
+            }
+            entry<AppRoute.Git>(swipeDismiss = swipeDismiss) {
+                // Git 全屏页（完全克隆 aicode GitScreen，2026-11-28）：进页即做仓库发现；
+                // 返回手势由 NavDisplay 处理——先出 Git 页再回对话页，与侧滑锚点层叠无冲突。
+                GitScreen(
+                    stateMachine = agentState.gitPanelState,
+                    onOpenDiff = { path, staged ->
+                        // diff 全屏查看器（第二批并行件，2026-11-28）：带仓库相对路径与暂存标记推入。
+                        pushRoute(AppRoute.GitDiff(path, staged))
+                    },
+                    onOpenCredentials = {
+                        // 凭据与署名独立页（第二批并行件，2026-11-28）。
+                        pushRoute(AppRoute.GitCredentials)
+                    },
+                    onBack = ::popRoute,
+                )
+            }
+            entry<AppRoute.GitDiff>(swipeDismiss = swipeDismiss) { route ->
+                // diff 全屏查看器（第二批并行件，2026-11-28）：独立状态机持独立 repository
+                //（GitPanelState 的 repository 是私有字段，选中仓库从其 UI 状态同步过来）。
+                val context = LocalContext.current
+                val diffState = remember(route) {
+                    GitDiffState(
+                        repository = io.github.mangi.eta.agent.git.EtaGitRepository(
+                            io.github.mangi.eta.agent.git.EtaGitEngine(context.applicationContext),
+                        ),
+                        scope = agentState.uiScope,
+                        filePath = route.filePath,
+                        staged = route.staged,
+                    )
+                }
+                LaunchedEffect(Unit) {
+                    diffState.syncRepoPath(agentState.gitPanelState.state.value.currentRepo)
+                }
+                GitDiffScreen(
+                    stateMachine = diffState,
+                    onBack = ::popRoute,
+                    onOpenInEditor = { relativePath ->
+                        // 「在编辑器打开」：仓库相对路径换算成绑定根内绝对路径推入现有 FileEditor。
+                        val repoRoot = agentState.gitPanelState.state.value.currentRepo
+                            ?: io.github.mangi.eta.agent.git.EtaGitRepository.BIND_ROOT.absolutePath
+                        pushRoute(AppRoute.FileEditor("$repoRoot/$relativePath"))
+                    },
+                )
+            }
+            entry<AppRoute.GitCredentials>(swipeDismiss = swipeDismiss) {
+                // 凭据与署名页（第二批并行件，2026-11-28）：署名 git config + 凭据 /root/.git-credentials。
+                val context = LocalContext.current
+                val credentialState = remember {
+                    GitCredentialState(
+                        context = context.applicationContext,
+                        repository = io.github.mangi.eta.agent.git.EtaGitRepository(
+                            io.github.mangi.eta.agent.git.EtaGitEngine(context.applicationContext),
+                        ),
+                        engine = io.github.mangi.eta.agent.git.EtaGitEngine(context.applicationContext),
+                        scope = agentState.uiScope,
+                    )
+                }
+                LaunchedEffect(Unit) {
+                    credentialState.syncRepoPath(agentState.gitPanelState.state.value.currentRepo)
+                }
+                GitCredentialsScreen(stateMachine = credentialState, onBack = ::popRoute)
             }
             entry<AppRoute.Tools>(swipeDismiss = swipeDismiss) {
                 AgentToolsScreen(

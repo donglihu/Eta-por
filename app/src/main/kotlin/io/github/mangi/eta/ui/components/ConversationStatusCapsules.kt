@@ -61,6 +61,9 @@ internal fun ConversationStatusCapsules(
     onOpenWorkspace: () -> Unit,
     workspaceActive: Boolean = false,
     onCloseWorkspace: () -> Unit = {},
+    gitActive: Boolean = false,
+    onOpenGit: () -> Unit = {},
+    onCloseGit: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     val screenWidth = LocalConfiguration.current.screenWidthDp.dp
@@ -81,6 +84,9 @@ internal fun ConversationStatusCapsules(
                     workspaceActive = workspaceActive,
                     onOpenWorkspace = onOpenWorkspace,
                     onCloseWorkspace = onCloseWorkspace,
+                    gitActive = gitActive,
+                    onOpenGit = onOpenGit,
+                    onCloseGit = onCloseGit,
                 )
             }
         }

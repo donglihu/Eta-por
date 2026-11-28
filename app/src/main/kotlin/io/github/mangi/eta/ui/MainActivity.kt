@@ -29,6 +29,7 @@ import io.github.mangi.eta.ui.components.ProvideEtaTextToolbar
 import io.github.mangi.eta.ui.app.ArchivedConversationRequest
 import io.github.mangi.eta.ui.app.AgentAppTheme
 import io.github.mangi.eta.ui.app.PredictiveBackController
+import top.yukonga.miuix.kmp.utils.MiuixPopupUtils.Companion.MiuixPopupHost
 import io.github.mangi.eta.ui.app.installStartupSplash
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -100,6 +101,12 @@ class MainActivity : ComponentActivity() {
                             }
                         },
                     )
+                    // 根因修复（2026-11-28）：Git 全屏页（AppRoute.Git/GitDiff/GitCredentials）不挂在任何
+                    // miuix Scaffold 之下，OverlayBottomSheet/OverlayDialog 经 DialogLayout 注册进
+                    // LocalDialogStates 的静态默认列表，而该列表没有任何 MiuixPopupHost 渲染——
+                    // 表现为「点击仓库名/弹层入口毫无反应」。在组合根补一个 MiuixPopupHost 兜底渲染
+                    // 这份默认列表；挂在 miuix Scaffold 下的页面仍注册进各自 Scaffold 的列表，互不影响。
+                    MiuixPopupHost()
                     io.github.mangi.eta.agent.display.VirtualScreenAppConflictDialog()
                     }
                   }

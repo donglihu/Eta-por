@@ -330,6 +330,22 @@ internal class AgentAppState(
         private set
 
     /**
+     * Git 面板状态机与仓库层（aicode git 功能移植，2026-11-28）。
+     * 惰性构造：引擎首条命令才创建 supervisor，不拖慢应用启动；
+     * 异步统一走 uiScope，UI 层禁止再自建协程作用域。
+     */
+    val gitPanelState: io.github.mangi.eta.ui.git.GitPanelState by lazy {
+        io.github.mangi.eta.ui.git.GitPanelState(
+            context = appContext,
+            repository = io.github.mangi.eta.agent.git.EtaGitRepository(
+                io.github.mangi.eta.agent.git.EtaGitEngine(appContext),
+            ),
+            scope = uiScope,
+            logger = AndroidAgentLogger,
+        )
+    }
+
+    /**
      * 执行侧真源的镜像。按「当前会话的 run 是否暂停」派生：
      * 并发时别的会话暂停不会让这个会话的按钮变成播放图标。
      */

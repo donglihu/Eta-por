@@ -16,11 +16,11 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.Chat
+import androidx.compose.material.icons.rounded.AccountTree
 import androidx.compose.material.icons.rounded.Folder
 import androidx.compose.material.icons.rounded.Widgets
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
@@ -63,26 +63,31 @@ private val profileOptions = listOf(LocalToolProfile.CHAT, LocalToolProfile.FULL
 internal fun profileOption(profile: LocalToolProfile): LocalToolProfile =
     if (profile == LocalToolProfile.CHAT) LocalToolProfile.CHAT else LocalToolProfile.FULL
 
-/** 胶囊三段的统一高度：指示器和图标都按这个尺寸排。 */
+/** 胶囊四段的统一高度：指示器和图标都按这个尺寸排。 */
 private val CapsuleSegmentHeight = 27.dp
 
 /** 指示器滑动时长：与面板滑入同一条曲线，看起来是同一个动作带出的。 */
 private val CapsuleIndicatorMs = 280
 
 /**
- * 顶栏模式胶囊：三段合并成一颗长胶囊——纯聊天 / 全部工具 / 工作区。
+ * 顶栏模式胶囊：四段合并成一颗长胶囊——纯聊天 / 全部工具 / 工作区 / Git。
  *
  * 选中态用一颗滑动指示器表达，而不是每段各自画背景：各自画背景时高亮会「瞬移」到
- * 新段上，滑动则让三段读起来是同一个控件的不同位置。
+ * 新段上，滑动则让四段读起来是同一个控件的不同位置。
  *
  * @param workspaceActive 工作区面板是否打开。打开时高亮停在第三格，
  *   点「全部工具」或「纯聊天」由调用方负责退出面板（本组件只负责把高亮滑回去）。
+ * @param gitActive Git 面板是否打开。Git 已改为全屏页路由（2026-11-28），调用方传 false；
+ *   本参数保留级联收起语义：前三段任一点击仍会先 onCloseGit，避免将来内嵌 Git 层时再漏。
  */
 @Composable
 internal fun LocalProfileTopBarCapsule(
     model: AgentModelOptionUi?,
     compact: Boolean = false,
     workspaceActive: Boolean = false,
+    gitActive: Boolean = false,
+    onOpenGit: () -> Unit = {},
+    onCloseGit: () -> Unit = {},
     onOpenWorkspace: () -> Unit = {},
     onCloseWorkspace: () -> Unit = {},
 ) {
@@ -93,16 +98,15 @@ internal fun LocalProfileTopBarCapsule(
     val current = profileOption(profile)
     val haptic = LocalHapticFeedback.current
     val workspaceLabel = stringResource(R.string.workspace_browser_title)
+    val gitLabel = stringResource(R.string.git_panel_title)
 
-    // 三段等宽：选中索引 → 指示器位移。索引 0=纯聊天 1=全部工具 2=工作区。
+    // 四段等宽：选中索引 → 指示器位移。索引 0=聊天 1=工具 2=工作区 3=Git。
     val selectedIndex = when {
+        gitActive -> 3
         workspaceActive -> 2
         current == LocalToolProfile.CHAT -> 0
         else -> 1
     }
-    // 记住上一段工作区状态：从工作区退出时高亮要滑回工具/聊天，而不是瞬移。
-    var lastIndex by remember { mutableIntStateOf(if (current == LocalToolProfile.CHAT) 0 else 1) }
-    if (!workspaceActive) lastIndex = selectedIndex
 
     // 半透明高亮：alpha 压到 0.42 一档，能透出底下的 surfaceContainer，
     // 不至于像一颗实心色块糊在顶栏上。指示器画在图标下层，所以图标不会被染混色。
@@ -149,6 +153,8 @@ internal fun LocalProfileTopBarCapsule(
                     haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                     LocalToolProfileStore.save(LocalToolProfile.CHAT, profileKey?.first, profileKey?.second)
                     profile = LocalToolProfile.CHAT
+                    // 缺陷 A 修复（2026-11-28）：切聊天时级联收起 Git 层，原来只清工作区。
+                    if (gitActive) onCloseGit()
                     if (workspaceActive) onCloseWorkspace()
                     LocalProfileSwitchNotice.publish(LocalToolProfileSwitch.Chat)
                 },
@@ -162,6 +168,8 @@ internal fun LocalProfileTopBarCapsule(
                     haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                     LocalToolProfileStore.save(LocalToolProfile.FULL, profileKey?.first, profileKey?.second)
                     profile = LocalToolProfile.FULL
+                    // 缺陷 A 修复（2026-11-28）：切全部工具时级联收起 Git 层。
+                    if (gitActive) onCloseGit()
                     if (workspaceActive) onCloseWorkspace()
                 },
             )
@@ -172,7 +180,17 @@ internal fun LocalProfileTopBarCapsule(
                 selected = selectedIndex == 2,
                 onClick = {
                     haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                    if (workspaceActive) onCloseWorkspace() else onOpenWorkspace()
+                    if (gitActive) onCloseGit() else if (workspaceActive) onCloseWorkspace() else onOpenWorkspace()
+                },
+            )
+            // 第四段：Git（推全屏页 AppRoute.Git，页内即 aicode 同款 GitScreen；不再有第四锚点层）。
+            CapsuleSegment(
+                icon = Icons.Rounded.AccountTree,
+                label = gitLabel,
+                selected = selectedIndex == 3,
+                onClick = {
+                    haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                    onOpenGit()
                 },
             )
         }
@@ -180,10 +198,8 @@ internal fun LocalProfileTopBarCapsule(
     }
 }
 
-/** 胶囊单段的宽度：三段必须等宽，否则指示器按 1/3 算出的位移会与图标错位。 */
+/** 胶囊单段的宽度：四段必须等宽，否则指示器按 1/4 算出的位移会与图标错位。 */
 private val CapsuleSegmentWidth = 33.dp
-
-/** 胶囊单段的宽度：三段必须等宽，否则指示器按 1/3 算出的位移会与图标错位。 */
 
 /** 胶囊里的一段：图标 + 选中色。背景由滑动指示器画，这里只负责图标和点击。 */
 @Composable

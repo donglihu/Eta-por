@@ -6,6 +6,11 @@ import kotlin.math.abs
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.filterNotNull
 
+/**
+ * 侧滑层的目标面：Closed=仅对话，Open=左滑进会话列表，Workspace=再左滑进文件面板。
+ * （Git 不再是侧滑锚点：改走全屏页 [io.github.mangi.eta.ui.navigation.AppRoute.Git]，2026-11-28。）
+ * 锚点数值与手势连续性见 ConversationSidePaneScaffold。
+ */
 internal enum class ConversationPaneAnchor {
     Closed,
     Open,

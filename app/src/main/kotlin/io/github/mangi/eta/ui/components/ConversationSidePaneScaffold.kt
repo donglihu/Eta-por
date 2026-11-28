@@ -58,6 +58,7 @@ import kotlin.math.roundToInt
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.filter
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import top.yukonga.miuix.kmp.theme.MiuixTheme
@@ -73,7 +74,7 @@ private object ConversationPaneMetrics {
 }
 
 @Composable
-fun ConversationSidePaneScaffold(
+internal fun ConversationSidePaneScaffold(
     state: ConversationPaneUiState,
     visible: Boolean,
     backHandlerEnabled: Boolean,
@@ -105,7 +106,8 @@ fun ConversationSidePaneScaffold(
     /** 拖放落点：目标分组 id，null 表示移出分组。 */
     onDropConversationToCategory: ((ConversationSummaryUi, String?) -> Unit)? = null,
     modifier: Modifier = Modifier,
-    workspaceVisible: Boolean = false,
+    /** 当前侧滑目标面：Closed 仅对话 / Open 会话列表 / Workspace 文件面板（三锚点，Git 走全屏页）。 */
+    pane: ConversationPaneAnchor = ConversationPaneAnchor.Closed,
     onWorkspaceOpen: () -> Unit = {},
     onWorkspaceDismiss: () -> Unit = {},
     workspaceContent: (@Composable () -> Unit)? = null,
@@ -119,7 +121,7 @@ fun ConversationSidePaneScaffold(
         val density = LocalDensity.current
         val paneWidth = minOf(maxWidth * ConversationPaneMetrics.PaneWidthFraction, ConversationPaneMetrics.PaneMaxWidth)
         val paneWidthPx = with(density) { paneWidth.toPx() }
-        val anchors = remember(paneWidthPx) {
+        val anchors = remember(paneWidthPx, screenWidthPx) {
             DraggableAnchors {
                 ConversationPaneAnchor.Closed at 0f
                 ConversationPaneAnchor.Open at paneWidthPx
@@ -155,24 +157,43 @@ fun ConversationSidePaneScaffold(
         // 高亮判定用「过半」，与吸附阈值一致：往左拉过屏宽一半就算进了工作区，
         // 回程再过半才回到对话区。这样高亮和最终落点不会互相矛盾。
         LaunchedEffect(paneDragState, screenWidthPx) {
+            // 根因修复（2026-11-28）：本效果把「实时位移」映射成 Workspace/Closed 并回调
+            // onWorkspaceOpen/onWorkspaceDismiss，而这两个回调会写回 pane 状态再驱动 pane-effect 的
+            // animateTo——是一个反馈环。丢失 distinctUntilChanged 后，点击触发的 open 动画在最初几帧
+            // （offset 仅离开锚点几个像素、还未过半）会被映射成 Closed → onWorkspaceDismiss →
+            // pane 翻回 Closed → pane-effect 重启并取消刚起步的 animateTo(Workspace)，动画永远起不来；
+            // 反向（点聊天/工作区收面板）同理会在过半点被 onWorkspaceOpen 顶回去。滑动之所以没事，
+            // 是因为手势持有 UserInput 优先级的 mutex，effect 的 animateTo(Default) 被拒绝后静默死亡，
+            // 不与手指抢状态。恢复 distinctUntilChanged 后，动画中间帧的同值发射被抑制，
+            // 只在真正越过半屏阈值的那一帧同步一次状态，点击与滑动重新等价。
             snapshotFlow { paneDragState.offset }
                 .filter { !it.isNaN() }
-                .map { it < -screenWidthPx / 2f }
+                .map { offset ->
+                    when {
+                        offset < -screenWidthPx / 2f -> ConversationPaneAnchor.Workspace
+                        else -> ConversationPaneAnchor.Closed
+                    }
+                }
                 .distinctUntilChanged()
-                .collect { inWorkspace ->
-                    if (inWorkspace) currentOnWorkspaceOpen() else currentOnWorkspaceDismiss()
+                .collect { targetPane ->
+                    when (targetPane) {
+                        ConversationPaneAnchor.Workspace -> currentOnWorkspaceOpen()
+                        else -> currentOnWorkspaceDismiss()
+                    }
                 }
         }
-        LaunchedEffect(workspaceVisible) {
-            // 只在「不在拖动中」时才由外部开关驱动：拖动时位移归手指，
-            // 这时再 animateTo 会和手势抢，表现就是高亮/面板慢半拍。
-            val settled = paneDragState.settledValue
-            val settledPos = runCatching { paneDragState.anchors.positionOf(settled) }.getOrNull()
-            val dragging = settledPos != null && abs(paneDragState.offset - settledPos) > 0.5f
-            if (!dragging) {
-                paneDragState.animateTo(
-                    if (workspaceVisible) ConversationPaneAnchor.Workspace else ConversationPaneAnchor.Closed,
-                )
+        LaunchedEffect(pane, paneWidthPx) {
+            // 缺陷 C 修复（2026-11-28）：原「拖动中」守卫是一次性的——settle 动画进行中外部切面
+            // 会被静默丢弃，之后不再有人补发。改为：仅当已 settle 且停在目标面时跳过；
+            // 否则先等当前 settle 结束（snapshotFlow 观察 isAnimationRunning），再补一次 animateTo。
+            fun settledAt(target: ConversationPaneAnchor): Boolean =
+                paneDragState.settledValue == target &&
+                    !paneDragState.isAnimationRunning &&
+                    abs(paneDragState.offset - paneDragState.anchors.positionOf(target)) < 0.5f
+            if (settledAt(pane)) return@LaunchedEffect
+            snapshotFlow { paneDragState.isAnimationRunning }.first { !it }
+            if (!settledAt(pane)) {
+                paneDragState.animateTo(pane, settleAnimation)
             }
         }
         val currentVisible by rememberUpdatedState(visible)
@@ -225,6 +246,9 @@ fun ConversationSidePaneScaffold(
                 focusManager.clearFocus()
                 keyboard?.hide()
             }
+            // 缺陷 B 修复（2026-11-28）：目标面为工作区时由 pane-effect 独占驱动。
+            // visible 翻转与 pane 切面同时重启时，这里无条件 animateTo(Open/Closed) 会压过工作区目标。
+            if (pane == ConversationPaneAnchor.Workspace) return@LaunchedEffect
             val target = if (visible) ConversationPaneAnchor.Open else ConversationPaneAnchor.Closed
             if (paneDragState.targetValue != target || paneDragState.settledValue != target) {
                 paneDragState.animateTo(target, settleAnimation)
@@ -366,6 +390,7 @@ fun ConversationSidePaneScaffold(
                         .fillMaxSize(),
                 ) { workspaceContent() }
             }
+
         }
     }
 }

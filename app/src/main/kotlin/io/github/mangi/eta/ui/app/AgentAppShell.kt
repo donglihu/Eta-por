@@ -137,7 +137,8 @@ internal fun AgentAppShell(
     /** 工作区面板打开时，只把顶栏以下的内容左移，顶栏那一行保持原样。 */
     workspaceShifted: Boolean = false,
     onDropConversationToCategory: ((io.github.mangi.eta.ui.model.ConversationSummaryUi, String?) -> Unit)? = null,
-    workspaceVisible: Boolean = false,
+    /** 侧滑目标面（会话列表/文件）：替代旧 workspaceVisible 布尔，三锚点高亮与动画共用；Git 走全屏页。 */
+    pane: io.github.mangi.eta.ui.components.ConversationPaneAnchor = io.github.mangi.eta.ui.components.ConversationPaneAnchor.Closed,
     onWorkspaceOpen: () -> Unit = {},
     onWorkspaceDismiss: () -> Unit = {},
     workspaceContent: (@Composable () -> Unit)? = null,
@@ -244,7 +245,7 @@ internal fun AgentAppShell(
                 onMoveCategory = onMoveCategory,
                 onDeleteCategoryConfirmed = onDeleteCategoryConfirmed,
                 onDropConversationToCategory = onDropConversationToCategory,
-                workspaceVisible = workspaceVisible,
+                pane = pane,
                 onWorkspaceOpen = onWorkspaceOpen,
                 onWorkspaceDismiss = onWorkspaceDismiss,
                 workspaceContent = workspaceContent,
@@ -261,7 +262,7 @@ internal fun AgentAppShell(
             currentRoute = currentRoute,
             surface = when {
                 isConversationPaneOpen -> SurfaceKey.Sidebar
-                workspaceVisible -> SurfaceKey.Workspace
+                pane == io.github.mangi.eta.ui.components.ConversationPaneAnchor.Workspace -> SurfaceKey.Workspace
                 else -> null
             },
             navigatorOpen = navigatorOpen,
@@ -621,6 +622,9 @@ private fun titleForRoute(route: AppRoute?): String = when (route) {
     is AppRoute.ExpertDetail -> "专家详情"
     is AppRoute.SkillStore -> "技能商店"
     is AppRoute.LogViewer -> "日志"
+    is AppRoute.Git -> "Git"
+    is AppRoute.GitDiff -> route.filePath.substringAfterLast('/')
+    is AppRoute.GitCredentials -> stringResource(R.string.git_credentials_and_identity)
     null -> stringResource(R.string.app_name)
 }
 

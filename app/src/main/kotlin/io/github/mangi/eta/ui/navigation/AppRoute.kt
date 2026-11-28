@@ -18,6 +18,22 @@ sealed interface AppRoute : NavKey {
     @Serializable
     data class FileEditor(val path: String, val line: Int = 0) : AppRoute
 
+    /**
+     * Git 全屏页（完全克隆 aicode GitScreen，2026-11-28 改造）：顶栏胶囊第四段推入。
+     * 仓库绑定根固定为工作区 projects 目录（EtaGitRepository），这是与 aicode 的唯一差异。
+     */
+    @Serializable
+    data object Git : AppRoute
+
+    /** Git diff 全屏页（下一批实现）：[filePath] 仓库相对路径，[staged] 是否查看暂存区差异。 */
+    @Serializable
+    data class GitDiff(val filePath: String, val staged: Boolean = false) : AppRoute
+
+
+    /** Git 凭据与署名独立页（署名 git config + 凭据 /root/.git-credentials 多 host 存储）。 */
+    @Serializable
+    data object GitCredentials : AppRoute
+
     @Serializable
     data object Tools : AppRoute
 
