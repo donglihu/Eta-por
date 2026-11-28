@@ -60,35 +60,67 @@ internal class AgentKeepaliveService : Service() {
                 NotificationManager.IMPORTANCE_LOW
             )
         )
-        val open = PendingIntent.getActivity(
-            this,
-            NOTIFICATION_ID,
-            Intent(this, MainActivity::class.java),
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
-        val notification = Notification.Builder(this, CHANNEL)
-            .setSmallIcon(R.drawable.ic_notification)
-            .setContentTitle(getString(R.string.keepalive_notification_title))
-            .setContentText(getString(R.string.keepalive_notification_summary))
-            .setContentIntent(open)
-            .setOngoing(true)
-            // 常驻通知不重播提示音与横幅：它一直在，反复提醒只会变成骚扰。
-            .setOnlyAlertOnce(true)
-            .build()
-        if (android.os.Build.VERSION.SDK_INT >= 34) startForeground(
-            NOTIFICATION_ID,
-            notification,
-            ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
-        )
-        else startForeground(NOTIFICATION_ID, notification)
+        if (!startForegroundSafely()) return
         acquireWifiLock()
         running = true
         AndroidAgentLogger.info("Keepalive service started")
     }
 
     /**
-     * WifiLock 只在保活期间持有：HIGH_PERF 会压住 Wi-Fi 省电策略，
-     * 让长连接（模型流式响应、MCP 长轮询）不因息屏被切断。
+     * 建立前台形态：构建常驻通知并调用 [startForeground]，全程兜底异常。
+     *
+     * fromJob=true 的自检拉起路径运行在没有可见 Activity 的任务上下文里，
+     * 通知构建遇堆紧张（OOM）或厂商 ROM 拒绝前台服务（后台启动限额、通知被关等）
+     * 都会直接抛异常；不捕获的话保活进程当场崩溃，START_STICKY 反复重建反复崩。
+     *
+     * 降级策略选「按 [stopSelf] 语义安全退出」而不是「无前台通知继续存活」：
+     * startForegroundService 启动的服务若不在超时窗口内完成 startForeground，
+     * 系统会以 ForegroundServiceDidNotStartInTimeException 崩掉进程，「无通知硬撑」
+     * 只是把崩溃换个时间点再发生；及时 stopSelf 既满足系统的前台义务检查，
+     * 也与本文件 [start]「失败不留下假象」的既有语义一致——常驻没立起来就如实退出，
+     * 交给自检调度与 STICKY 重建在下一轮再试。通知构建与 startForeground 同属
+     * 建立前台形态的失败面，一并包进捕获块；[onStartCommand] 里
+     * [restorePersistentFromSettings] 的调用点在本方法之外，不受影响。
+     */
+    private fun startForegroundSafely(): Boolean {
+        return runCatching {
+            val open = PendingIntent.getActivity(
+                this,
+                NOTIFICATION_ID,
+                Intent(this, MainActivity::class.java),
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+            val notification = Notification.Builder(this, CHANNEL)
+                .setSmallIcon(R.drawable.ic_notification)
+                .setContentTitle(getString(R.string.keepalive_notification_title))
+                .setContentText(getString(R.string.keepalive_notification_summary))
+                .setContentIntent(open)
+                .setOngoing(true)
+                // 常驻通知不重播提示音与横幅：它一直在，反复提醒只会变成骚扰。
+                .setOnlyAlertOnce(true)
+                .build()
+            if (android.os.Build.VERSION.SDK_INT >= 34) startForeground(
+                NOTIFICATION_ID,
+                notification,
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+            )
+            else startForeground(NOTIFICATION_ID, notification)
+            true
+        }.getOrElse { failure ->
+            // 捕获 Throwable 而非仅 RuntimeException：OOM 是 Error 不是 Exception，
+            // 只捕 RuntimeException 漏掉通知构建 OOM 这个主场景。
+            // ThreadDeath（线程 stop 信号）不可恢复，必须重新抛出交给 VM 处理。
+            if (failure is ThreadDeath) throw failure
+            AndroidAgentLogger.warn("Keepalive foreground failed: type=${failure.safeLogType()}")
+            stopSelf()
+            false
+        }
+    }
+
+    /**
+     * WifiLock 只在保活期间持有：低延迟锁（WIFI_MODE_FULL_LOW_LATENCY）在 API 29+
+     * 取代已废弃的高性能锁，压住 Wi-Fi 省电策略，让长连接（模型流式响应、MCP 长轮询）
+     * 不因息屏被切断，且对厂商功耗治理更友好。
      *
      * 拿不到不算致命——保活主体仍然是前台服务，Wi-Fi 锁只是加分项，
      * 所以失败只记 warn，不抛也不中断服务。
@@ -100,7 +132,7 @@ internal class AgentKeepaliveService : Service() {
                 AndroidAgentLogger.warn("Keepalive wifi lock unavailable: WifiManager missing")
                 return
             }
-            manager.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, WIFI_LOCK_TAG)?.apply {
+            manager.createWifiLock(WifiManager.WIFI_MODE_FULL_LOW_LATENCY, WIFI_LOCK_TAG)?.apply {
                 setReferenceCounted(false)
                 acquire()
             }.also { wifiLock = it }
@@ -302,7 +334,10 @@ internal class AgentKeepaliveService : Service() {
          *
          * `getRunningServices` 在 Android O+ 只返回调用方自己进程的服务，
          * 对「查自己应用的服务」这个用途恰好有效，也不需要额外权限。
+         * 已废弃（DEPRECATION）：Android 无等价替代 API（O+ 返回仅自身条目但仍然可用），
+         * 这里仅探测自身服务运行态，故显式压制告警，不改逻辑。
          */
+        @Suppress("DEPRECATION")
         fun isRunning(context: Context): Boolean {
             val manager = context.getSystemService(ActivityManager::class.java)
             if (manager == null) {
